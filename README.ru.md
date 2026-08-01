@@ -101,3 +101,15 @@ Diskpass написан на **C** (изначально прототип был
 - **cJSON** — сериализация базы данных.
 - **GTK3** — графический интерфейс, включая нативный заголовок окна и совместимость с Xorg/Wayland.
 
+
+## Установка
+
+```bash
+sudo apt install build-essential pkg-config libgtk-3-dev libgpgme-dev libsodium-dev libcjson-dev
+
+git clone https://github.com/Sergei768/Diskpass/
+
+cd Diskpass
+
+chmod +x ./build.sh && ./build.sh
+```
