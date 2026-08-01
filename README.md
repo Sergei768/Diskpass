@@ -100,3 +100,15 @@ Diskpass is written in **C** (originally prototyped in Python, then completely r
 - **cJSON** — database serialization.
 - **GTK3** — graphical interface, including native window header and Xorg/Wayland compatibility.
 
+
+## Installation
+
+```bash
+sudo apt install build-essential pkg-config libgtk-3-dev libgpgme-dev libsodium-dev libcjson-dev
+
+git clone https://github.com/Sergei768/Diskpass/
+
+cd Diskpass
+
+chmod +x ./build.sh && ./build.sh
+```
