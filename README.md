@@ -1,6 +1,3 @@
-
-[Русский](README.ru.md) | **English**
-
 <img src="logo.png" width="100%">
 
 **README Language:** [Русский](README.ru.md) | **English**
