@@ -2,23 +2,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <locale.h>
 #include <time.h>
-#include <limits.h>
+#include <ctype.h>
+#include <locale.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-#include <sodium.h>
-#include <sodium/utils.h>
-#include <gpgme.h>
-#include <cjson/cJSON.h>
 #include <gtk/gtk.h>
+#include <gpgme.h>
+#include <sodium.h>
+#include <cjson/cJSON.h>
 
 #define ARRAY_SIZE(a) ((sizeof(a)) / sizeof((a)[0]))
 #define SECURE_ZERO(p,n) do { if((p)) sodium_memzero((p),(n)); } while(0)
@@ -135,6 +134,14 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
+static void secure_free_string(char **s) {
+    if (!s || !*s) return;
+    size_t len = strlen(*s);
+    if (len > 0) sodium_memzero(*s, len);
+    free(*s);
+    *s = NULL;
+}
+
 typedef struct { const char *key; const char *ru; const char *en; } i18n_entry_t;
 
 static const i18n_entry_t I18N[] = {
@@ -208,8 +215,8 @@ static const char *i18n(const char *key) {
 
 static const char *map_encode(const char *part_name, const char *value) {
     const map_entry_t *tbl = NULL; int n = 0;
-    if (strcmp(part_name, "type") == 0)        { tbl = TYPE_MAP;   n = TYPE_MAP_N; }
-    else if (strcmp(part_name, "size") == 0)   { tbl = SIZE_MAP;  n = SIZE_MAP_N; }
+    if (strcmp(part_name, "type") == 0) { tbl = TYPE_MAP; n = TYPE_MAP_N; }
+    else if (strcmp(part_name, "size") == 0) { tbl = SIZE_MAP; n = SIZE_MAP_N; }
     else if (strcmp(part_name, "cipher") == 0) { tbl = CIPHER_MAP; n = CIPHER_MAP_N; }
     if (!tbl) return value;
     for (int i = 0; i < n; i++)
@@ -219,8 +226,8 @@ static const char *map_encode(const char *part_name, const char *value) {
 
 static const char *map_decode(const char *part_name, const char *code) {
     const map_entry_t *tbl = NULL; int n = 0;
-    if (strcmp(part_name, "type") == 0)        { tbl = TYPE_MAP;   n = TYPE_MAP_N; }
-    else if (strcmp(part_name, "size") == 0)   { tbl = SIZE_MAP;  n = SIZE_MAP_N; }
+    if (strcmp(part_name, "type") == 0) { tbl = TYPE_MAP; n = TYPE_MAP_N; }
+    else if (strcmp(part_name, "size") == 0) { tbl = SIZE_MAP; n = SIZE_MAP_N; }
     else if (strcmp(part_name, "cipher") == 0) { tbl = CIPHER_MAP; n = CIPHER_MAP_N; }
     if (!tbl) return code;
     for (int i = 0; i < n; i++)
@@ -256,8 +263,8 @@ static char *generate_password(int length) {
 }
 
 static char calculate_block_salt(const uint8_t *noise_key, size_t key_len,
-                                 const uint8_t *salt, size_t salt_len,
-                                 int part_index, const char *val_str)
+    const uint8_t *salt, size_t salt_len,
+    int part_index, const char *val_str)
 {
     size_t vlen = strlen(val_str);
     size_t msg_len = salt_len + 1 + vlen;
@@ -289,21 +296,21 @@ static void db_entry_init(db_entry_t *e) { memset(e, 0, sizeof(*e)); }
 
 static void db_entry_clear(db_entry_t *e) {
     if (!e) return;
-    free(e->label); e->label = NULL;
-    free(e->type); e->type = NULL;
-    free(e->size); e->size = NULL;
-    free(e->cipher); e->cipher = NULL;
-    free(e->content_tag); e->content_tag = NULL;
-    free(e->dsalt); e->dsalt = NULL;
-    free(e->tag_full); e->tag_full = NULL;
-    free(e->notes); e->notes = NULL;
-    free(e->alias); e->alias = NULL;
+    secure_free_string(&e->label);
+    secure_free_string(&e->type);
+    secure_free_string(&e->size);
+    secure_free_string(&e->cipher);
+    secure_free_string(&e->content_tag);
+    secure_free_string(&e->dsalt);
+    secure_free_string(&e->tag_full);
+    secure_free_string(&e->notes);
+    secure_free_string(&e->alias);
     if (e->dpass) { sec_strfree(e->dpass); e->dpass = NULL; }
 }
 
 typedef struct {
     char *file_path, *recipient;
-    uint8_t *salt;      size_t salt_len;
+    uint8_t *salt; size_t salt_len;
     uint8_t *noise_key; size_t noise_key_len;
     char *schema_order[5];
     char lang[8];
@@ -316,11 +323,11 @@ static void db_manager_init(db_manager_t *m) { memset(m, 0, sizeof(*m)); strcpy(
 
 static void db_manager_clear(db_manager_t *m) {
     if (!m) return;
-    free(m->file_path); m->file_path = NULL;
-    free(m->recipient); m->recipient = NULL;
-    if (m->salt)      { SECURE_ZERO(m->salt, m->salt_len);      free(m->salt);      m->salt = NULL; }
+    secure_free_string(&m->file_path);
+    secure_free_string(&m->recipient);
+    if (m->salt) { SECURE_ZERO(m->salt, m->salt_len); free(m->salt); m->salt = NULL; }
     if (m->noise_key) { SECURE_ZERO(m->noise_key, m->noise_key_len); free(m->noise_key); m->noise_key = NULL; }
-    for (int i = 0; i < SCHEMA_COUNT; i++) { free(m->schema_order[i]); m->schema_order[i] = NULL; }
+    for (int i = 0; i < SCHEMA_COUNT; i++) { secure_free_string(&m->schema_order[i]); }
     for (int i = 0; i < m->entry_count; i++) db_entry_clear(&m->entries[i]);
     free(m->entries); m->entries = NULL; m->entry_count = 0; m->entry_cap = 0;
     if (m->gpg_ctx) { gpgme_release(m->gpg_ctx); m->gpg_ctx = NULL; }
@@ -331,13 +338,15 @@ static int db_init_gpg(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
     GPG_CHECK(gerr, "gpgme_new");
     gpgme_set_protocol(m->gpg_ctx, GPGME_PROTOCOL_OpenPGP);
     gpgme_set_armor(m->gpg_ctx, 1);
+    gerr = gpgme_set_pinentry_mode(m->gpg_ctx, GPGME_PINENTRY_MODE_ASK);
+    GPG_CHECK(gerr, "gpgme_set_pinentry_mode");
     return 0;
 cleanup:
     return -1;
 }
 
 static int db_read_file(const char *path, char **out_recipient, char **out_enc_data,
-                        char *err_msg, size_t err_msg_sz)
+    char *err_msg, size_t err_msg_sz)
 {
     FILE *f = fopen(path, "rb");
     if (!f) { snprintf(err_msg, err_msg_sz, "Cannot open file: %s", strerror(errno)); return -1; }
@@ -362,7 +371,7 @@ static int db_read_file(const char *path, char **out_recipient, char **out_enc_d
 }
 
 static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_len,
-                            char *err_msg, size_t err_msg_sz)
+    char *err_msg, size_t err_msg_sz)
 {
     gpgme_error_t gerr;
     gpgme_data_t in = NULL, out = NULL;
@@ -386,13 +395,13 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
     result[rlen] = '\0';
     gpgme_free(raw);
 cleanup:
-    if (in)  gpgme_data_release(in);
+    if (in) gpgme_data_release(in);
     if (out) gpgme_data_release(out);
     return result;
 }
 
 static char *db_gpg_encrypt(db_manager_t *m, const char *plaintext, size_t pt_len,
-                            char *err_msg, size_t err_msg_sz)
+    char *err_msg, size_t err_msg_sz)
 {
     gpgme_error_t gerr;
     gpgme_data_t in = NULL, out = NULL;
@@ -421,7 +430,7 @@ static char *db_gpg_encrypt(db_manager_t *m, const char *plaintext, size_t pt_le
     gpgme_free(raw);
 cleanup:
     if (keys[0]) gpgme_key_release(keys[0]);
-    if (in)  gpgme_data_release(in);
+    if (in) gpgme_data_release(in);
     if (out) gpgme_data_release(out);
     return result;
 }
@@ -477,7 +486,7 @@ static int db_load_json(db_manager_t *m, const char *json_str, char *err_msg, si
     bool schema_ok = true;
     for (int i = 0; i < SCHEMA_COUNT; i++) if (!m->schema_order[i]) schema_ok = false;
     if (!schema_ok) {
-        for (int i = 0; i < SCHEMA_COUNT; i++) { free(m->schema_order[i]); m->schema_order[i] = NULL; }
+        for (int i = 0; i < SCHEMA_COUNT; i++) { secure_free_string(&m->schema_order[i]); }
         for (int i = 0; i < SCHEMA_COUNT; i++) m->schema_order[i] = xstrdup(SCHEMA_PARTS[i]);
     }
     cJSON *j_lang = cJSON_GetObjectItem(root, "lang");
@@ -546,17 +555,64 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
     SECURE_ZERO(json_str, strlen(json_str));
     free(json_str);
     if (!enc) return -1;
-    FILE *f = fopen(m->file_path, "wb");
-    if (!f) { snprintf(err_msg, err_msg_sz, "Cannot write file: %s", strerror(errno)); free(enc); return -1; }
+
+    size_t tmp_len = strlen(m->file_path) + 5;
+    char *tmp_path = malloc(tmp_len);
+    if (!tmp_path) {
+        snprintf(err_msg, err_msg_sz, "alloc failed for temp path");
+        free(enc);
+        return -1;
+    }
+    snprintf(tmp_path, tmp_len, "%s.tmp", m->file_path);
+
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot create temp file: %s", strerror(errno));
+        free(tmp_path);
+        free(enc);
+        return -1;
+    }
+
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        snprintf(err_msg, err_msg_sz, "fdopen failed: %s", strerror(errno));
+        close(fd);
+        unlink(tmp_path);
+        free(tmp_path);
+        free(enc);
+        return -1;
+    }
+
     fprintf(f, "%s\n", m->recipient);
     fputs(enc, f);
+
+    int write_err = ferror(f);
+    if (fflush(f) != 0) write_err = 1;
+    if (fsync(fd) != 0) write_err = 1;
+
     fclose(f);
     free(enc);
+
+    if (write_err) {
+        snprintf(err_msg, err_msg_sz, "Write error or fsync failed: %s", strerror(errno));
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, m->file_path) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot rename temp file: %s", strerror(errno));
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+
+    free(tmp_path);
     return 0;
 }
 
 static db_manager_t *db_manager_open(const char *path, const char *forced_key,
-                                     char *err_msg, size_t err_msg_sz) {
+    char *err_msg, size_t err_msg_sz) {
     db_manager_t *m = calloc(1, sizeof(db_manager_t));
     if (!m) { snprintf(err_msg, err_msg_sz, "alloc failed"); return NULL; }
     db_manager_init(m);
@@ -579,7 +635,7 @@ static db_manager_t *db_manager_open(const char *path, const char *forced_key,
 }
 
 static db_manager_t *db_manager_create(const char *path, const char *recipient,
-                                       const char *lang, char *err_msg, size_t err_msg_sz) {
+    const char *lang, char *err_msg, size_t err_msg_sz) {
     db_manager_t *m = calloc(1, sizeof(db_manager_t));
     if (!m) { snprintf(err_msg, err_msg_sz, "alloc failed"); return NULL; }
     db_manager_init(m);
@@ -596,11 +652,26 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
     for (int i = 0; i < SCHEMA_COUNT; i++) tmp[i] = xstrdup(SCHEMA_PARTS[i]);
     secure_shuffle((const char **)tmp, SCHEMA_COUNT);
     for (int i = 0; i < SCHEMA_COUNT; i++) m->schema_order[i] = tmp[i];
-    if (lang) strncpy(m->lang, lang, sizeof(m->lang)-1);
+    if (lang) snprintf(m->lang, sizeof(m->lang), "%s", lang);
+
     char *dir = xstrdup(path);
     char *slash = strrchr(dir, '/');
-    if (slash) { *slash = '\0'; mkdir(dir, 0700); }
+    if (slash) {
+        *slash = '\0';
+        struct stat st;
+        if (stat(dir, &st) != 0) {
+            if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+                snprintf(err_msg, err_msg_sz, "Cannot create directory: %s", strerror(errno));
+                free(dir); db_manager_clear(m); free(m); return NULL;
+            }
+        } else if (!S_ISDIR(st.st_mode)) {
+            snprintf(err_msg, err_msg_sz, "Path exists but is not a directory");
+            free(dir); db_manager_clear(m); free(m); return NULL;
+        }
+        chmod(dir, 0700);
+    }
     free(dir);
+
     m->entry_cap = 16;
     m->entries = calloc(m->entry_cap, sizeof(db_entry_t));
     m->entry_count = 0;
@@ -609,7 +680,7 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
 }
 
 static char *db_encode_label(db_manager_t *m, const char *type, const char *size,
-                             const char *content_tag, const char *cipher, const char *dsalt) {
+    const char *content_tag, const char *cipher, const char *dsalt) {
     const char *values[SCHEMA_COUNT];
     const char *raw_names[SCHEMA_COUNT];
     for (int i = 0; i < SCHEMA_COUNT; i++) {
@@ -617,7 +688,7 @@ static char *db_encode_label(db_manager_t *m, const char *type, const char *size
         else if (strcmp(m->schema_order[i], "size") == 0)   { values[i] = size;        raw_names[i] = "size"; }
         else if (strcmp(m->schema_order[i], "content_tag")==0){ values[i] = content_tag; raw_names[i] = "content_tag"; }
         else if (strcmp(m->schema_order[i], "cipher") == 0) { values[i] = cipher;      raw_names[i] = "cipher"; }
-        else if (strcmp(m->schema_order[i], "dsalt") == 0)  { values[i] = dsalt;        raw_names[i] = "dsalt"; }
+        else if (strcmp(m->schema_order[i], "dsalt") == 0)  { values[i] = dsalt;       raw_names[i] = "dsalt"; }
     }
     char blocks[SCHEMA_COUNT][8];
     for (int i = 0; i < SCHEMA_COUNT; i++) {
@@ -629,7 +700,18 @@ static char *db_encode_label(db_manager_t *m, const char *type, const char *size
         snprintf(blocks[i], sizeof(blocks[i]), "%s%c", encoded, schar);
     }
     char label[128] = "";
-    for (int i = 0; i < SCHEMA_COUNT; i++) { if (i > 0) strcat(label, "-"); strcat(label, blocks[i]); }
+    size_t pos = 0;
+    for (int i = 0; i < SCHEMA_COUNT; i++) {
+        if (i > 0) {
+            if (pos < sizeof(label) - 1) label[pos++] = '-';
+        }
+        size_t blen = strlen(blocks[i]);
+        if (pos + blen < sizeof(label)) {
+            memcpy(label + pos, blocks[i], blen);
+            pos += blen;
+        }
+        label[pos] = '\0';
+    }
     return xstrdup(label);
 }
 
@@ -639,8 +721,8 @@ typedef struct {
 } parsed_block_t;
 
 static int db_parse_label(db_manager_t *m, const char *label,
-                          parsed_block_t *out_blocks, int *out_count,
-                          char *err_msg, size_t err_msg_sz) {
+    parsed_block_t *out_blocks, int *out_count,
+    char *err_msg, size_t err_msg_sz) {
     char buf[128];
     strncpy(buf, label, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
     for (char *p = buf; *p; p++) *p = toupper((unsigned char)*p);
@@ -697,10 +779,10 @@ static char *build_label_tooltip(db_manager_t *m, const char *label) {
 }
 
 static int db_add_entry(db_manager_t *m, const char *type, const char *size,
-                        const char *cipher, const char *content_tag, const char *dsalt,
-                        const char *tag_full, const char *dpass, const char *notes,
-                        const char *alias,
-                        char *err_msg, size_t err_msg_sz) {
+    const char *cipher, const char *content_tag, const char *dsalt,
+    const char *tag_full, const char *dpass, const char *notes,
+    const char *alias,
+    char *err_msg, size_t err_msg_sz) {
     if (m->entry_count >= m->entry_cap) {
         int new_cap = m->entry_cap * 2;
         db_entry_t *ne = realloc(m->entries, new_cap * sizeof(db_entry_t));
@@ -735,9 +817,9 @@ static int db_remove_entry(db_manager_t *m, const char *label, char *err_msg, si
 }
 
 static int db_update_entry(db_manager_t *m, const char *label,
-                           const char *new_dpass, const char *new_notes,
-                           const char *new_alias,
-                           char *err_msg, size_t err_msg_sz) {
+    const char *new_dpass, const char *new_notes,
+    const char *new_alias,
+    char *err_msg, size_t err_msg_sz) {
     for (int i = 0; i < m->entry_count; i++) {
         if (strcmp(m->entries[i].label, label) == 0) {
             if (m->entries[i].dpass) { sec_strfree(m->entries[i].dpass); m->entries[i].dpass = NULL; }
@@ -765,6 +847,10 @@ static gpg_key_info_t *gpg_list_keys(gpgme_ctx_t ctx, int secret_only, int *out_
         gerr = gpgme_op_keylist_next(ctx, &key);
         if (gerr == GPG_ERR_EOF) break;
         if (gerr != GPG_ERR_NO_ERROR) break;
+        if (key->revoked || key->expired || key->disabled || key->invalid) {
+            gpgme_key_release(key);
+            continue;
+        }
         if (count >= cap) {
             cap = cap ? cap * 2 : 32;
             gpg_key_info_t *tmp = realloc(result, cap * sizeof(gpg_key_info_t));
@@ -818,15 +904,12 @@ static char *find_icon_path(void) {
     char *p1 = g_build_filename(g_get_user_data_dir(), "diskpass", "disk-icon.png", NULL);
     if (g_file_test(p1, G_FILE_TEST_EXISTS)) return p1;
     g_free(p1);
-
     char *p2 = g_build_filename("/usr/local/share/diskpass", "disk-icon.png", NULL);
     if (g_file_test(p2, G_FILE_TEST_EXISTS)) return p2;
     g_free(p2);
-
     char *p3 = g_build_filename("/usr/share/diskpass", "disk-icon.png", NULL);
     if (g_file_test(p3, G_FILE_TEST_EXISTS)) return p3;
     g_free(p3);
-
     char exe_path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len > 0) {
@@ -837,7 +920,6 @@ static char *find_icon_path(void) {
         if (g_file_test(p4, G_FILE_TEST_EXISTS)) return p4;
         g_free(p4);
     }
-
     if (g_file_test("disk-icon.png", G_FILE_TEST_EXISTS)) return g_strdup("disk-icon.png");
     return NULL;
 }
@@ -861,6 +943,8 @@ static gboolean clipboard_clear_timer(gpointer user_data) {
     (void)user_data;
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(cb, "", 0);
+    GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    gtk_clipboard_set_text(primary, "", 0);
     g_app.clipboard_timer_id = 0;
     return G_SOURCE_REMOVE;
 }
@@ -868,6 +952,8 @@ static gboolean clipboard_clear_timer(gpointer user_data) {
 static void clipboard_copy_secure(const char *text) {
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(cb, text, -1);
+    GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    gtk_clipboard_set_text(primary, "", 0);
     if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
     g_app.clipboard_timer_id = g_timeout_add_seconds(30, clipboard_clear_timer, NULL);
 }
@@ -885,32 +971,32 @@ static void on_back_to_welcome(GtkButton *b, gpointer d) {
 }
 
 static void update_ui_text(void) {
-    if (g_app.welcome_title)    gtk_label_set_text(GTK_LABEL(g_app.welcome_title), "DiskPass");
-    if (g_app.welcome_desc)     gtk_label_set_text(GTK_LABEL(g_app.welcome_desc), i18n("app_desc"));
-    if (g_app.btn_open)         gtk_button_set_label(GTK_BUTTON(g_app.btn_open), i18n("open_db"));
-    if (g_app.btn_create)       gtk_button_set_label(GTK_BUTTON(g_app.btn_create), i18n("create_db"));
+    if (g_app.welcome_title) gtk_label_set_text(GTK_LABEL(g_app.welcome_title), "DiskPass");
+    if (g_app.welcome_desc) gtk_label_set_text(GTK_LABEL(g_app.welcome_desc), i18n("app_desc"));
+    if (g_app.btn_open) gtk_button_set_label(GTK_BUTTON(g_app.btn_open), i18n("open_db"));
+    if (g_app.btn_create) gtk_button_set_label(GTK_BUTTON(g_app.btn_create), i18n("create_db"));
     if (g_app.lbl_lang_welcome) gtk_label_set_text(GTK_LABEL(g_app.lbl_lang_welcome), i18n("language"));
-    if (g_app.setup_title)      gtk_label_set_text(GTK_LABEL(g_app.setup_title), i18n("setup_title"));
-    if (g_app.lbl_setup_file)   gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_file), i18n("db_file"));
-    if (g_app.lbl_setup_key)    gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_key), i18n("pgp_key"));
-    if (g_app.lbl_setup_lang)   gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_lang), i18n("language"));
-    if (g_app.btn_setup_back)   gtk_button_set_label(GTK_BUTTON(g_app.btn_setup_back), i18n("back"));
+    if (g_app.setup_title) gtk_label_set_text(GTK_LABEL(g_app.setup_title), i18n("setup_title"));
+    if (g_app.lbl_setup_file) gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_file), i18n("db_file"));
+    if (g_app.lbl_setup_key) gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_key), i18n("pgp_key"));
+    if (g_app.lbl_setup_lang) gtk_label_set_text(GTK_LABEL(g_app.lbl_setup_lang), i18n("language"));
+    if (g_app.btn_setup_back) gtk_button_set_label(GTK_BUTTON(g_app.btn_setup_back), i18n("back"));
     if (g_app.btn_setup_create) gtk_button_set_label(GTK_BUTTON(g_app.btn_setup_create), i18n("create_btn"));
-    if (g_app.unlock_title)     gtk_label_set_text(GTK_LABEL(g_app.unlock_title), i18n("locked_title"));
-    if (g_app.lbl_unlock_file)  gtk_label_set_text(GTK_LABEL(g_app.lbl_unlock_file), i18n("file"));
-    if (g_app.lbl_unlock_key)   gtk_label_set_text(GTK_LABEL(g_app.lbl_unlock_key), i18n("pgp_key"));
-    if (g_app.btn_unlock_back)  gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock_back), i18n("back"));
-    if (g_app.btn_unlock)       gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock), i18n("unlock_btn"));
-    if (g_app.btn_lock)         gtk_widget_set_tooltip_text(g_app.btn_lock, i18n("lock_db"));
-    if (g_app.btn_add)          gtk_widget_set_tooltip_text(g_app.btn_add, i18n("add_entry"));
-    if (g_app.btn_edit)         gtk_widget_set_tooltip_text(g_app.btn_edit, i18n("edit_entry"));
-    if (g_app.btn_del)          gtk_widget_set_tooltip_text(g_app.btn_del, i18n("del_entry"));
-    if (g_app.btn_sch)          gtk_widget_set_tooltip_text(g_app.btn_sch, i18n("show_schema"));
-    if (g_app.search)           gtk_entry_set_placeholder_text(GTK_ENTRY(g_app.search), i18n("search"));
-    if (g_app.lbl_main)         gtk_label_set_text(GTK_LABEL(g_app.lbl_main), i18n("select_entry"));
-    if (g_app.btn_copy_label)   gtk_button_set_label(GTK_BUTTON(g_app.btn_copy_label), i18n("copy_label"));
-    if (g_app.btn_copy_pass)    gtk_button_set_label(GTK_BUTTON(g_app.btn_copy_pass), i18n("copy_pass"));
-    if (g_app.notes_lbl)        gtk_label_set_text(GTK_LABEL(g_app.notes_lbl), i18n("notes"));
+    if (g_app.unlock_title) gtk_label_set_text(GTK_LABEL(g_app.unlock_title), i18n("locked_title"));
+    if (g_app.lbl_unlock_file) gtk_label_set_text(GTK_LABEL(g_app.lbl_unlock_file), i18n("file"));
+    if (g_app.lbl_unlock_key) gtk_label_set_text(GTK_LABEL(g_app.lbl_unlock_key), i18n("pgp_key"));
+    if (g_app.btn_unlock_back) gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock_back), i18n("back"));
+    if (g_app.btn_unlock) gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock), i18n("unlock_btn"));
+    if (g_app.btn_lock) gtk_widget_set_tooltip_text(g_app.btn_lock, i18n("lock_db"));
+    if (g_app.btn_add) gtk_widget_set_tooltip_text(g_app.btn_add, i18n("add_entry"));
+    if (g_app.btn_edit) gtk_widget_set_tooltip_text(g_app.btn_edit, i18n("edit_entry"));
+    if (g_app.btn_del) gtk_widget_set_tooltip_text(g_app.btn_del, i18n("del_entry"));
+    if (g_app.btn_sch) gtk_widget_set_tooltip_text(g_app.btn_sch, i18n("show_schema"));
+    if (g_app.search) gtk_entry_set_placeholder_text(GTK_ENTRY(g_app.search), i18n("search"));
+    if (g_app.lbl_main) gtk_label_set_text(GTK_LABEL(g_app.lbl_main), i18n("select_entry"));
+    if (g_app.btn_copy_label) gtk_button_set_label(GTK_BUTTON(g_app.btn_copy_label), i18n("copy_label"));
+    if (g_app.btn_copy_pass) gtk_button_set_label(GTK_BUTTON(g_app.btn_copy_pass), i18n("copy_pass"));
+    if (g_app.notes_lbl) gtk_label_set_text(GTK_LABEL(g_app.notes_lbl), i18n("notes"));
 }
 
 static void refresh_entry_list(void) {
@@ -1027,7 +1113,7 @@ static void show_entry_details(int idx) {
         gtk_style_context_add_class(gtk_widget_get_style_context(l1), "dim-label");
         gtk_label_set_xalign(GTK_LABEL(l1), 0.0);
         gtk_grid_attach(grid, l1, 0, row, 1, 1);
-        GtkWidget *l2 = gtk_label_new(e->tag_full && e->tag_full[0] ? e->tag_full : "\xe2\x80\x94");
+        GtkWidget *l2 = gtk_label_new(e->tag_full && e->tag_full[0] ? e->tag_full : "â");
         gtk_label_set_xalign(GTK_LABEL(l2), 0.0);
         gtk_label_set_ellipsize(GTK_LABEL(l2), PANGO_ELLIPSIZE_END);
         gtk_widget_set_hexpand(l2, TRUE);
@@ -1039,12 +1125,12 @@ static void show_entry_details(int idx) {
         gtk_style_context_add_class(gtk_widget_get_style_context(l1), "dim-label");
         gtk_label_set_xalign(GTK_LABEL(l1), 0.0);
         gtk_grid_attach(grid, l1, 0, row, 1, 1);
-        GtkWidget *l2 = gtk_label_new(e->dpass ? "\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f\xe2\x97\x8f" : "\xe2\x80\x94");
+        GtkWidget *l2 = gtk_label_new(e->dpass ? "ââââââââ" : "â");
         gtk_label_set_xalign(GTK_LABEL(l2), 0.0);
         gtk_grid_attach(grid, l2, 1, row, 1, 1);
         row++;
     }
-    gtk_label_set_text(GTK_LABEL(g_app.notes_text), e->notes && e->notes[0] ? e->notes : "\xe2\x80\x94");
+    gtk_label_set_text(GTK_LABEL(g_app.notes_text), e->notes && e->notes[0] ? e->notes : "â");
     gtk_widget_show_all(GTK_WIDGET(grid));
 }
 
@@ -1064,9 +1150,9 @@ static gboolean filter_func(GtkListBoxRow *row, gpointer user_data) {
     db_entry_t *e = &g_app.db->entries[idx];
     char searchable[512];
     snprintf(searchable, sizeof(searchable), "%s %s %s %s %s %s %s",
-             e->label?e->label:"", e->type?e->type:"", e->size?e->size:"",
-             e->content_tag?e->content_tag:"", e->cipher?e->cipher:"", e->dsalt?e->dsalt:"",
-             e->alias?e->alias:"");
+        e->label?e->label:"", e->type?e->type:"", e->size?e->size:"",
+        e->content_tag?e->content_tag:"", e->cipher?e->cipher:"", e->dsalt?e->dsalt:"",
+        e->alias?e->alias:"");
     char lq[64]; strncpy(lq, query, sizeof(lq)-1); lq[sizeof(lq)-1]='\0';
     for (char *p = lq; *p; p++) *p = tolower((unsigned char)*p);
     char ls[512]; strncpy(ls, searchable, sizeof(ls)-1); ls[sizeof(ls)-1]='\0';
@@ -1104,6 +1190,14 @@ static void on_lock_clicked(GtkButton *btn, gpointer user_data) {
     free(g_app.expected_fp); g_app.expected_fp = NULL;
     clear_details();
     refresh_entry_list();
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(cb, "", 0);
+    GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    gtk_clipboard_set_text(primary, "", 0);
+    if (g_app.clipboard_timer_id) {
+        g_source_remove(g_app.clipboard_timer_id);
+        g_app.clipboard_timer_id = 0;
+    }
     gtk_stack_set_visible_child_name(g_app.stack, "welcome");
 }
 
@@ -1153,10 +1247,14 @@ static void on_open_clicked(GtkButton *btn, gpointer user_data) {
         if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
         g_app.db = calloc(1, sizeof(db_manager_t));
         db_manager_init(g_app.db);
-        gpgme_new(&g_app.db->gpg_ctx);
-        gpgme_set_protocol(g_app.db->gpg_ctx, GPGME_PROTOCOL_OpenPGP);
-        populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.unlock_key_combo), 1, g_app.unlock_err);
-        gtk_stack_set_visible_child_name(g_app.stack, "unlock");
+        gpgme_error_t gerr = gpgme_new(&g_app.db->gpg_ctx);
+        if (gerr != GPG_ERR_NO_ERROR) {
+            db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL;
+        } else {
+            gpgme_set_protocol(g_app.db->gpg_ctx, GPGME_PROTOCOL_OpenPGP);
+            populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.unlock_key_combo), 1, g_app.unlock_err);
+            gtk_stack_set_visible_child_name(g_app.stack, "unlock");
+        }
     }
     gtk_widget_destroy(dlg);
 }
@@ -1185,10 +1283,14 @@ static void on_create_clicked(GtkButton *btn, gpointer user_data) {
         if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
         g_app.db = calloc(1, sizeof(db_manager_t));
         db_manager_init(g_app.db);
-        gpgme_new(&g_app.db->gpg_ctx);
-        gpgme_set_protocol(g_app.db->gpg_ctx, GPGME_PROTOCOL_OpenPGP);
-        populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.key_combo), 0, g_app.setup_err);
-        gtk_stack_set_visible_child_name(g_app.stack, "setup");
+        gpgme_error_t gerr = gpgme_new(&g_app.db->gpg_ctx);
+        if (gerr != GPG_ERR_NO_ERROR) {
+            db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL;
+        } else {
+            gpgme_set_protocol(g_app.db->gpg_ctx, GPGME_PROTOCOL_OpenPGP);
+            populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.key_combo), 0, g_app.setup_err);
+            gtk_stack_set_visible_child_name(g_app.stack, "setup");
+        }
     }
     gtk_widget_destroy(dlg);
 }
@@ -1255,6 +1357,14 @@ static void on_add_type_changed(GtkComboBoxText *combo, gpointer user_data) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(vsz), 0);
 }
 
+static void on_toggle_password_visibility(GtkEntry *entry, GtkEntryIconPosition pos, GdkEvent *event, gpointer user_data) {
+    (void)pos; (void)event; (void)user_data;
+    gboolean visible = gtk_entry_get_visibility(entry);
+    gtk_entry_set_visibility(entry, !visible);
+    gtk_entry_set_icon_from_icon_name(entry, GTK_ENTRY_ICON_SECONDARY,
+        !visible ? "eye-open-symbolic" : "eye-not-looking-symbolic");
+}
+
 static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
     if (!g_app.db) return;
@@ -1289,7 +1399,14 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_grid_attach(grid, vci, 1, row++, 1, 1);
     gtk_grid_attach(grid, gtk_label_new(i18n("password")), 0, row, 1, 1);
     GtkWidget *ph = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *vdp = gtk_entry_new(); gtk_widget_set_hexpand(vdp, TRUE);
+    GtkWidget *vdp = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(vdp), FALSE);
+    gtk_entry_set_invisible_char(GTK_ENTRY(vdp), '*');
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, "eye-not-looking-symbolic");
+    gtk_entry_set_icon_activatable(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, TRUE);
+    gtk_entry_set_icon_tooltip_text(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, "Toggle visibility");
+    g_signal_connect(vdp, "icon-press", G_CALLBACK(on_toggle_password_visibility), NULL);
+    gtk_widget_set_hexpand(vdp, TRUE);
     gtk_box_pack_start(GTK_BOX(ph), vdp, TRUE, TRUE, 0);
     GtkWidget *bg = gtk_button_new_from_icon_name("view-refresh", GTK_ICON_SIZE_BUTTON);
     gtk_widget_set_tooltip_text(bg, i18n("generate"));
@@ -1379,6 +1496,12 @@ static void on_edit_clicked(GtkButton *btn, gpointer user_data) {
     gtk_grid_attach(GTK_GRID(grid), gtk_label_new(i18n("password")), 0, 2, 1, 1);
     GtkWidget *ph = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *vdp = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(vdp), FALSE);
+    gtk_entry_set_invisible_char(GTK_ENTRY(vdp), '*');
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, "eye-not-looking-symbolic");
+    gtk_entry_set_icon_activatable(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, TRUE);
+    gtk_entry_set_icon_tooltip_text(GTK_ENTRY(vdp), GTK_ENTRY_ICON_SECONDARY, "Toggle visibility");
+    g_signal_connect(vdp, "icon-press", G_CALLBACK(on_toggle_password_visibility), NULL);
     if (e->dpass) gtk_entry_set_text(GTK_ENTRY(vdp), e->dpass);
     gtk_widget_set_hexpand(vdp, TRUE);
     gtk_box_pack_start(GTK_BOX(ph), vdp, TRUE, TRUE, 0);
@@ -1506,7 +1629,7 @@ static void on_lang_changed_welcome(GtkComboBoxText *combo, gpointer user_data) 
     (void)user_data;
     gchar *id = (gchar*)gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
     if (id && strcmp(id, g_lang) != 0) {
-        strncpy(g_lang, id, sizeof(g_lang)-1);
+        snprintf(g_lang, sizeof(g_lang), "%s", id);
         gtk_combo_box_set_active_id(GTK_COMBO_BOX(g_app.lang_combo), g_lang);
         update_ui_text();
     }
@@ -1517,18 +1640,14 @@ static void build_welcome(void) {
     gtk_widget_set_valign(box, GTK_ALIGN_CENTER);
     gtk_widget_set_halign(box, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_start(box, 40); gtk_widget_set_margin_end(box, 40);
-
     GtkWidget *img = make_icon_img(72);
     gtk_box_pack_start(GTK_BOX(box), img, FALSE, FALSE, 0);
-
     g_app.welcome_title = gtk_label_new("DiskPass");
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.welcome_title), "welcome-title");
     gtk_box_pack_start(GTK_BOX(box), g_app.welcome_title, FALSE, FALSE, 0);
-
     g_app.welcome_desc = gtk_label_new(i18n("app_desc"));
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.welcome_desc), "dim-label");
     gtk_box_pack_start(GTK_BOX(box), g_app.welcome_desc, FALSE, FALSE, 0);
-
     GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(btn_box, 18);
     g_app.btn_open = gtk_button_new_with_label(i18n("open_db"));
@@ -1539,7 +1658,6 @@ static void build_welcome(void) {
     g_signal_connect(g_app.btn_create, "clicked", G_CALLBACK(on_create_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(btn_box), g_app.btn_create, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), btn_box, FALSE, FALSE, 0);
-
     GtkWidget *lang_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     gtk_widget_set_margin_top(lang_box, 20);
     g_app.lbl_lang_welcome = gtk_label_new(i18n("language"));
@@ -1551,7 +1669,6 @@ static void build_welcome(void) {
     g_signal_connect(g_app.lang_combo_welcome, "changed", G_CALLBACK(on_lang_changed_welcome), NULL);
     gtk_box_pack_start(GTK_BOX(lang_box), g_app.lang_combo_welcome, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), lang_box, FALSE, FALSE, 0);
-
     gtk_stack_add_named(g_app.stack, box, "welcome");
 }
 
@@ -1656,18 +1773,15 @@ static void build_main(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(toolbar), "main-toolbar");
     gtk_widget_set_margin_top(toolbar, 6); gtk_widget_set_margin_bottom(toolbar, 6);
     gtk_widget_set_margin_start(toolbar, 6); gtk_widget_set_margin_end(toolbar, 6);
-
     g_app.btn_lock = gtk_button_new_from_icon_name("changes-prevent-symbolic", GTK_ICON_SIZE_BUTTON);
     gtk_widget_set_tooltip_text(g_app.btn_lock, i18n("lock_db"));
     g_signal_connect(g_app.btn_lock, "clicked", G_CALLBACK(on_lock_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(toolbar), g_app.btn_lock, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), gtk_label_new(""), TRUE, TRUE, 0);
-
     g_app.btn_sch = gtk_button_new_from_icon_name("dialog-information-symbolic", GTK_ICON_SIZE_BUTTON);
     gtk_widget_set_tooltip_text(g_app.btn_sch, i18n("show_schema"));
     g_signal_connect(g_app.btn_sch, "clicked", G_CALLBACK(on_schema_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(toolbar), g_app.btn_sch, FALSE, FALSE, 0);
-
     GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(btn_box), "linked");
     g_app.btn_add = gtk_button_new_from_icon_name("list-add-symbolic", GTK_ICON_SIZE_BUTTON);
@@ -1686,11 +1800,9 @@ static void build_main(void) {
     gtk_box_pack_start(GTK_BOX(btn_box), g_app.btn_del, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(toolbar), btn_box, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(main_box), toolbar, FALSE, FALSE, 0);
-
     GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_set_position(GTK_PANED(paned), 300);
     gtk_paned_set_wide_handle(GTK_PANED(paned), TRUE);
-
     GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     GtkWidget *search_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(search_box), "sidebar");
@@ -1712,7 +1824,6 @@ static void build_main(void) {
     gtk_container_add(GTK_CONTAINER(sw), GTK_WIDGET(g_app.listbox));
     gtk_box_pack_start(GTK_BOX(left_box), sw, TRUE, TRUE, 0);
     gtk_paned_pack1(GTK_PANED(paned), left_box, TRUE, FALSE);
-
     GtkWidget *detail_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(detail_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_vexpand(detail_scroll, TRUE);
@@ -1720,7 +1831,6 @@ static void build_main(void) {
     gtk_widget_set_margin_top(g_app.detail_box, 18); gtk_widget_set_margin_bottom(g_app.detail_box, 18);
     gtk_widget_set_margin_start(g_app.detail_box, 24); gtk_widget_set_margin_end(g_app.detail_box, 24);
     gtk_widget_set_valign(g_app.detail_box, GTK_ALIGN_START);
-
     GtkWidget *top_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     g_app.lbl_main = gtk_label_new(i18n("select_entry"));
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.lbl_main), "detail-title");
@@ -1781,13 +1891,13 @@ static void load_css(void) {
         ".linked button:last-child { border-radius: 0 5px 5px 0; }"
         "entry, combobox entry { border-radius: 5px; }"
         ".schema-val { background-color: #aee; color: #333; font-family: monospace;"
-        "  font-weight: bold; font-size: 18px; padding: 8px 4px;"
-        "  border-radius: 4px 0 0 4px; border: 1px solid #3aa; }"
+        " font-weight: bold; font-size: 18px; padding: 8px 4px;"
+        " border-radius: 4px 0 0 4px; border: 1px solid #3aa; }"
         ".schema-salt { background-color: #fea; color: #333; font-family: monospace;"
-        "  font-weight: bold; font-size: 18px; padding: 8px 4px;"
-        "  border-radius: 0 4px 4px 0; border: 1px solid #c93; }"
+        " font-weight: bold; font-size: 18px; padding: 8px 4px;"
+        " border-radius: 0 4px 4px 0; border: 1px solid #c93; }"
         ".schema-dash { font-family: monospace; font-weight: bold; font-size: 18px;"
-        "  padding: 8px 0; color: #999; }";
+        " padding: 8px 0; color: #999; }";
     GtkCssProvider *provider = gtk_css_provider_new();
     GError *error = NULL;
     gtk_css_provider_load_from_data(provider, css, -1, &error);
@@ -1797,7 +1907,40 @@ static void load_css(void) {
     g_object_unref(provider);
 }
 
+static void graceful_shutdown(int sig) {
+    (void)sig;
+    if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
+    GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(cb, "", 0);
+    GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    gtk_clipboard_set_text(primary, "", 0);
+    if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
+    free(g_app.current_file); g_app.current_file = NULL;
+    free(g_app.expected_fp); g_app.expected_fp = NULL;
+    gtk_main_quit();
+}
+
+static void setup_accelerators(GtkWidget *win) {
+    GtkAccelGroup *accel = gtk_accel_group_new();
+    gtk_window_add_accel_group(GTK_WINDOW(win), accel);
+    gtk_widget_add_accelerator(g_app.btn_add, "clicked", accel,
+        GDK_KEY_n, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_del, "clicked", accel,
+        GDK_KEY_Delete, 0, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_lock, "clicked", accel,
+        GDK_KEY_l, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_sch, "clicked", accel,
+        GDK_KEY_s, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_copy_label, "clicked", accel,
+        GDK_KEY_c, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_copy_pass, "clicked", accel,
+        GDK_KEY_p, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.search, "grab-focus", accel,
+        GDK_KEY_f, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+}
+
 int main(int argc, char **argv) {
+    umask(0077);
     setlocale(LC_ALL, "");
     if (!g_get_charset(NULL)) {
         g_setenv("LANG", "C.UTF-8", TRUE);
@@ -1806,42 +1949,37 @@ int main(int argc, char **argv) {
     if (sodium_init() < 0) { fprintf(stderr, "FATAL: libsodium init failed\n"); return 1; }
     if (!gpgme_check_version("1.14.0")) { fprintf(stderr, "FATAL: GPGME >= 1.14.0 required\n"); return 1; }
     gpgme_set_locale(NULL, LC_CTYPE, setlocale(LC_CTYPE, NULL));
-
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
+        fprintf(stderr, "WARNING: mlockall failed: %s\n", strerror(errno));
+    }
+    signal(SIGINT, graceful_shutdown);
+    signal(SIGTERM, graceful_shutdown);
     gtk_init(&argc, &argv);
     load_css();
-
     memset(&g_app, 0, sizeof(g_app));
-
     char *icon_path = find_icon_path();
     if (icon_path) {
         icon_pb = gdk_pixbuf_new_from_file_at_size(icon_path, 256, 256, NULL);
         g_free(icon_path);
     }
-
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "DiskPass");
     gtk_window_set_default_size(GTK_WINDOW(win), 850, 550);
     gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
-
-    if (icon_pb)
-        gtk_window_set_icon(GTK_WINDOW(win), icon_pb);
-
+    if (icon_pb) gtk_window_set_icon(GTK_WINDOW(win), icon_pb);
     g_app.window = GTK_WINDOW(win);
     g_app.stack = GTK_STACK(gtk_stack_new());
     gtk_stack_set_transition_type(g_app.stack, GTK_STACK_TRANSITION_TYPE_CROSSFADE);
     gtk_container_add(GTK_CONTAINER(win), GTK_WIDGET(g_app.stack));
-
     build_welcome();
     build_setup();
     build_unlock();
     build_main();
-
+    setup_accelerators(win);
     gtk_stack_set_visible_child_name(g_app.stack, "welcome");
     g_signal_connect(win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     gtk_widget_show_all(win);
-
     gtk_main();
-
     if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
     if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
     free(g_app.current_file);
@@ -1849,5 +1987,7 @@ int main(int argc, char **argv) {
     if (icon_pb) g_object_unref(icon_pb);
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(cb, "", 0);
+    GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
+    gtk_clipboard_set_text(primary, "", 0);
     return 0;
 }
