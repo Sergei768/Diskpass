@@ -56,7 +56,11 @@ static const map_entry_t TYPE_MAP[] = {
     {"HDD","H"},{"SSD","S"},{"USB","U"},{"M.2","M"},{"SD","D"},{"CF","C"},
     {"OPTICAL","O"},{"OTHER","X"},
     {"LTO1","1"},{"LTO2","2"},{"LTO3","3"},{"LTO4","4"},
-    {"LTO5","5"},{"LTO6","6"},{"LTO7","7"},{"LTO8","8"},{"LTO9","9"}
+    {"LTO5","5"},{"LTO6","6"},{"LTO7","7"},{"LTO8","8"},{"LTO9","9"},
+    {"LTO10","0"},{"LTO11","A"},{"LTO12","B"},{"LTO13","E"},{"LTO14","F"},
+    {"microSD","G"},{"CFast","I"},{"XQD","J"},{"CFexpress","K"},{"NVMe","L"},
+    {"HDD_External","N"},{"MMC","P"},{"MemoryStick","Q"},{"SD_Express","R"},
+    {"UFS","T"},{"HVD","V"},{"DAT","W"},{"AIT","Y"},{"Floppy","Z"}
 };
 static const int TYPE_MAP_N = ARRAY_SIZE(TYPE_MAP);
 
@@ -70,7 +74,25 @@ static const map_entry_t SIZE_MAP[] = {
     {"3TB","T6"},{"3.0TB","T7"},{"4TB","T8"},{"6TB","T9"},{"6.25TB","TA"},
     {"8TB","TB"},{"10TB","TC"},{"12TB","TD"},{"14TB","TE"},{"15TB","TF"},
     {"16TB","TG"},{"18TB","TH"},{"20TB","TJ"},{"22TB","TK"},
-    {"24TB","TM"},{"30TB","TN"},{"36TB","TP"},{"45TB","TQ"}
+    {"24TB","TM"},{"30TB","TN"},{"36TB","TP"},{"45TB","TQ"},
+    {"512MB","W1"},{"640MB","W2"},{"9.4GB","W3"},{"5TB","W4"},{"28TB","W5"},
+    {"32TB","W6"},{"34TB","W7"},{"44TB","W8"},{"15.36TB","W9"},{"30.72TB","WA"},
+    {"61.44TB","WB"},{"122.88TB","WC"},{"3.9TB","WD"},
+    {"1MB","WE"},{"2MB","WF"},{"4MB","WG"},{"8MB","WH"},{"16MB","WJ"},{"32MB","WK"},
+    {"64MB","WM"},{"128MB","WN"},{"256MB","WP"},
+    {"360KB","WQ"},{"720KB","WR"},{"1.2MB","WS"},{"1.44MB","WT"},{"2.88MB","WV"},
+    {"100MB","WW"},{"250MB","WX"},{"750MB","WY"},{"1.3GB","WZ"},
+    {"2.6GB","V0"},{"5.2GB","V1"},{"9.1GB","V2"},
+    {"40MB","V3"},{"80MB","V4"},{"120MB","V5"},{"125MB","V6"},{"200MB","V7"},
+    {"340MB","V8"},{"400MB","V9"},{"680MB","VA"},
+    {"1.1GB","VB"},{"1.6GB","VC"},{"2.2GB","VD"},{"2.5GB","VE"},{"5GB","VF"},
+    {"15GB","VG"},{"20GB","VH"},{"35GB","VJ"},{"38GB","VK"},
+    {"70GB","VM"},{"75GB","VN"},{"80GB","VP"},{"110GB","VQ"},{"140GB","VR"},
+    {"160GB","VS"},{"175GB","VT"},{"220GB","VV"},{"260GB","VW"},{"300GB","VX"},
+    {"365TB","VY"},{"520GB","VZ"},{"525TB","U1"},{"600GB","U2"},{"913TB","U3"},
+    {"1Mb","U4"},{"4Mb","U5"},{"8Mb","U6"},{"16Mb","U7"},{"32Mb","U8"},
+    {"64Mb","U9"},{"128Mb","UA"},{"256Mb","UB"},{"1Gb","UC"},{"2Gb","UD"},{"4Gb","UE"},
+    {"4KB","UF"},{"16KB","UG"},{"64KB","UH"},{"256KB","UJ"}
 };
 static const int SIZE_MAP_N = ARRAY_SIZE(SIZE_MAP);
 
@@ -82,11 +104,22 @@ static const int CIPHER_MAP_N = ARRAY_SIZE(CIPHER_MAP);
 
 static const char *SIZE_FOR_USB[] = {"1GB","2GB","4GB","8GB","16GB","32GB","64GB","128GB","256GB","512GB","1TB","2TB",NULL};
 static const char *SIZE_FOR_SD[] = {"4GB","8GB","16GB","32GB","64GB","128GB","256GB","512GB","1TB","2TB",NULL};
-static const char *SIZE_FOR_CF[] = {"4GB","8GB","16GB","32GB","64GB","128GB","256GB","512GB",NULL};
-static const char *SIZE_FOR_HDD[] = {"250GB","320GB","500GB","1TB","2TB","3TB","4TB","6TB","8TB","10TB","12TB","14TB","16TB","18TB","20TB","22TB","24TB",NULL};
+static const char *SIZE_FOR_MICROSD[] = {"512MB","1GB","2GB","4GB","8GB","16GB","32GB","64GB","128GB","256GB","512GB","1TB",NULL};
+static const char *SIZE_FOR_CF[] = {"512MB","1GB","2GB","4GB","8GB","16GB","32GB","64GB","128GB","256GB",NULL};
+static const char *SIZE_FOR_CFAST[] = {"8GB","16GB","32GB","64GB","128GB","256GB","512GB","1TB",NULL};
+static const char *SIZE_FOR_XQD[] = {"32GB","64GB","120GB","128GB","240GB","256GB",NULL};
+static const char *SIZE_FOR_CFEXPRESS[] = {"128GB","256GB","400GB","512GB","1TB","2TB","4TB",NULL};
+static const char *SIZE_FOR_SDEXPRESS[] = {"128GB","256GB","512GB","1TB",NULL};
+static const char *SIZE_FOR_UFS[] = {"128GB","256GB","512GB","1TB",NULL};
+static const char *SIZE_FOR_MEMORYSTICK[] = {"4MB","8MB","16MB","32MB","64MB","128MB","256MB","512MB","1GB","2GB","4GB","8GB","16GB","32GB",NULL};
+static const char *SIZE_FOR_MMC[] = {"8MB","16MB","32MB","64MB","128MB","256MB","512MB","1GB","2GB","4GB","8GB","16GB",NULL};
+static const char *SIZE_FOR_HDD[] = {"250GB","320GB","500GB","1TB","2TB","3TB","4TB","5TB","6TB","8TB","10TB","12TB","14TB","16TB","18TB","20TB","22TB","24TB","28TB","30TB","32TB","34TB","44TB",NULL};
+static const char *SIZE_FOR_HDD_EXT[] = {"500GB","1TB","2TB","4TB","6TB","8TB","10TB","12TB","14TB","16TB","18TB","20TB","24TB","30TB",NULL};
 static const char *SIZE_FOR_SSD[] = {"120GB","128GB","240GB","250GB","256GB","480GB","500GB","512GB","1TB","2TB","4TB","8TB","16TB",NULL};
-static const char *SIZE_FOR_M2[] = {"128GB","250GB","256GB","500GB","512GB","1TB","2TB","4TB","8TB",NULL};
-static const char *SIZE_FOR_OPT[] = {"700MB","4.7GB","8.5GB","25GB","50GB","100GB",NULL};
+static const char *SIZE_FOR_M2[] = {"128GB","250GB","256GB","500GB","512GB","1TB","2TB","4TB","8TB","16TB",NULL};
+static const char *SIZE_FOR_NVME[] = {"256GB","512GB","1TB","2TB","4TB","8TB","15.36TB","30.72TB","61.44TB","122.88TB",NULL};
+static const char *SIZE_FOR_OPT[] = {"640MB","700MB","4.7GB","8.5GB","9.4GB","25GB","50GB","100GB","128GB",NULL};
+static const char *SIZE_FOR_HVD[] = {"100GB","1TB","3.9TB",NULL};
 static const char *SIZE_FOR_LTO1[] = {"100GB","200GB",NULL};
 static const char *SIZE_FOR_LTO2[] = {"200GB","400GB",NULL};
 static const char *SIZE_FOR_LTO3[] = {"400GB","800GB",NULL};
@@ -96,24 +129,49 @@ static const char *SIZE_FOR_LTO6[] = {"2.5TB","6.25TB",NULL};
 static const char *SIZE_FOR_LTO7[] = {"6TB","15TB",NULL};
 static const char *SIZE_FOR_LTO8[] = {"12TB","30TB",NULL};
 static const char *SIZE_FOR_LTO9[] = {"18TB","45TB",NULL};
+static const char *SIZE_FOR_LTO10[] = {"30TB","40TB","75TB","100TB",NULL};
+static const char *SIZE_FOR_LTO11[] = {"70TB","175TB",NULL};
+static const char *SIZE_FOR_LTO12[] = {"120TB","300TB",NULL};
+static const char *SIZE_FOR_LTO13[] = {"210TB","525TB",NULL};
+static const char *SIZE_FOR_LTO14[] = {"365TB","913TB",NULL};
+static const char *SIZE_FOR_DAT[] = {"1.3GB","2GB","4GB","8GB","12GB","20GB","40GB","80GB","160GB",NULL};
+static const char *SIZE_FOR_AIT[] = {"25GB","35GB","50GB","100GB","200GB","260GB","520GB","1TB","1.3TB","2TB",NULL};
+static const char *SIZE_FOR_FLOPPY[] = {"360KB","720KB","1.2MB","1.44MB","2.88MB",NULL};
 static const char *SIZE_FOR_OTHER[] = {
-    "700MB","1GB","2GB","4GB","8GB","16GB","32GB","64GB",
-    "4.7GB","8.5GB","25GB","50GB","100GB",
-    "120GB","128GB","200GB","240GB","250GB","256GB",
-    "320GB","400GB","480GB","500GB","512GB","800GB",
+    "360KB","512MB","640MB","700MB","1MB","2MB","4MB","8MB","16MB","32MB","64MB","128MB","256MB",
+    "1GB","2GB","4GB","8GB","16GB","32GB","64GB","128GB","256GB","512GB",
+    "4.7GB","8.5GB","9.4GB","25GB","50GB","100GB",
+    "120GB","240GB","250GB","320GB","400GB","480GB","500GB","800GB",
     "1TB","1.5TB","1.6TB","2TB","2.5TB","3TB","3.0TB",
-    "4TB","6TB","6.25TB","8TB","10TB","12TB","14TB","15TB",
-    "16TB","18TB","20TB","22TB","24TB","30TB","36TB","45TB",NULL
+    "4TB","5TB","6TB","6.25TB","8TB","10TB","12TB","14TB","15TB",
+    "16TB","18TB","20TB","20TB","22TB","24TB","28TB","30TB","32TB","34TB","36TB","44TB","45TB",
+    "15.36TB","30.72TB","61.44TB","122.88TB",
+    "1.3GB","2.6GB","5.2GB","9.1GB","3.9TB",
+    "100MB","250MB","750MB","40MB","80MB","120MB","125MB","200MB","340MB","680MB",
+    "1.1GB","2.2GB","2.5GB","5GB","15GB","35GB","38GB","70GB","75GB","80GB",
+    "110GB","140GB","160GB","175GB","220GB","260GB","300GB","365TB","520GB","525TB","600GB","913TB",
+    "1Mb","4Mb","8Mb","16Mb","32Mb","64Mb","128Mb","256Mb","1Gb","2Gb","4Gb",
+    "4KB","16KB","64KB","256KB",
+    NULL
 };
 
 typedef struct { const char *type; const char **sizes; } type_size_assoc_t;
 static const type_size_assoc_t TYPE_SIZE_MAP[] = {
-    {"USB",SIZE_FOR_USB},{"SD",SIZE_FOR_SD},{"CF",SIZE_FOR_CF},
-    {"HDD",SIZE_FOR_HDD},{"SSD",SIZE_FOR_SSD},{"M.2",SIZE_FOR_M2},
-    {"OPTICAL",SIZE_FOR_OPT},{"OTHER",SIZE_FOR_OTHER},
+    {"USB",SIZE_FOR_USB},{"SD",SIZE_FOR_SD},{"microSD",SIZE_FOR_MICROSD},
+    {"CF",SIZE_FOR_CF},{"CFast",SIZE_FOR_CFAST},{"XQD",SIZE_FOR_XQD},
+    {"CFexpress",SIZE_FOR_CFEXPRESS},{"SD_Express",SIZE_FOR_SDEXPRESS},
+    {"UFS",SIZE_FOR_UFS},{"MemoryStick",SIZE_FOR_MEMORYSTICK},{"MMC",SIZE_FOR_MMC},
+    {"HDD",SIZE_FOR_HDD},{"HDD_External",SIZE_FOR_HDD_EXT},
+    {"SSD",SIZE_FOR_SSD},{"M.2",SIZE_FOR_M2},{"NVMe",SIZE_FOR_NVME},
+    {"OPTICAL",SIZE_FOR_OPT},{"HVD",SIZE_FOR_HVD},
     {"LTO1",SIZE_FOR_LTO1},{"LTO2",SIZE_FOR_LTO2},{"LTO3",SIZE_FOR_LTO3},
     {"LTO4",SIZE_FOR_LTO4},{"LTO5",SIZE_FOR_LTO5},{"LTO6",SIZE_FOR_LTO6},
-    {"LTO7",SIZE_FOR_LTO7},{"LTO8",SIZE_FOR_LTO8},{"LTO9",SIZE_FOR_LTO9}
+    {"LTO7",SIZE_FOR_LTO7},{"LTO8",SIZE_FOR_LTO8},{"LTO9",SIZE_FOR_LTO9},
+    {"LTO10",SIZE_FOR_LTO10},{"LTO11",SIZE_FOR_LTO11},{"LTO12",SIZE_FOR_LTO12},
+    {"LTO13",SIZE_FOR_LTO13},{"LTO14",SIZE_FOR_LTO14},
+    {"DAT",SIZE_FOR_DAT},{"AIT",SIZE_FOR_AIT},
+    {"Floppy",SIZE_FOR_FLOPPY},
+    {"OTHER",SIZE_FOR_OTHER}
 };
 static const int TYPE_SIZE_MAP_N = ARRAY_SIZE(TYPE_SIZE_MAP);
 
