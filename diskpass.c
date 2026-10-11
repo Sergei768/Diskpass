@@ -34,14 +34,14 @@
 
 #define DB_VERSION 3
 #define AUTOLOCK_SECONDS 300
-#define DB_MAX_FILE_BYTES (128U * 1024U * 1024U)
-#define DB_MAX_JSON_BYTES (64U * 1024U * 1024U)
+#define DB_MAX_FILE_BYTES (32ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DB_MAX_JSON_BYTES (16ULL * 1024ULL * 1024ULL * 1024ULL)
 #define DB_MAX_ENTRIES 100000
 #define DB_MAX_FILTERS 256
-#define DB_MAX_INDEX_BYTES (32U * 1024U * 1024U)
-#define DB_MAX_INDEX_FILES 500000
-#define DB_MAX_INDEX_QUEUED_DIRS 100000
-#define DB_MAX_INDEX_DIRS 500000
+#define DB_MAX_INDEX_BYTES (8ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DB_MAX_INDEX_FILES 100000000ULL
+#define DB_MAX_INDEX_QUEUED_DIRS 2000000ULL
+#define DB_MAX_INDEX_DIRS 10000000ULL
 
 static const char ALPHABET[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 static const size_t ALPHABET_LEN = 32;
@@ -1874,6 +1874,7 @@ static void fs_to_store(fs_node_t *node, GtkTreeStore *store, GtkTreeIter *paren
 
 static char *scan_directory_recursive(const char *root) {
     if (!root || !root[0]) return NULL;
+
     GString *s = g_string_new(NULL);
     GQueue *queue = g_queue_new();
     if (!s || !queue) {
@@ -1881,6 +1882,7 @@ static char *scan_directory_recursive(const char *root) {
         if (queue) g_queue_free(queue);
         return NULL;
     }
+
     char *root_copy = g_strdup(root);
     if (!root_copy) {
         g_string_free(s, TRUE);
@@ -1888,10 +1890,19 @@ static char *scan_directory_recursive(const char *root) {
         return NULL;
     }
     g_queue_push_tail(queue, root_copy);
+
     size_t root_len = strlen(root);
     size_t files_count = 0;
     size_t dirs_count = 0;
     gboolean exceeded = FALSE;
+
+    static const char *skip_names[] = {
+        "node_modules", ".cache", ".git", ".svn", ".hg",
+        "proc", "sys", "dev", "run",
+        "__pycache__", ".npm", ".cargo", ".rustup", ".gradle",
+        ".thumbnails", "lost+found",
+        NULL
+    };
 
     while (!g_queue_is_empty(queue) && !exceeded) {
         char *dir = g_queue_pop_head(queue);
@@ -1900,53 +1911,74 @@ static char *scan_directory_recursive(const char *root) {
             exceeded = TRUE;
             break;
         }
+
         GError *dir_err = NULL;
         GDir *d = g_dir_open(dir, 0, &dir_err);
         if (!d) {
             if (dir_err) g_error_free(dir_err);
             secure_g_free_string(&dir);
-            exceeded = TRUE;
-            break;
+            continue;
         }
-        if (d) {
-            const char *name;
-            while ((name = g_dir_read_name(d))) {
-                char *full = g_build_filename(dir, name, NULL);
-                struct stat st;
-                if (!full || lstat(full, &st) != 0) { secure_g_free_string(&full); continue; }
-                if (S_ISDIR(st.st_mode)) {
-                    if (g_queue_get_length(queue) >= DB_MAX_INDEX_QUEUED_DIRS) {
-                        secure_g_free_string(&full); exceeded = TRUE; break;
-                    }
-                    g_queue_push_tail(queue, full);
-                } else if (S_ISREG(st.st_mode)) {
-                    const char *rel = full + root_len;
-                    while (*rel == '/' || *rel == '\\') rel++;
-                    size_t need = strlen(rel) + 32;
-                    if (files_count >= DB_MAX_INDEX_FILES || need > DB_MAX_INDEX_BYTES - s->len) {
-                        secure_g_free_string(&full); exceeded = TRUE; break;
-                    }
-                    g_string_append_printf(s, "%s\t%lld\n", rel, (long long)st.st_size);
-                    files_count++;
-                    secure_g_free_string(&full);
-                } else {
-                    secure_g_free_string(&full);
-                }
+
+        const char *name;
+        while ((name = g_dir_read_name(d))) {
+            gboolean skip = FALSE;
+            for (int i = 0; skip_names[i]; i++) {
+                if (strcmp(name, skip_names[i]) == 0) { skip = TRUE; break; }
             }
-            g_dir_close(d);
+            if (skip) continue;
+
+            char *full = g_build_filename(dir, name, NULL);
+            struct stat st;
+            if (!full || lstat(full, &st) != 0) {
+                secure_g_free_string(&full);
+                continue;
+            }
+
+            if (S_ISDIR(st.st_mode)) {
+                if (g_queue_get_length(queue) >= DB_MAX_INDEX_QUEUED_DIRS) {
+                    secure_g_free_string(&full);
+                    exceeded = TRUE;
+                    break;
+                }
+                g_queue_push_tail(queue, full);
+            } else if (S_ISREG(st.st_mode)) {
+                const char *rel = full + root_len;
+                while (*rel == '/' || *rel == '\\') rel++;
+                size_t need = strlen(rel) + 32;
+                if (files_count >= DB_MAX_INDEX_FILES ||
+                    need > DB_MAX_INDEX_BYTES - s->len) {
+                    secure_g_free_string(&full);
+                    exceeded = TRUE;
+                    break;
+                }
+                g_string_append_printf(s, "%s\t%lld\n", rel, (long long)st.st_size);
+                files_count++;
+                secure_g_free_string(&full);
+            } else {
+                secure_g_free_string(&full);
+            }
         }
+        g_dir_close(d);
         secure_g_free_string(&dir);
     }
+
     while (!g_queue_is_empty(queue)) {
         char *pending = g_queue_pop_head(queue);
         secure_g_free_string(&pending);
     }
     g_queue_free(queue);
+
     if (exceeded) {
+        fprintf(stderr,
+            "scan_directory_recursive: exceeded limits "
+            "(files=%zu, dirs=%zu, bytes=%zu)\n",
+            files_count, dirs_count, s->len);
         sodium_memzero(s->str, s->len + 1);
         g_string_free(s, TRUE);
         return NULL;
     }
+
     return g_string_free(s, FALSE);
 }
 
