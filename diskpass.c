@@ -7,13 +7,16 @@
 #include <locale.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
+#include <math.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
-
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <gpgme.h>
@@ -31,11 +34,19 @@
 
 #define DB_VERSION 3
 #define AUTOLOCK_SECONDS 300
+#define DB_MAX_FILE_BYTES (128U * 1024U * 1024U)
+#define DB_MAX_JSON_BYTES (64U * 1024U * 1024U)
+#define DB_MAX_ENTRIES 100000
+#define DB_MAX_FILTERS 256
+#define DB_MAX_INDEX_BYTES (32U * 1024U * 1024U)
+#define DB_MAX_INDEX_FILES 500000
+#define DB_MAX_INDEX_QUEUED_DIRS 100000
+#define DB_MAX_INDEX_DIRS 500000
 
 static const char ALPHABET[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 static const size_t ALPHABET_LEN = 32;
 static const char *SCHEMA_PARTS[] = {"type","size","content_tag","cipher","dsalt"};
-static const int SCHEMA_COUNT = 5;
+enum { SCHEMA_COUNT = 5 };
 static const int PART_LENGTHS[] = {1, 2, 2, 1, 2};
 static const int FULL_PART_LENGTHS[] = {2, 3, 3, 2, 3};
 
@@ -140,10 +151,23 @@ static char *xstrdup(const char *s) {
 
 static void secure_free_string(char **s) {
     if (!s || !*s) return;
-    size_t len = strlen(*s);
-    if (len > 0) sodium_memzero(*s, len);
+    size_t len = strlen(*s) + 1;
+    sodium_memzero(*s, len);
     free(*s);
     *s = NULL;
+}
+
+static void secure_g_free_string(char **s) {
+    if (!s || !*s) return;
+    sodium_memzero(*s, strlen(*s) + 1);
+    g_free(*s);
+    *s = NULL;
+}
+
+static void secure_g_free_cb(gpointer p) {
+    if (!p) return;
+    sodium_memzero(p, strlen((const char *)p) + 1);
+    g_free(p);
 }
 
 static char *format_bytes(long long bytes) {
@@ -249,7 +273,8 @@ static const i18n_entry_t I18N[] = {
     {"smart_unavailable","SMART недоступен для этого устройства","SMART not available for this device"},
     {"save_error","Ошибка сохранения","Save error"},
     {"signed_ok","Подпись БД верна","Database signature verified"},
-    {"unsigned_warn","БД без подписи — будет подписана при следующем сохранении","Database unsigned — will be signed on next save"},
+    {"unsigned_warn","БД без подписи — открытие запрещено","Unsigned database — opening is blocked"},
+    {"unsigned_err","База не имеет обязательной цифровой подписи.","Database is missing the required digital signature."},
     {"sig_mismatch","Подпись БД сделана чужим ключом","Database signature was made by a foreign key"},
     {"add_auto","Выбрать подключённый диск","Select connected disk"},
     {"add_manual","Создать вручную","Create manually"},
@@ -301,6 +326,165 @@ static const char *map_decode(const char *part_name, const char *code) {
     return code;
 }
 
+static gboolean map_has_name(const map_entry_t *tbl, int n, const char *value) {
+    if (!tbl || !value) return FALSE;
+    for (int i = 0; i < n; i++)
+        if (strcmp(tbl[i].name, value) == 0) return TRUE;
+    return FALSE;
+}
+
+static gboolean map_has_code(const map_entry_t *tbl, int n, const char *value) {
+    if (!tbl || !value) return FALSE;
+    for (int i = 0; i < n; i++)
+        if (strcmp(tbl[i].code, value) == 0) return TRUE;
+    return FALSE;
+}
+
+static gboolean valid_ascii_tag_char(unsigned char c) {
+    return c < 0x80 && isalnum(c) != 0;
+}
+
+static gboolean valid_alphabet_string(const char *s, size_t expected_len) {
+    if (!s || strlen(s) != expected_len) return FALSE;
+    for (size_t i = 0; i < expected_len; i++)
+        if (!strchr(ALPHABET, s[i])) return FALSE;
+    return TRUE;
+}
+
+static void db_json_zero_strings(cJSON *node) {
+    for (cJSON *cur = node; cur; cur = cur->next) {
+        if (cJSON_IsString(cur) && cur->valuestring)
+            sodium_memzero(cur->valuestring, strlen(cur->valuestring));
+        if (cur->child) db_json_zero_strings(cur->child);
+    }
+}
+
+static gboolean db_json_preflight(const char *json, size_t len) {
+    if (!json) return FALSE;
+    size_t depth = 0;
+    gboolean in_string = FALSE, escaped = FALSE;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)json[i];
+        if (in_string) {
+            if (escaped) escaped = FALSE;
+            else if (c == '\\') escaped = TRUE;
+            else if (c == '"') in_string = FALSE;
+            continue;
+        }
+        if (c == '"') { in_string = TRUE; continue; }
+        if (c == '{' || c == '[') {
+            if (++depth > 64) return FALSE;
+        } else if (c == '}' || c == ']') {
+            if (depth == 0) return FALSE;
+            depth--;
+        }
+    }
+    return !in_string && !escaped && depth == 0;
+}
+
+static gboolean db_json_has_duplicate_keys(cJSON *node) {
+    for (cJSON *cur = node; cur; cur = cur->next) {
+        if (cJSON_IsObject(cur)) {
+            size_t members = 0;
+            for (cJSON *a = cur->child; a; a = a->next) {
+                if (++members > 128) return TRUE;
+                if (!a->string) continue;
+                for (cJSON *b = a->next; b; b = b->next) {
+                    if (b->string && strcmp(a->string, b->string) == 0)
+                        return TRUE;
+                }
+            }
+        }
+        if (cur->child && db_json_has_duplicate_keys(cur->child))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean db_json_has_unicode_nul_escape(const char *json) {
+    if (!json) return TRUE;
+    const char *end = json + strlen(json);
+    const char *p = json;
+    while (p < end) {
+        if (*p != '\\') { p++; continue; }
+        const char *run = p;
+        while (p < end && *p == '\\') p++;
+        size_t slashes = (size_t)(p - run);
+        if ((slashes & 1U) && (size_t)(end - p) >= 5 && p[0] == 'u' && p[1] == '0' &&
+            p[2] == '0' && p[3] == '0' && p[4] == '0')
+            return TRUE;
+        if (p < end) p++;
+    }
+    return FALSE;
+}
+
+static gboolean db_json_string_field_valid(cJSON *obj, const char *key,
+        gboolean required, size_t max_len) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!v) return !required;
+    return cJSON_IsString(v) && v->valuestring && strlen(v->valuestring) <= max_len;
+}
+
+static const char *db_json_string(cJSON *obj, const char *key) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return (v && cJSON_IsString(v)) ? v->valuestring : NULL;
+}
+
+static gboolean db_valid_schema_array(cJSON *arr, char *order[SCHEMA_COUNT]) {
+    if (!arr || !cJSON_IsArray(arr) || cJSON_GetArraySize(arr) != SCHEMA_COUNT)
+        return FALSE;
+    gboolean seen[SCHEMA_COUNT] = { FALSE, FALSE, FALSE, FALSE, FALSE };
+    for (int i = 0; i < SCHEMA_COUNT; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        if (!item || !cJSON_IsString(item) || !item->valuestring) return FALSE;
+        int found = -1;
+        for (int j = 0; j < SCHEMA_COUNT; j++)
+            if (strcmp(item->valuestring, SCHEMA_PARTS[j]) == 0) { found = j; break; }
+        if (found < 0 || seen[found]) return FALSE;
+        seen[found] = TRUE;
+        order[i] = xstrdup(item->valuestring);
+    }
+    return TRUE;
+}
+
+static int write_all_fd(int fd, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static gboolean db_parent_directory_is_safe(const char *path, char *err_msg, size_t err_msg_sz) {
+    if (!path || !path[0]) {
+        snprintf(err_msg, err_msg_sz, "Invalid database path");
+        return FALSE;
+    }
+    gchar *dir = g_path_get_dirname(path);
+    if (!dir) {
+        snprintf(err_msg, err_msg_sz, "Cannot determine database directory");
+        return FALSE;
+    }
+    struct stat st;
+    if (g_lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        snprintf(err_msg, err_msg_sz, "Database parent must be an actual directory");
+        g_free(dir);
+        return FALSE;
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)) {
+        snprintf(err_msg, err_msg_sz,
+            "Refusing to save in a group/world-writable directory without the sticky bit");
+        g_free(dir);
+        return FALSE;
+    }
+    g_free(dir);
+    return TRUE;
+}
+
 static const char **get_sizes_for_type(const char *type_name) {
     for (int i = 0; i < TYPE_SIZE_MAP_N; i++)
         if (strcmp(TYPE_SIZE_MAP[i].type, type_name) == 0)
@@ -332,18 +516,25 @@ static char calculate_block_salt(const uint8_t *noise_key, size_t key_len,
     const uint8_t *salt, size_t salt_len,
     int part_index, const char *val_str)
 {
+    if (!noise_key || !salt || !val_str || salt_len > 32 || key_len > 32)
+        return ALPHABET[0];
     size_t vlen = strlen(val_str);
+    if (vlen > 64) return ALPHABET[0];
+    uint8_t msg[32 + 1 + 64];
     size_t msg_len = salt_len + 1 + vlen;
-    uint8_t *msg = malloc(msg_len);
-    if (!msg) return ALPHABET[0];
     memcpy(msg, salt, salt_len);
     msg[salt_len] = (uint8_t)part_index;
     memcpy(msg + salt_len + 1, val_str, vlen);
-    uint8_t hash[8];
-    crypto_generichash(hash, sizeof(hash), msg, msg_len, noise_key, key_len);
-    free(msg);
+    uint8_t hash[8] = {0};
+    if (crypto_generichash(hash, sizeof(hash), msg, msg_len, noise_key, key_len) != 0) {
+        sodium_memzero(msg, sizeof(msg));
+        sodium_memzero(hash, sizeof(hash));
+        return ALPHABET[0];
+    }
+    sodium_memzero(msg, sizeof(msg));
     uint64_t val = 0;
     for (int i = 0; i < 8; i++) val = (val << 8) | hash[i];
+    sodium_memzero(hash, sizeof(hash));
     return ALPHABET[val % ALPHABET_LEN];
 }
 
@@ -442,7 +633,7 @@ static void db_manager_clear(db_manager_t *m) {
     secure_free_string(&m->file_path);
     secure_free_string(&m->recipient);
     if (m->salt) { SECURE_ZERO(m->salt, m->salt_len); free(m->salt); m->salt = NULL; }
-    if (m->noise_key) { SECURE_ZERO(m->noise_key, m->noise_key_len); free(m->noise_key); m->noise_key = NULL; }
+    if (m->noise_key) { sec_free(m->noise_key, m->noise_key_len); m->noise_key = NULL; m->noise_key_len = 0; }
     for (int i = 0; i < SCHEMA_COUNT; i++) { secure_free_string(&m->schema_order[i]); }
     for (int i = 0; i < m->entry_count; i++) db_entry_clear(&m->entries[i]);
     free(m->entries); m->entries = NULL; m->entry_count = 0; m->entry_cap = 0;
@@ -464,24 +655,103 @@ cleanup:
 static int db_read_file(const char *path, char **out_recipient, char **out_enc_data,
     char *err_msg, size_t err_msg_sz)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) { snprintf(err_msg, err_msg_sz, "Cannot open file: %s", strerror(errno)); return -1; }
-    char *recipient = NULL; size_t cap = 0;
-    ssize_t len = getline(&recipient, &cap, f);
-    if (len <= 0) { snprintf(err_msg, err_msg_sz, "%s", i18n("file_corrupted")); fclose(f); free(recipient); return -1; }
-    while (len > 0 && (recipient[len-1]=='\n'||recipient[len-1]=='\r')) recipient[--len]='\0';
-    char *enc_data = NULL; size_t enc_len = 0;
-    char buf[4096]; size_t n;
+    if (!path || !out_recipient || !out_enc_data) {
+        snprintf(err_msg, err_msg_sz, "Invalid database path");
+        return -1;
+    }
+    *out_recipient = NULL;
+    *out_enc_data = NULL;
+
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot open file safely: %s", strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > (uint64_t)DB_MAX_FILE_BYTES) {
+        snprintf(err_msg, err_msg_sz, "Invalid database file type or size limit exceeded");
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        snprintf(err_msg, err_msg_sz, "Cannot read database: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    char recipient_buf[256];
+    if (!fgets(recipient_buf, sizeof(recipient_buf), f)) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("file_corrupted"));
+        fclose(f);
+        return -1;
+    }
+    char *nl = strchr(recipient_buf, '\n');
+    if (!nl) {
+        snprintf(err_msg, err_msg_sz, "Invalid or oversized recipient fingerprint");
+        fclose(f);
+        return -1;
+    }
+    *nl = '\0';
+    size_t fp_len = strlen(recipient_buf);
+    if (fp_len > 0 && recipient_buf[fp_len - 1] == '\r') recipient_buf[--fp_len] = '\0';
+    gboolean fp_valid_len = (fp_len == 32 || fp_len == 40 || fp_len == 64);
+    if (!fp_valid_len) {
+        snprintf(err_msg, err_msg_sz, "Invalid recipient fingerprint");
+        fclose(f);
+        return -1;
+    }
+    for (size_t i = 0; i < fp_len; i++) {
+        if (!g_ascii_isxdigit((guchar)recipient_buf[i])) {
+            snprintf(err_msg, err_msg_sz, "Invalid recipient fingerprint");
+            fclose(f);
+            return -1;
+        }
+    }
+
+    char *enc_data = NULL;
+    size_t enc_len = 0;
+    char buf[4096];
+    size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (enc_len > (size_t)DB_MAX_FILE_BYTES - n) {
+            snprintf(err_msg, err_msg_sz, "Encrypted database exceeds size limit");
+            free(enc_data);
+            fclose(f);
+            return -1;
+        }
+        if (memchr(buf, '\0', n) != NULL) {
+            snprintf(err_msg, err_msg_sz, "Invalid binary data in armored database");
+            free(enc_data);
+            fclose(f);
+            return -1;
+        }
         char *tmp = realloc(enc_data, enc_len + n + 1);
-        if (!tmp) { fclose(f); free(recipient); free(enc_data); return -1; }
+        if (!tmp) {
+            snprintf(err_msg, err_msg_sz, "Out of memory while reading database");
+            free(enc_data);
+            fclose(f);
+            return -1;
+        }
         enc_data = tmp;
         memcpy(enc_data + enc_len, buf, n);
         enc_len += n;
     }
-    fclose(f);
-    if (enc_data) enc_data[enc_len] = '\0';
-    *out_recipient = recipient;
+    int read_error = ferror(f);
+    int close_error = fclose(f);
+    if (read_error || close_error != 0) {
+        snprintf(err_msg, err_msg_sz, "Error while reading database");
+        free(enc_data);
+        return -1;
+    }
+    if (!enc_data || enc_len == 0) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("file_corrupted"));
+        free(enc_data);
+        return -1;
+    }
+    enc_data[enc_len] = '\0';
+    *out_recipient = xstrdup(recipient_buf);
     *out_enc_data = enc_data;
     return 0;
 }
@@ -492,6 +762,10 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
     gpgme_error_t gerr;
     gpgme_data_t in = NULL, out = NULL;
     char *result = NULL;
+    if (!m || !enc_data || enc_len == 0 || enc_len > DB_MAX_FILE_BYTES) {
+        snprintf(err_msg, err_msg_sz, "Invalid encrypted database size");
+        return NULL;
+    }
     gerr = gpgme_data_new_from_mem(&in, enc_data, enc_len, 0);
     GPG_CHECK(gerr, "gpgme_data_new_from_mem");
     gerr = gpgme_data_new(&out);
@@ -501,33 +775,108 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
         snprintf(err_msg, err_msg_sz, "%s%s", i18n("gpg_err"), gpgme_strerror(gerr));
         goto cleanup;
     }
+
     m->is_signed = FALSE;
     gpgme_verify_result_t vres = gpgme_op_verify_result(m->gpg_ctx);
-    if (vres && vres->signatures && vres->signatures->fpr) {
-        if (vres->signatures->status != GPG_ERR_NO_ERROR) {
-            snprintf(err_msg, err_msg_sz, "%s%s", i18n("gpg_err"),
-                     gpgme_strerror(vres->signatures->status));
-            goto cleanup;
-        }
-        if (strcmp(vres->signatures->fpr, m->recipient) != 0) {
-            snprintf(err_msg, err_msg_sz, "%s", i18n("sig_mismatch"));
-            goto cleanup;
-        }
-        m->is_signed = TRUE;
+    gpgme_signature_t sig = vres ? vres->signatures : NULL;
+    if (!sig) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("unsigned_err"));
+        goto cleanup;
     }
+    
+    if (sig->next || sig->status != GPG_ERR_NO_ERROR || !sig->fpr || !m->recipient) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("sig_mismatch"));
+        goto cleanup;
+    }
+    gpgme_key_t recipient_pub = NULL;
+    if (gpgme_get_key(m->gpg_ctx, m->recipient, &recipient_pub, 0) != GPG_ERR_NO_ERROR ||
+        !recipient_pub) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("key_mismatch"));
+        if (recipient_pub) gpgme_key_release(recipient_pub);
+        goto cleanup;
+    }
+
+
+    gboolean signer_matches =
+        (g_ascii_strcasecmp(sig->fpr, m->recipient) == 0);
+    if (!signer_matches) {
+        for (gpgme_subkey_t sub = recipient_pub->subkeys; sub; sub = sub->next) {
+            if (sub->fpr && g_ascii_strcasecmp(sub->fpr, sig->fpr) == 0) {
+                signer_matches = TRUE;
+                break;
+            }
+        }
+    }
+    if (!signer_matches) {
+        gpgme_key_release(recipient_pub);
+        snprintf(err_msg, err_msg_sz, "%s", i18n("sig_mismatch"));
+        goto cleanup;
+    }
+
+
+    gboolean recipient_matches = FALSE;
+    gpgme_decrypt_result_t dres = gpgme_op_decrypt_result(m->gpg_ctx);
+    for (gpgme_recipient_t rec = dres ? dres->recipients : NULL; rec; rec = rec->next) {
+        if (!rec->keyid || rec->status != GPG_ERR_NO_ERROR) continue;
+        size_t kid_len = strlen(rec->keyid);
+        if (kid_len < 8 || kid_len > 16) continue;
+        for (gpgme_subkey_t sub = recipient_pub->subkeys; sub; sub = sub->next) {
+            if (!sub->fpr) continue;
+            size_t fpr_len = strlen(sub->fpr);
+            if (fpr_len >= kid_len &&
+                g_ascii_strcasecmp(sub->fpr + fpr_len - kid_len, rec->keyid) == 0) {
+                recipient_matches = TRUE;
+                break;
+            }
+        }
+        if (recipient_matches) break;
+    }
+    gpgme_key_release(recipient_pub);
+    if (!recipient_matches) {
+        snprintf(err_msg, err_msg_sz,
+            "Encrypted database recipient does not match the pinned OpenPGP key");
+        goto cleanup;
+    }
+    m->is_signed = TRUE;
+
     size_t rlen = 0;
     char *raw = gpgme_data_release_and_get_mem(out, &rlen);
     out = NULL;
     if (!raw) goto cleanup;
-    result = malloc(rlen + 1);
-    if (!result) { sodium_memzero(raw, rlen); gpgme_free(raw); goto cleanup; }
+    if (rlen > DB_MAX_JSON_BYTES) {
+        sodium_memzero(raw, rlen);
+        gpgme_free(raw);
+        snprintf(err_msg, err_msg_sz, "Decrypted database exceeds size limit");
+        goto cleanup;
+    }
+    if (rlen > 0 && memchr(raw, '\0', rlen) != NULL) {
+        sodium_memzero(raw, rlen);
+        gpgme_free(raw);
+        snprintf(err_msg, err_msg_sz, "Decrypted content contains an embedded NUL byte");
+        goto cleanup;
+    }
+    result = sodium_malloc(rlen + 1);
+    if (!result) {
+        sodium_memzero(raw, rlen);
+        gpgme_free(raw);
+        snprintf(err_msg, err_msg_sz, "Cannot allocate protected memory for decrypted database");
+        goto cleanup;
+    }
     memcpy(result, raw, rlen);
     result[rlen] = '\0';
     sodium_memzero(raw, rlen);
     gpgme_free(raw);
 cleanup:
     if (in) gpgme_data_release(in);
-    if (out) gpgme_data_release(out);
+    if (out) {
+        size_t wipe_len = 0;
+        char *wipe_buf = gpgme_data_release_and_get_mem(out, &wipe_len);
+        out = NULL;
+        if (wipe_buf) {
+            sodium_memzero(wipe_buf, wipe_len);
+            gpgme_free(wipe_buf);
+        }
+    }
     return result;
 }
 
@@ -536,34 +885,42 @@ static char *db_gpg_encrypt(db_manager_t *m, const char *plaintext, size_t pt_le
 {
     gpgme_error_t gerr;
     gpgme_data_t in = NULL, out = NULL;
-    gpgme_key_t keys[2] = {NULL, NULL};
+    gpgme_key_t recipient_key = NULL;
     gpgme_key_t signer = NULL;
-    gboolean have_signer = FALSE;
     char *result = NULL;
+    if (!m || !m->recipient || !plaintext || pt_len == 0 || pt_len > DB_MAX_JSON_BYTES) {
+        snprintf(err_msg, err_msg_sz, "Invalid data or missing recipient key");
+        return NULL;
+    }
 
     gerr = gpgme_data_new_from_mem(&in, plaintext, pt_len, 0);
     GPG_CHECK(gerr, "gpgme_data_new_from_mem");
     gerr = gpgme_data_new(&out);
     GPG_CHECK(gerr, "gpgme_data_new");
-    gerr = gpgme_get_key(m->gpg_ctx, m->recipient, &keys[0], 0);
-    GPG_CHECK(gerr, "gpgme_get_key");
-
-    if (gpgme_get_key(m->gpg_ctx, m->recipient, &signer, 1) == GPG_ERR_NO_ERROR && signer) {
-        gpgme_signers_clear(m->gpg_ctx);
-        gpgme_signers_add(m->gpg_ctx, signer);
-        gpgme_key_release(signer);
-        signer = NULL;
-        have_signer = TRUE;
+    gerr = gpgme_get_key(m->gpg_ctx, m->recipient, &recipient_key, 0);
+    GPG_CHECK(gerr, "gpgme_get_key (recipient)");
+    if (recipient_key->revoked || recipient_key->expired || recipient_key->disabled ||
+        recipient_key->invalid || !recipient_key->can_encrypt) {
+        snprintf(err_msg, err_msg_sz, "Selected OpenPGP certificate is not valid for encryption");
+        goto cleanup;
+    }
+    gerr = gpgme_get_key(m->gpg_ctx, m->recipient, &signer, 1);
+    if (gerr != GPG_ERR_NO_ERROR || !signer || signer->revoked || signer->expired ||
+        signer->disabled || signer->invalid || !signer->can_sign) {
+        snprintf(err_msg, err_msg_sz,
+            "The selected key must have a valid private signing key; unsigned databases are disabled");
+        goto cleanup;
+    }
+    gpgme_signers_clear(m->gpg_ctx);
+    gerr = gpgme_signers_add(m->gpg_ctx, signer);
+    if (gerr != GPG_ERR_NO_ERROR) {
+        snprintf(err_msg, err_msg_sz, "Cannot configure database signer: %s", gpgme_strerror(gerr));
+        goto cleanup;
     }
 
-    gpgme_key_t recips[] = {keys[0], NULL};
-    if (have_signer)
-        gerr = gpgme_op_encrypt_sign(m->gpg_ctx, recips,
-            GPGME_ENCRYPT_ALWAYS_TRUST, in, out);
-    else
-        gerr = gpgme_op_encrypt(m->gpg_ctx, recips,
-            GPGME_ENCRYPT_ALWAYS_TRUST, in, out);
-
+    gpgme_key_t recips[] = {recipient_key, NULL};
+    gerr = gpgme_op_encrypt_sign(m->gpg_ctx, recips,
+        GPGME_ENCRYPT_ALWAYS_TRUST, in, out);
     if (gerr != GPG_ERR_NO_ERROR) {
         snprintf(err_msg, err_msg_sz, "%s%s", i18n("gpg_err"), gpgme_strerror(gerr));
         goto cleanup;
@@ -573,13 +930,18 @@ static char *db_gpg_encrypt(db_manager_t *m, const char *plaintext, size_t pt_le
     out = NULL;
     if (!raw) goto cleanup;
     result = malloc(rlen + 1);
-    if (!result) { gpgme_free(raw); goto cleanup; }
+    if (!result) {
+        sodium_memzero(raw, rlen);
+        gpgme_free(raw);
+        snprintf(err_msg, err_msg_sz, "Out of memory while encrypting database");
+        goto cleanup;
+    }
     memcpy(result, raw, rlen);
     result[rlen] = '\0';
     gpgme_free(raw);
 cleanup:
     if (signer) gpgme_key_release(signer);
-    if (keys[0]) gpgme_key_release(keys[0]);
+    if (recipient_key) gpgme_key_release(recipient_key);
     if (in) gpgme_data_release(in);
     if (out) gpgme_data_release(out);
     return result;
@@ -593,233 +955,528 @@ static char *hex_encode(const uint8_t *data, size_t len) {
     return out;
 }
 
+static int hex_nibble(unsigned char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
 static uint8_t *hex_decode(const char *hex, size_t *out_len) {
+    if (!hex || !out_len) return NULL;
+    *out_len = 0;
     size_t slen = strlen(hex);
-    if (slen % 2 != 0) return NULL;
+    if ((slen % 2) != 0) return NULL;
     size_t dlen = slen / 2;
-    uint8_t *out = malloc(dlen);
+    uint8_t *out = malloc(dlen ? dlen : 1);
     if (!out) return NULL;
     for (size_t i = 0; i < dlen; i++) {
-        unsigned int byte;
-        if (sscanf(hex + i*2, "%2x", &byte) != 1) { free(out); return NULL; }
-        out[i] = (uint8_t)byte;
+        int hi = hex_nibble((unsigned char)hex[i * 2]);
+        int lo = hex_nibble((unsigned char)hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            sodium_memzero(out, dlen ? dlen : 1);
+            free(out);
+            return NULL;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
     }
     *out_len = dlen;
     return out;
 }
 
+static char *db_encode_label(db_manager_t *m, const char *type, const char *size,
+    const char *content_tag, const char *cipher, const char *dsalt);
+
 static int db_load_json(db_manager_t *m, const char *json_str, char *err_msg, size_t err_msg_sz) {
-    cJSON *root = cJSON_Parse(json_str);
-    if (!root) { snprintf(err_msg, err_msg_sz, "JSON parse error"); return -1; }
-    cJSON *j_salt = cJSON_GetObjectItem(root, "salt");
-    if (j_salt && cJSON_IsString(j_salt)) {
-        size_t slen = 0;
-        uint8_t *s = hex_decode(j_salt->valuestring, &slen);
-        if (s && slen == 32) { m->salt = s; m->salt_len = slen; } else free(s);
+    cJSON *root = NULL;
+    int rc = -1;
+    if (!m || !json_str) {
+        snprintf(err_msg, err_msg_sz, "Invalid JSON input");
+        return -1;
     }
-    cJSON *j_noise = cJSON_GetObjectItem(root, "noise_key");
-    if (j_noise && cJSON_IsString(j_noise)) {
-        size_t nlen = 0;
-        uint8_t *n = hex_decode(j_noise->valuestring, &nlen);
-        if (n && nlen == 32) { m->noise_key = n; m->noise_key_len = nlen; } else free(n);
+    size_t json_len = strnlen(json_str, (size_t)DB_MAX_JSON_BYTES + 1);
+    if (json_len == 0 || json_len > DB_MAX_JSON_BYTES) {
+        snprintf(err_msg, err_msg_sz, "Database JSON exceeds size limit or is empty");
+        return -1;
     }
-    cJSON *j_schema = cJSON_GetObjectItem(root, "schema");
-    if (j_schema && cJSON_IsArray(j_schema)) {
-        int n = cJSON_GetArraySize(j_schema);
-        if (n == SCHEMA_COUNT) {
-            for (int i = 0; i < SCHEMA_COUNT; i++) {
-                cJSON *item = cJSON_GetArrayItem(j_schema, i);
-                if (item && cJSON_IsString(item)) m->schema_order[i] = xstrdup(item->valuestring);
-            }
+    if (!db_json_preflight(json_str, json_len)) {
+        snprintf(err_msg, err_msg_sz, "Database JSON nesting or syntax preflight limit exceeded");
+        return -1;
+    }
+    if (db_json_has_unicode_nul_escape(json_str)) {
+        snprintf(err_msg, err_msg_sz, "Database JSON contains a forbidden embedded NUL escape");
+        return -1;
+    }
+    root = cJSON_ParseWithOpts(json_str, NULL, TRUE);
+    if (!root || !cJSON_IsObject(root)) {
+        snprintf(err_msg, err_msg_sz, "JSON root must be an object");
+        goto cleanup;
+    }
+    if (db_json_has_duplicate_keys(root)) {
+        snprintf(err_msg, err_msg_sz, "Database JSON contains duplicate keys or an oversized object");
+        goto cleanup;
+    }
+
+    cJSON *j_version = cJSON_GetObjectItemCaseSensitive(root, "version");
+    if (!j_version || !cJSON_IsNumber(j_version) || j_version->valuedouble != DB_VERSION) {
+        snprintf(err_msg, err_msg_sz, "Unsupported or missing database version");
+        goto cleanup;
+    }
+
+    cJSON *j_salt = cJSON_GetObjectItemCaseSensitive(root, "salt");
+    cJSON *j_noise = cJSON_GetObjectItemCaseSensitive(root, "noise_key");
+    size_t slen = 0, nlen = 0;
+    uint8_t *salt = NULL, *noise = NULL;
+    if (!j_salt || !cJSON_IsString(j_salt) || !j_salt->valuestring || strlen(j_salt->valuestring) != 64 ||
+        !j_noise || !cJSON_IsString(j_noise) || !j_noise->valuestring || strlen(j_noise->valuestring) != 64) {
+        snprintf(err_msg, err_msg_sz, "Missing or invalid database salt/key");
+        goto cleanup;
+    }
+    salt = hex_decode(j_salt->valuestring, &slen);
+    noise = hex_decode(j_noise->valuestring, &nlen);
+    if (!salt || !noise || slen != 32 || nlen != 32) {
+        if (salt) { sodium_memzero(salt, slen); free(salt); }
+        if (noise) { sodium_memzero(noise, nlen); free(noise); }
+        snprintf(err_msg, err_msg_sz, "Database salt/key must be 32-byte hexadecimal values");
+        goto cleanup;
+    }
+    uint8_t *secure_noise = sodium_malloc(nlen);
+    if (!secure_noise) {
+        sodium_memzero(salt, slen); free(salt);
+        sodium_memzero(noise, nlen); free(noise);
+        snprintf(err_msg, err_msg_sz, "Cannot allocate protected memory for database key");
+        goto cleanup;
+    }
+    memcpy(secure_noise, noise, nlen);
+    sodium_memzero(noise, nlen);
+    free(noise);
+    m->salt = salt; m->salt_len = slen;
+    m->noise_key = secure_noise; m->noise_key_len = nlen;
+
+    cJSON *j_schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+    if (!db_valid_schema_array(j_schema, m->schema_order)) {
+        for (int i = 0; i < SCHEMA_COUNT; i++) secure_free_string(&m->schema_order[i]);
+        snprintf(err_msg, err_msg_sz, "Schema must contain each supported tag field exactly once");
+        goto cleanup;
+    }
+
+    cJSON *j_lang = cJSON_GetObjectItemCaseSensitive(root, "lang");
+    if (j_lang) {
+        if (!cJSON_IsString(j_lang) || !j_lang->valuestring ||
+            (strcmp(j_lang->valuestring, "ru") != 0 && strcmp(j_lang->valuestring, "en") != 0)) {
+            snprintf(err_msg, err_msg_sz, "Invalid language setting");
+            goto cleanup;
         }
+        snprintf(m->lang, sizeof(m->lang), "%s", j_lang->valuestring);
     }
-    bool schema_ok = true;
-    for (int i = 0; i < SCHEMA_COUNT; i++) if (!m->schema_order[i]) schema_ok = false;
-    if (!schema_ok) {
-        for (int i = 0; i < SCHEMA_COUNT; i++) { secure_free_string(&m->schema_order[i]); }
-        for (int i = 0; i < SCHEMA_COUNT; i++) m->schema_order[i] = xstrdup(SCHEMA_PARTS[i]);
+
+    cJSON *j_entries = cJSON_GetObjectItemCaseSensitive(root, "entries");
+    if (!j_entries || !cJSON_IsArray(j_entries)) {
+        snprintf(err_msg, err_msg_sz, "Entries must be an array");
+        goto cleanup;
     }
-    cJSON *j_lang = cJSON_GetObjectItem(root, "lang");
-    if (j_lang && cJSON_IsString(j_lang)) snprintf(m->lang, sizeof(m->lang), "%s", j_lang->valuestring);
-    cJSON *j_entries = cJSON_GetObjectItem(root, "entries");
-    if (j_entries && cJSON_IsArray(j_entries)) {
-        int n = cJSON_GetArraySize(j_entries);
-        if (n < 0) n = 0;
-        m->entry_cap = n + 16;
-        m->entries = calloc(m->entry_cap, sizeof(db_entry_t));
-        if (!m->entries) {
-            cJSON_Delete(root);
-            snprintf(err_msg, err_msg_sz, "alloc failed");
-            return -1;
+    int n = cJSON_GetArraySize(j_entries);
+    if (n < 0 || n > DB_MAX_ENTRIES) {
+        snprintf(err_msg, err_msg_sz, "Database contains too many entries");
+        goto cleanup;
+    }
+    m->entry_cap = n > 0 ? n : 16;
+    m->entries = calloc((size_t)m->entry_cap, sizeof(db_entry_t));
+    if (!m->entries) {
+        snprintf(err_msg, err_msg_sz, "Out of memory while loading entries");
+        goto cleanup;
+    }
+    for (int i = 0; i < n; i++) {
+        cJSON *je = cJSON_GetArrayItem(j_entries, i);
+        if (!je || !cJSON_IsObject(je)) {
+            snprintf(err_msg, err_msg_sz, "Entry %d is not an object", i + 1);
+            goto cleanup;
         }
-        m->entry_count = n;
-        for (int i = 0; i < n; i++) {
-            cJSON *je = cJSON_GetArrayItem(j_entries, i);
-            db_entry_init(&m->entries[i]);
-            cJSON *v;
-            v = cJSON_GetObjectItem(je, "label");       if (v && cJSON_IsString(v)) m->entries[i].label       = xstrdup(v->valuestring);
-            if (!m->entries[i].label) m->entries[i].label = xstrdup("");
-            v = cJSON_GetObjectItem(je, "type");        if (v && cJSON_IsString(v)) m->entries[i].type        = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "size");        if (v && cJSON_IsString(v)) m->entries[i].size        = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "cipher");      if (v && cJSON_IsString(v)) m->entries[i].cipher      = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "content_tag"); if (v && cJSON_IsString(v)) m->entries[i].content_tag = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "dsalt");       if (v && cJSON_IsString(v)) m->entries[i].dsalt       = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "tag_full");    if (v && cJSON_IsString(v)) m->entries[i].tag_full    = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "dpass");       if (v && cJSON_IsString(v) && v->valuestring[0]) m->entries[i].dpass = sec_strdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "notes");       if (v && cJSON_IsString(v)) m->entries[i].notes = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "alias");       if (v && cJSON_IsString(v)) m->entries[i].alias = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "files");       if (v && cJSON_IsString(v)) m->entries[i].files = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "smart");       if (v && cJSON_IsString(v)) m->entries[i].smart = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "uuid");        if (v && cJSON_IsString(v)) m->entries[i].uuid = xstrdup(v->valuestring);
-            v = cJSON_GetObjectItem(je, "last_snapshot");
-            if (v && cJSON_IsNumber(v)) m->entries[i].last_snapshot = (long long)v->valuedouble;
+        if (!db_json_string_field_valid(je, "label", TRUE, 127) ||
+            !db_json_string_field_valid(je, "type", TRUE, 32) ||
+            !db_json_string_field_valid(je, "size", TRUE, 32) ||
+            !db_json_string_field_valid(je, "cipher", TRUE, 32) ||
+            !db_json_string_field_valid(je, "content_tag", TRUE, 2) ||
+            !db_json_string_field_valid(je, "dsalt", TRUE, 2) ||
+            !db_json_string_field_valid(je, "tag_full", FALSE, 4096) ||
+            !db_json_string_field_valid(je, "dpass", FALSE, 16384) ||
+            !db_json_string_field_valid(je, "notes", FALSE, 1024 * 1024) ||
+            !db_json_string_field_valid(je, "alias", FALSE, 4096) ||
+            !db_json_string_field_valid(je, "files", FALSE, DB_MAX_INDEX_BYTES) ||
+            !db_json_string_field_valid(je, "smart", FALSE, 2 * 1024 * 1024) ||
+            !db_json_string_field_valid(je, "uuid", FALSE, 256)) {
+            snprintf(err_msg, err_msg_sz, "Entry %d contains missing, oversized or mistyped fields", i + 1);
+            goto cleanup;
         }
+
+        const char *type = db_json_string(je, "type");
+        const char *size = db_json_string(je, "size");
+        const char *cipher = db_json_string(je, "cipher");
+        const char *content_tag = db_json_string(je, "content_tag");
+        const char *dsalt = db_json_string(je, "dsalt");
+        if (!map_has_name(TYPE_MAP, TYPE_MAP_N, type) ||
+            !map_has_name(SIZE_MAP, SIZE_MAP_N, size) ||
+            !map_has_name(CIPHER_MAP, CIPHER_MAP_N, cipher) ||
+            strlen(content_tag) != 2 || !valid_ascii_tag_char((unsigned char)content_tag[0]) ||
+            !valid_ascii_tag_char((unsigned char)content_tag[1]) ||
+            !valid_alphabet_string(dsalt, 2)) {
+            snprintf(err_msg, err_msg_sz, "Entry %d contains invalid tag components", i + 1);
+            goto cleanup;
+        }
+        cJSON *j_last = cJSON_GetObjectItemCaseSensitive(je, "last_snapshot");
+        if (j_last && (!cJSON_IsNumber(j_last) || !isfinite(j_last->valuedouble) ||
+            j_last->valuedouble < 0 || j_last->valuedouble >= (double)LLONG_MAX)) {
+            snprintf(err_msg, err_msg_sz, "Entry %d contains invalid snapshot timestamp", i + 1);
+            goto cleanup;
+        }
+
+        db_entry_init(&m->entries[i]);
+        m->entry_count = i + 1;
+        db_entry_t *e = &m->entries[i];
+        e->label = xstrdup(db_json_string(je, "label"));
+        e->type = xstrdup(type);
+        e->size = xstrdup(size);
+        e->cipher = xstrdup(cipher);
+        e->content_tag = xstrdup(content_tag);
+        e->dsalt = xstrdup(dsalt);
+        const char *value;
+        value = db_json_string(je, "tag_full"); if (value) e->tag_full = xstrdup(value);
+        value = db_json_string(je, "dpass"); if (value && value[0]) e->dpass = sec_strdup(value);
+        value = db_json_string(je, "notes"); if (value) e->notes = xstrdup(value);
+        value = db_json_string(je, "alias"); if (value && value[0]) e->alias = xstrdup(value);
+        value = db_json_string(je, "files"); if (value && value[0]) e->files = xstrdup(value);
+        value = db_json_string(je, "smart"); if (value && value[0]) e->smart = xstrdup(value);
+        value = db_json_string(je, "uuid"); if (value && value[0]) e->uuid = xstrdup(value);
+        if (j_last) e->last_snapshot = (long long)j_last->valuedouble;
+
+        char *canonical = db_encode_label(m, e->type, e->size, e->content_tag, e->cipher, e->dsalt);
+        if (!canonical || strcmp(canonical, e->label) != 0) {
+            free(canonical);
+            snprintf(err_msg, err_msg_sz, "Entry %d label does not match its authenticated fields", i + 1);
+            goto cleanup;
+        }
+        free(canonical);
     }
-    cJSON *j_filters = cJSON_GetObjectItem(root, "filters");
-    if (j_filters && cJSON_IsArray(j_filters)) {
-        int n = cJSON_GetArraySize(j_filters);
-        if (n < 0) n = 0;
-        m->filter_cap = n + 4;
-        m->filters = calloc(m->filter_cap, sizeof(search_filter_t));
+
+    cJSON *j_filters = cJSON_GetObjectItemCaseSensitive(root, "filters");
+    if (j_filters && !cJSON_IsArray(j_filters)) {
+        snprintf(err_msg, err_msg_sz, "Filters must be an array");
+        goto cleanup;
+    }
+    if (j_filters) {
+        int nf = cJSON_GetArraySize(j_filters);
+        if (nf < 0 || nf > DB_MAX_FILTERS) {
+            snprintf(err_msg, err_msg_sz, "Database contains too many filters");
+            goto cleanup;
+        }
+        m->filter_cap = nf > 0 ? nf : 4;
+        m->filters = calloc((size_t)m->filter_cap, sizeof(search_filter_t));
         if (!m->filters) {
-            cJSON_Delete(root);
-            snprintf(err_msg, err_msg_sz, "alloc failed");
-            return -1;
+            snprintf(err_msg, err_msg_sz, "Out of memory while loading filters");
+            goto cleanup;
         }
-        m->filter_count = 0;
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < nf; i++) {
             cJSON *jf = cJSON_GetArrayItem(j_filters, i);
-            if (!cJSON_IsObject(jf)) continue;
-            cJSON *jn = cJSON_GetObjectItem(jf, "name");
-            cJSON *je = cJSON_GetObjectItem(jf, "exts");
-            if (jn && je && cJSON_IsString(jn) && cJSON_IsString(je)) {
-                m->filters[m->filter_count].name = xstrdup(jn->valuestring);
-                m->filters[m->filter_count].exts = xstrdup(je->valuestring);
-                m->filter_count++;
+            if (!jf || !cJSON_IsObject(jf) ||
+                !db_json_string_field_valid(jf, "name", TRUE, 256) ||
+                !db_json_string_field_valid(jf, "exts", TRUE, 4096)) {
+                snprintf(err_msg, err_msg_sz, "Filter %d is malformed", i + 1);
+                goto cleanup;
             }
+            m->filters[i].name = xstrdup(db_json_string(jf, "name"));
+            m->filters[i].exts = xstrdup(db_json_string(jf, "exts"));
+            m->filter_count++;
         }
+    } else {
+        db_init_default_filters(m);
     }
-    if (!m->filters) db_init_default_filters(m);
-    cJSON_Delete(root);
-    return 0;
+
+    rc = 0;
+cleanup:
+    if (root) {
+        db_json_zero_strings(root);
+        cJSON_Delete(root);
+    }
+    return rc;
+}
+
+static gboolean db_json_add_string(cJSON *obj, const char *key, const char *value) {
+    return obj && key && value && cJSON_AddStringToObject(obj, key, value) != NULL;
+}
+
+static gboolean db_json_add_number(cJSON *obj, const char *key, double value) {
+    return obj && key && cJSON_AddNumberToObject(obj, key, value) != NULL;
+}
+
+static gboolean db_json_add_array_item(cJSON *arr, cJSON *item) {
+    if (!arr || !item) {
+        if (item) cJSON_Delete(item);
+        return FALSE;
+    }
+    if (!cJSON_AddItemToArray(arr, item)) {
+        cJSON_Delete(item);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) { snprintf(err_msg, err_msg_sz, "JSON alloc failed"); return -1; }
-    cJSON_AddNumberToObject(root, "version", DB_VERSION);
+    cJSON *root = NULL, *j_schema = NULL, *j_entries = NULL, *j_filters = NULL;
+    char *json_str = NULL, *enc = NULL, *tmp_path = NULL, *prev_path = NULL;
+    int fd = -1;
+    gboolean write_ok = FALSE;
+    struct stat old_st;
+    gboolean had_old_regular = FALSE;
+    int rc = -1;
+
+    if (!m || !m->file_path || !m->recipient || !m->salt || m->salt_len != 32 ||
+        !m->noise_key || m->noise_key_len != 32) {
+        snprintf(err_msg, err_msg_sz, "Database state is incomplete");
+        return -1;
+    }
+    if (m->entry_count < 0 || m->entry_count > DB_MAX_ENTRIES ||
+        m->filter_count < 0 || m->filter_count > DB_MAX_FILTERS) {
+        snprintf(err_msg, err_msg_sz, "Database exceeds configured resource limits");
+        return -1;
+    }
+    if (!db_parent_directory_is_safe(m->file_path, err_msg, err_msg_sz))
+        return -1;
+
+    if (strcmp(m->lang, "ru") != 0 && strcmp(m->lang, "en") != 0) {
+        snprintf(err_msg, err_msg_sz, "Invalid database language setting");
+        return -1;
+    }
+    root = cJSON_CreateObject();
+    j_schema = cJSON_CreateArray();
+    j_entries = cJSON_CreateArray();
+    j_filters = cJSON_CreateArray();
+    if (!root || !j_schema || !j_entries || !j_filters) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed");
+        goto cleanup;
+    }
+    if (!db_json_add_number(root, "version", DB_VERSION)) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for database version");
+        goto cleanup;
+    }
     char *hex_salt = hex_encode(m->salt, m->salt_len);
-    cJSON_AddStringToObject(root, "salt", hex_salt ? hex_salt : "");
-    free(hex_salt);
     char *hex_noise = hex_encode(m->noise_key, m->noise_key_len);
-    cJSON_AddStringToObject(root, "noise_key", hex_noise ? hex_noise : "");
-    free(hex_noise);
-    cJSON *j_schema = cJSON_CreateArray();
-    for (int i = 0; i < SCHEMA_COUNT; i++) cJSON_AddItemToArray(j_schema, cJSON_CreateString(m->schema_order[i]));
-    cJSON_AddItemToObject(root, "schema", j_schema);
-    cJSON_AddStringToObject(root, "lang", m->lang);
-    cJSON *j_entries = cJSON_CreateArray();
+    if (!hex_salt || !hex_noise) {
+        free(hex_salt); free(hex_noise);
+        snprintf(err_msg, err_msg_sz, "Hex encoding allocation failed");
+        goto cleanup;
+    }
+    gboolean secrets_added = db_json_add_string(root, "salt", hex_salt) &&
+        db_json_add_string(root, "noise_key", hex_noise);
+    sodium_memzero(hex_salt, strlen(hex_salt)); free(hex_salt);
+    sodium_memzero(hex_noise, strlen(hex_noise)); free(hex_noise);
+    if (!secrets_added) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for database secrets");
+        goto cleanup;
+    }
+    gboolean seen_schema[SCHEMA_COUNT] = { FALSE, FALSE, FALSE, FALSE, FALSE };
+    for (int i = 0; i < SCHEMA_COUNT; i++) {
+        int schema_idx = -1;
+        if (m->schema_order[i]) {
+            for (int j = 0; j < SCHEMA_COUNT; j++)
+                if (strcmp(m->schema_order[i], SCHEMA_PARTS[j]) == 0) { schema_idx = j; break; }
+        }
+        if (schema_idx < 0 || seen_schema[schema_idx]) {
+            snprintf(err_msg, err_msg_sz, "Database schema is invalid");
+            goto cleanup;
+        }
+        seen_schema[schema_idx] = TRUE;
+        cJSON *schema_item = cJSON_CreateString(m->schema_order[i]);
+        if (!db_json_add_array_item(j_schema, schema_item)) {
+            snprintf(err_msg, err_msg_sz, "JSON allocation failed for tag schema");
+            goto cleanup;
+        }
+    }
+    if (!cJSON_AddItemToObject(root, "schema", j_schema)) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for tag schema");
+        goto cleanup;
+    }
+    j_schema = NULL;
+    if (!db_json_add_string(root, "lang", m->lang)) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for language setting");
+        goto cleanup;
+    }
+
     for (int i = 0; i < m->entry_count; i++) {
         db_entry_t *e = &m->entries[i];
-        cJSON *je = cJSON_CreateObject();
-        if (e->label)       cJSON_AddStringToObject(je, "label",       e->label);
-        if (e->type)        cJSON_AddStringToObject(je, "type",        e->type);
-        if (e->size)        cJSON_AddStringToObject(je, "size",        e->size);
-        if (e->cipher)      cJSON_AddStringToObject(je, "cipher",      e->cipher);
-        if (e->content_tag) cJSON_AddStringToObject(je, "content_tag", e->content_tag);
-        if (e->dsalt)       cJSON_AddStringToObject(je, "dsalt",       e->dsalt);
-        if (e->tag_full)    cJSON_AddStringToObject(je, "tag_full",    e->tag_full);
-        if (e->dpass)       cJSON_AddStringToObject(je, "dpass",       e->dpass);
-        if (e->notes)       cJSON_AddStringToObject(je, "notes",       e->notes);
-        if (e->alias)       cJSON_AddStringToObject(je, "alias",       e->alias);
-        if (e->files && e->files[0]) cJSON_AddStringToObject(je, "files", e->files);
-        if (e->smart && e->smart[0]) cJSON_AddStringToObject(je, "smart", e->smart);
-        if (e->uuid && e->uuid[0])   cJSON_AddStringToObject(je, "uuid",  e->uuid);
-        if (e->last_snapshot > 0)
-            cJSON_AddNumberToObject(je, "last_snapshot", (double)e->last_snapshot);
-        cJSON_AddItemToArray(j_entries, je);
-    }
-    cJSON_AddItemToObject(root, "entries", j_entries);
-    cJSON *j_filters = cJSON_CreateArray();
-    for (int i = 0; i < m->filter_count; i++) {
-        cJSON *jf = cJSON_CreateObject();
-        cJSON_AddStringToObject(jf, "name", m->filters[i].name);
-        cJSON_AddStringToObject(jf, "exts", m->filters[i].exts);
-        cJSON_AddItemToArray(j_filters, jf);
-    }
-    cJSON_AddItemToObject(root, "filters", j_filters);
-    char *json_str = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json_str) { snprintf(err_msg, err_msg_sz, "JSON print failed"); return -1; }
-    char *enc = db_gpg_encrypt(m, json_str, strlen(json_str), err_msg, err_msg_sz);
-    SECURE_ZERO(json_str, strlen(json_str));
-    free(json_str);
-    if (!enc) return -1;
-
-    size_t tmp_len = strlen(m->file_path) + 5;
-    char *tmp_path = malloc(tmp_len);
-    if (!tmp_path) { free(enc); return -1; }
-    snprintf(tmp_path, tmp_len, "%s.tmp", m->file_path);
-
-    unlink(tmp_path);
-    int fd = open(tmp_path,
-        O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_EXCL, 0600);
-    if (fd < 0) {
-        snprintf(err_msg, err_msg_sz, "Cannot create temp file: %s", strerror(errno));
-        free(tmp_path); free(enc); return -1;
-    }
-
-    FILE *f = fdopen(fd, "wb");
-    if (!f) {
-        snprintf(err_msg, err_msg_sz, "fdopen failed: %s", strerror(errno));
-        close(fd); unlink(tmp_path); free(tmp_path); free(enc); return -1;
-    }
-
-    fprintf(f, "%s\n", m->recipient);
-    fputs(enc, f);
-
-    int write_err = ferror(f);
-    if (fflush(f) != 0) write_err = 1;
-    if (fsync(fd) != 0) write_err = 1;
-    fclose(f);
-    free(enc);
-
-    if (write_err) {
-        snprintf(err_msg, err_msg_sz, "Write error or fsync failed: %s", strerror(errno));
-        unlink(tmp_path); free(tmp_path); return -1;
-    }
-
-    size_t prev_len = strlen(m->file_path) + 6;
-    char *prev_path = malloc(prev_len);
-    if (prev_path) {
-        snprintf(prev_path, prev_len, "%s.prev", m->file_path);
-        unlink(prev_path);
-        if (link(m->file_path, prev_path) != 0) {
-            (void)0;
+        if (!e->label || !e->type || !e->size || !e->cipher || !e->content_tag || !e->dsalt) {
+            snprintf(err_msg, err_msg_sz, "Entry %d is incomplete", i + 1);
+            goto cleanup;
         }
-        free(prev_path);
+        if (strlen(e->label) > 127 || strlen(e->type) > 32 || strlen(e->size) > 32 ||
+            strlen(e->cipher) > 32 || strlen(e->content_tag) != 2 || strlen(e->dsalt) != 2 ||
+            (e->tag_full && strlen(e->tag_full) > 4096) ||
+            (e->dpass && strlen(e->dpass) > 16384) ||
+            (e->notes && strlen(e->notes) > 1024 * 1024) ||
+            (e->alias && strlen(e->alias) > 4096) ||
+            (e->files && strlen(e->files) > DB_MAX_INDEX_BYTES) ||
+            (e->smart && strlen(e->smart) > 2 * 1024 * 1024) ||
+            (e->uuid && strlen(e->uuid) > 256)) {
+            snprintf(err_msg, err_msg_sz, "Entry %d exceeds a field safety limit", i + 1);
+            goto cleanup;
+        }
+        char *canonical = db_encode_label(m, e->type, e->size, e->content_tag, e->cipher, e->dsalt);
+        if (!canonical || strcmp(canonical, e->label) != 0) {
+            free(canonical);
+            snprintf(err_msg, err_msg_sz, "Entry %d label does not match its fields", i + 1);
+            goto cleanup;
+        }
+        free(canonical);
+        cJSON *je = cJSON_CreateObject();
+        if (!je) { snprintf(err_msg, err_msg_sz, "JSON allocation failed"); goto cleanup; }
+#define ADD_STRING_IF(field) do { \
+            if (e->field && !db_json_add_string(je, #field, e->field)) { \
+                cJSON_Delete(je); \
+                snprintf(err_msg, err_msg_sz, "JSON allocation failed for entry %d", i + 1); \
+                goto cleanup; \
+            } \
+        } while (0)
+        ADD_STRING_IF(label); ADD_STRING_IF(type); ADD_STRING_IF(size); ADD_STRING_IF(cipher);
+        ADD_STRING_IF(content_tag); ADD_STRING_IF(dsalt); ADD_STRING_IF(tag_full); ADD_STRING_IF(dpass);
+        ADD_STRING_IF(notes); ADD_STRING_IF(alias);
+        if ((e->files && e->files[0] && !db_json_add_string(je, "files", e->files)) ||
+            (e->smart && e->smart[0] && !db_json_add_string(je, "smart", e->smart)) ||
+            (e->uuid && e->uuid[0] && !db_json_add_string(je, "uuid", e->uuid)) ||
+            (e->last_snapshot > 0 && !db_json_add_number(je, "last_snapshot", (double)e->last_snapshot))) {
+            cJSON_Delete(je);
+            snprintf(err_msg, err_msg_sz, "JSON allocation failed for entry %d", i + 1);
+            goto cleanup;
+        }
+#undef ADD_STRING_IF
+        if (!cJSON_AddItemToArray(j_entries, je)) {
+            cJSON_Delete(je);
+            snprintf(err_msg, err_msg_sz, "JSON allocation failed for entries array");
+            goto cleanup;
+        }
+    }
+    if (!cJSON_AddItemToObject(root, "entries", j_entries)) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for entries array");
+        goto cleanup;
+    }
+    j_entries = NULL;
+    for (int i = 0; i < m->filter_count; i++) {
+        if (!m->filters[i].name || !m->filters[i].exts ||
+            strlen(m->filters[i].name) > 256 || strlen(m->filters[i].exts) > 4096) {
+            snprintf(err_msg, err_msg_sz, "Filter %d is incomplete or exceeds a field limit", i + 1);
+            goto cleanup;
+        }
+        cJSON *jf = cJSON_CreateObject();
+        if (!jf) { snprintf(err_msg, err_msg_sz, "JSON allocation failed"); goto cleanup; }
+        if (!db_json_add_string(jf, "name", m->filters[i].name) ||
+            !db_json_add_string(jf, "exts", m->filters[i].exts)) {
+            cJSON_Delete(jf);
+            snprintf(err_msg, err_msg_sz, "JSON allocation failed for filter %d", i + 1);
+            goto cleanup;
+        }
+        if (!cJSON_AddItemToArray(j_filters, jf)) {
+            cJSON_Delete(jf);
+            snprintf(err_msg, err_msg_sz, "JSON allocation failed for filters array");
+            goto cleanup;
+        }
+    }
+    if (!cJSON_AddItemToObject(root, "filters", j_filters)) {
+        snprintf(err_msg, err_msg_sz, "JSON allocation failed for filters array");
+        goto cleanup;
+    }
+    j_filters = NULL;
+    json_str = cJSON_PrintUnformatted(root);
+    if (!json_str) { snprintf(err_msg, err_msg_sz, "JSON print failed"); goto cleanup; }
+    if (strlen(json_str) > DB_MAX_JSON_BYTES) {
+        snprintf(err_msg, err_msg_sz, "Database JSON exceeds size limit");
+        goto cleanup;
+    }
+    db_json_zero_strings(root);
+    cJSON_Delete(root); root = NULL;
+
+    enc = db_gpg_encrypt(m, json_str, strlen(json_str), err_msg, err_msg_sz);
+    sodium_memzero(json_str, strlen(json_str));
+    free(json_str); json_str = NULL;
+    if (!enc) goto cleanup;
+
+    size_t tmp_len = strlen(m->file_path) + sizeof(".tmp.XXXXXX");
+    tmp_path = malloc(tmp_len);
+    if (!tmp_path) { snprintf(err_msg, err_msg_sz, "Temporary path allocation failed"); goto cleanup; }
+    snprintf(tmp_path, tmp_len, "%s.tmp.XXXXXX", m->file_path);
+    fd = g_mkstemp_full(tmp_path, O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot create safe temporary file: %s", strerror(errno));
+        goto cleanup;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot restrict temporary file permissions: %s", strerror(errno));
+        goto cleanup;
     }
 
+    if (lstat(m->file_path, &old_st) == 0 && S_ISREG(old_st.st_mode))
+        had_old_regular = TRUE;
+
+    size_t fp_len = strlen(m->recipient);
+    size_t enc_len = strlen(enc);
+    if (write_all_fd(fd, m->recipient, fp_len) != 0 ||
+        write_all_fd(fd, "\n", 1) != 0 || write_all_fd(fd, enc, enc_len) != 0 ||
+        fsync(fd) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot write database safely: %s", strerror(errno));
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        snprintf(err_msg, err_msg_sz, "Cannot close temporary database: %s", strerror(errno));
+        goto cleanup;
+    }
+    fd = -1;
     if (rename(tmp_path, m->file_path) != 0) {
-        snprintf(err_msg, err_msg_sz, "Cannot rename temp file: %s", strerror(errno));
-        unlink(tmp_path); free(tmp_path); return -1;
+        snprintf(err_msg, err_msg_sz, "Cannot atomically replace database: %s", strerror(errno));
+        goto cleanup;
+    }
+    write_ok = TRUE;
+
+    if (had_old_regular) {
+        size_t prev_len = strlen(m->file_path) + sizeof(".prev");
+        prev_path = malloc(prev_len);
+        if (prev_path) {
+            snprintf(prev_path, prev_len, "%s.prev", m->file_path);
+            struct stat prev_st;
+            if (lstat(prev_path, &prev_st) == 0 && S_ISREG(prev_st.st_mode) &&
+                prev_st.st_dev == old_st.st_dev && prev_st.st_ino == old_st.st_ino)
+                (void)unlink(prev_path);
+        }
     }
 
     char *dir_copy = xstrdup(m->file_path);
     char *slash = strrchr(dir_copy, '/');
+    const char *dir_name = ".";
     if (slash) {
-        *slash = '\0';
-        int dfd = open(dir_copy, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        if (slash == dir_copy) { slash[1] = '\0'; dir_name = dir_copy; }
+        else { *slash = '\0'; dir_name = dir_copy; }
     }
+    int dfd = open(dir_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
     free(dir_copy);
-
+    rc = 0;
+cleanup:
+    if (fd >= 0) close(fd);
+    if (!write_ok && tmp_path) unlink(tmp_path);
+    if (root) { db_json_zero_strings(root); cJSON_Delete(root); }
+    if (j_schema) { db_json_zero_strings(j_schema); cJSON_Delete(j_schema); }
+    if (j_entries) { db_json_zero_strings(j_entries); cJSON_Delete(j_entries); }
+    if (j_filters) { db_json_zero_strings(j_filters); cJSON_Delete(j_filters); }
+    if (json_str) { sodium_memzero(json_str, strlen(json_str)); free(json_str); }
+    if (enc) { sodium_memzero(enc, strlen(enc)); free(enc); }
     free(tmp_path);
-    return 0;
+    free(prev_path);
+    return rc;
 }
 
 static db_manager_t *db_manager_open(const char *path, const char *forced_key,
     char *err_msg, size_t err_msg_sz) {
+    if (!path || !path[0]) {
+        snprintf(err_msg, err_msg_sz, "Invalid database path");
+        return NULL;
+    }
     db_manager_t *m = calloc(1, sizeof(db_manager_t));
     if (!m) { snprintf(err_msg, err_msg_sz, "alloc failed"); return NULL; }
     db_manager_init(m);
@@ -827,7 +1484,7 @@ static db_manager_t *db_manager_open(const char *path, const char *forced_key,
     m->file_path = xstrdup(path);
     char *enc_data = NULL;
     if (db_read_file(path, &m->recipient, &enc_data, err_msg, err_msg_sz) != 0) { db_manager_clear(m); free(m); return NULL; }
-    if (forced_key && strcmp(forced_key, m->recipient) != 0) {
+    if (forced_key && g_ascii_strcasecmp(forced_key, m->recipient) != 0) {
         snprintf(err_msg, err_msg_sz, "%s", i18n("key_mismatch"));
         free(enc_data); db_manager_clear(m); free(m); return NULL;
     }
@@ -835,14 +1492,17 @@ static db_manager_t *db_manager_open(const char *path, const char *forced_key,
     free(enc_data);
     if (!json_str) { db_manager_clear(m); free(m); return NULL; }
     int rc = db_load_json(m, json_str, err_msg, err_msg_sz);
-    SECURE_ZERO(json_str, strlen(json_str));
-    free(json_str);
+    sec_strfree(json_str);
     if (rc != 0) { db_manager_clear(m); free(m); return NULL; }
     return m;
 }
 
 static db_manager_t *db_manager_create(const char *path, const char *recipient,
     const char *lang, char *err_msg, size_t err_msg_sz) {
+    if (!path || !path[0]) {
+        snprintf(err_msg, err_msg_sz, "Invalid database path");
+        return NULL;
+    }
     db_manager_t *m = calloc(1, sizeof(db_manager_t));
     if (!m) { snprintf(err_msg, err_msg_sz, "alloc failed"); return NULL; }
     db_manager_init(m);
@@ -850,7 +1510,7 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
     if (db_init_gpg(m, err_msg, err_msg_sz) != 0) { db_manager_clear(m); free(m); return NULL; }
     m->file_path = xstrdup(path);
     m->recipient = xstrdup(recipient);
-    m->salt = malloc(32); m->noise_key = malloc(32);
+    m->salt = malloc(32); m->noise_key = sodium_malloc(32);
     if (!m->salt || !m->noise_key) { db_manager_clear(m); free(m); return NULL; }
     m->salt_len = 32; m->noise_key_len = 32;
     randombytes_buf(m->salt, 32);
@@ -864,9 +1524,13 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
     char *dir = xstrdup(path);
     char *slash = strrchr(dir, '/');
     if (slash) {
-        *slash = '\0';
-        g_mkdir_with_parents(dir, 0700);
-        chmod(dir, 0700);
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+
+        if (g_mkdir_with_parents(dir, 0700) != 0) {
+            snprintf(err_msg, err_msg_sz, "Cannot create database directory: %s", g_strerror(errno));
+            free(dir); db_manager_clear(m); free(m); return NULL;
+        }
     }
     free(dir);
 
@@ -881,35 +1545,54 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
 
 static char *db_encode_label(db_manager_t *m, const char *type, const char *size,
     const char *content_tag, const char *cipher, const char *dsalt) {
+    if (!m || !m->salt || m->salt_len != 32 || !m->noise_key || m->noise_key_len != 32 ||
+        !map_has_name(TYPE_MAP, TYPE_MAP_N, type) ||
+        !map_has_name(SIZE_MAP, SIZE_MAP_N, size) ||
+        !map_has_name(CIPHER_MAP, CIPHER_MAP_N, cipher) ||
+        !content_tag || strlen(content_tag) != 2 ||
+        !valid_ascii_tag_char((unsigned char)content_tag[0]) ||
+        !valid_ascii_tag_char((unsigned char)content_tag[1]) ||
+        !valid_alphabet_string(dsalt, 2))
+        return NULL;
+
     const char *values[SCHEMA_COUNT];
     const char *raw_names[SCHEMA_COUNT];
+    gboolean seen_names[SCHEMA_COUNT] = { FALSE, FALSE, FALSE, FALSE, FALSE };
     for (int i = 0; i < SCHEMA_COUNT; i++) {
+        if (!m->schema_order[i]) return NULL;
         if (strcmp(m->schema_order[i], "type") == 0)        { values[i] = type;        raw_names[i] = "type"; }
         else if (strcmp(m->schema_order[i], "size") == 0)   { values[i] = size;        raw_names[i] = "size"; }
         else if (strcmp(m->schema_order[i], "content_tag")==0){ values[i] = content_tag; raw_names[i] = "content_tag"; }
         else if (strcmp(m->schema_order[i], "cipher") == 0) { values[i] = cipher;      raw_names[i] = "cipher"; }
         else if (strcmp(m->schema_order[i], "dsalt") == 0)  { values[i] = dsalt;       raw_names[i] = "dsalt"; }
+        else return NULL;
+        int name_index = -1;
+        for (int j = 0; j < SCHEMA_COUNT; j++)
+            if (strcmp(SCHEMA_PARTS[j], raw_names[i]) == 0) { name_index = j; break; }
+        if (name_index < 0 || seen_names[name_index]) return NULL;
+        seen_names[name_index] = TRUE;
     }
     char blocks[SCHEMA_COUNT][8];
     for (int i = 0; i < SCHEMA_COUNT; i++) {
         const char *encoded = map_encode(raw_names[i], values[i]);
-        int part_index = 0;
+        int part_index = -1;
         for (int j = 0; j < SCHEMA_COUNT; j++)
             if (strcmp(SCHEMA_PARTS[j], raw_names[i]) == 0) { part_index = j; break; }
-        char schar = calculate_block_salt(m->noise_key, m->noise_key_len, m->salt, m->salt_len, part_index, encoded);
-        snprintf(blocks[i], sizeof(blocks[i]), "%s%c", encoded, schar);
+        if (!encoded || part_index < 0 || strlen(encoded) != (size_t)PART_LENGTHS[part_index])
+            return NULL;
+        char schar = calculate_block_salt(m->noise_key, m->noise_key_len,
+            m->salt, m->salt_len, part_index, encoded);
+        int written = snprintf(blocks[i], sizeof(blocks[i]), "%s%c", encoded, schar);
+        if (written < 0 || (size_t)written >= sizeof(blocks[i])) return NULL;
     }
     char label[128] = "";
     size_t pos = 0;
     for (int i = 0; i < SCHEMA_COUNT; i++) {
-        if (i > 0) {
-            if (pos < sizeof(label) - 1) label[pos++] = '-';
-        }
+        if (i > 0) label[pos++] = '-';
         size_t blen = strlen(blocks[i]);
-        if (pos + blen < sizeof(label)) {
-            memcpy(label + pos, blocks[i], blen);
-            pos += blen;
-        }
+        if (pos + blen >= sizeof(label)) return NULL;
+        memcpy(label + pos, blocks[i], blen);
+        pos += blen;
         label[pos] = '\0';
     }
     return xstrdup(label);
@@ -923,16 +1606,29 @@ typedef struct {
 static int db_parse_label(db_manager_t *m, const char *label,
     parsed_block_t *out_blocks, int *out_count,
     char *err_msg, size_t err_msg_sz) {
+    if (!m || !label || !out_blocks || !out_count || !m->salt || !m->noise_key ||
+        strlen(label) >= 128) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("invalid_label"));
+        return -1;
+    }
     char buf[128];
-    strncpy(buf, label, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
-    for (char *p = buf; *p; p++) *p = toupper((unsigned char)*p);
+    memcpy(buf, label, strlen(label) + 1);
+    for (char *p = buf; *p; p++) *p = (char)toupper((unsigned char)*p);
     char *parts[SCHEMA_COUNT]; int cnt = 0;
     char *save = NULL;
+    if (strlen(label) != 17 || label[0] == '-' || label[16] == '-' || strstr(label, "--")) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("label_err")); return -1;
+    }
     char *tok = strtok_r(buf, "-", &save);
     while (tok && cnt < SCHEMA_COUNT) { parts[cnt++] = tok; tok = strtok_r(NULL, "-", &save); }
-    if (cnt != SCHEMA_COUNT) { snprintf(err_msg, err_msg_sz, "%s", i18n("label_err")); return -1; }
+    if (cnt != SCHEMA_COUNT || tok != NULL) {
+        snprintf(err_msg, err_msg_sz, "%s", i18n("label_err")); return -1;
+    }
     for (int i = 0; i < SCHEMA_COUNT; i++) {
         const char *part_name = m->schema_order[i];
+        if (!part_name) {
+            snprintf(err_msg, err_msg_sz, "%s", i18n("invalid_label")); return -1;
+        }
         int expected_len = 0;
         for (int j = 0; j < SCHEMA_COUNT; j++)
             if (strcmp(SCHEMA_PARTS[j], part_name) == 0) { expected_len = FULL_PART_LENGTHS[j]; break; }
@@ -945,9 +1641,21 @@ static int db_parse_label(db_manager_t *m, const char *label,
         memcpy(out_blocks[i].val, parts[i], val_len);
         out_blocks[i].val[val_len] = '\0';
         out_blocks[i].schar = parts[i][val_len];
-        int part_index = 0;
+        int part_index = -1;
         for (int j = 0; j < SCHEMA_COUNT; j++)
             if (strcmp(SCHEMA_PARTS[j], part_name) == 0) { part_index = j; break; }
+        if (part_index < 0) {
+            snprintf(err_msg, err_msg_sz, "%s", i18n("invalid_label")); return -1;
+        }
+        if ((strcmp(part_name, "type") == 0 && !map_has_code(TYPE_MAP, TYPE_MAP_N, out_blocks[i].val)) ||
+            (strcmp(part_name, "size") == 0 && !map_has_code(SIZE_MAP, SIZE_MAP_N, out_blocks[i].val)) ||
+            (strcmp(part_name, "cipher") == 0 && !map_has_code(CIPHER_MAP, CIPHER_MAP_N, out_blocks[i].val)) ||
+            (strcmp(part_name, "content_tag") == 0 &&
+             (!valid_ascii_tag_char((unsigned char)out_blocks[i].val[0]) ||
+              !valid_ascii_tag_char((unsigned char)out_blocks[i].val[1]))) ||
+            (strcmp(part_name, "dsalt") == 0 && !valid_alphabet_string(out_blocks[i].val, 2))) {
+            snprintf(err_msg, err_msg_sz, "%s", i18n("invalid_label")); return -1;
+        }
         out_blocks[i].expected_schar = calculate_block_salt(m->noise_key, m->noise_key_len, m->salt, m->salt_len, part_index, out_blocks[i].val);
         if (out_blocks[i].schar != out_blocks[i].expected_schar) {
             snprintf(err_msg, err_msg_sz, "%s %d (%s)", i18n("block_err"), i+1, i18n(part_name)); return -1;
@@ -1021,7 +1729,7 @@ static fs_node_t *fs_node_new(const char *name, gboolean is_dir) {
 
 static void fs_node_free(fs_node_t *n) {
     if (!n) return;
-    g_free(n->name);
+    secure_g_free_string(&n->name);
     for (GList *l = n->children; l; l = l->next)
         fs_node_free((fs_node_t*)l->data);
     g_list_free(n->children);
@@ -1043,6 +1751,7 @@ static fs_node_t *fs_build_tree(const char *files) {
     fs_node_t *root = fs_node_new("", TRUE);
     if (!files || !files[0]) return root;
 
+    size_t copy_len = strlen(files) + 1;
     char *copy = xstrdup(files);
     char *save = NULL;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -1070,6 +1779,7 @@ static fs_node_t *fs_build_tree(const char *files) {
         }
         g_strfreev(parts);
     }
+    sodium_memzero(copy, copy_len);
     free(copy);
 
     GQueue *q = g_queue_new();
@@ -1105,36 +1815,80 @@ static void fs_to_store(fs_node_t *node, GtkTreeStore *store, GtkTreeIter *paren
 }
 
 static char *scan_directory_recursive(const char *root) {
+    if (!root || !root[0]) return NULL;
     GString *s = g_string_new(NULL);
     GQueue *queue = g_queue_new();
-    g_queue_push_tail(queue, g_strdup(root));
+    if (!s || !queue) {
+        if (s) g_string_free(s, TRUE);
+        if (queue) g_queue_free(queue);
+        return NULL;
+    }
+    char *root_copy = g_strdup(root);
+    if (!root_copy) {
+        g_string_free(s, TRUE);
+        g_queue_free(queue);
+        return NULL;
+    }
+    g_queue_push_tail(queue, root_copy);
     size_t root_len = strlen(root);
+    size_t files_count = 0;
+    size_t dirs_count = 0;
+    gboolean exceeded = FALSE;
 
-    while (!g_queue_is_empty(queue)) {
+    while (!g_queue_is_empty(queue) && !exceeded) {
         char *dir = g_queue_pop_head(queue);
-        GDir *d = g_dir_open(dir, 0, NULL);
+        if (++dirs_count > DB_MAX_INDEX_DIRS) {
+            secure_g_free_string(&dir);
+            exceeded = TRUE;
+            break;
+        }
+        GError *dir_err = NULL;
+        GDir *d = g_dir_open(dir, 0, &dir_err);
+        if (!d) {
+            if (dir_err) g_error_free(dir_err);
+            secure_g_free_string(&dir);
+            exceeded = TRUE;
+            break;
+        }
         if (d) {
             const char *name;
             while ((name = g_dir_read_name(d))) {
                 char *full = g_build_filename(dir, name, NULL);
                 struct stat st;
-                if (lstat(full, &st) != 0) { g_free(full); continue; }
+                if (!full || lstat(full, &st) != 0) { secure_g_free_string(&full); continue; }
                 if (S_ISDIR(st.st_mode)) {
+                    if (g_queue_get_length(queue) >= DB_MAX_INDEX_QUEUED_DIRS) {
+                        secure_g_free_string(&full); exceeded = TRUE; break;
+                    }
                     g_queue_push_tail(queue, full);
                 } else if (S_ISREG(st.st_mode)) {
                     const char *rel = full + root_len;
                     while (*rel == '/' || *rel == '\\') rel++;
+                    size_t need = strlen(rel) + 32;
+                    if (files_count >= DB_MAX_INDEX_FILES || need > DB_MAX_INDEX_BYTES - s->len) {
+                        secure_g_free_string(&full); exceeded = TRUE; break;
+                    }
                     g_string_append_printf(s, "%s\t%lld\n", rel, (long long)st.st_size);
-                    g_free(full);
+                    files_count++;
+                    secure_g_free_string(&full);
                 } else {
-                    g_free(full);
+                    secure_g_free_string(&full);
                 }
             }
             g_dir_close(d);
         }
-        g_free(dir);
+        secure_g_free_string(&dir);
+    }
+    while (!g_queue_is_empty(queue)) {
+        char *pending = g_queue_pop_head(queue);
+        secure_g_free_string(&pending);
     }
     g_queue_free(queue);
+    if (exceeded) {
+        sodium_memzero(s->str, s->len + 1);
+        g_string_free(s, TRUE);
+        return NULL;
+    }
     return g_string_free(s, FALSE);
 }
 
@@ -1154,22 +1908,26 @@ typedef struct {
 static void free_disk_list(disk_info_t *list, int count) {
     if (!list) return;
     for (int i = 0; i < count; i++) {
-        free(list[i].device);
-        free(list[i].uuid);
-        free(list[i].size_h);
-        free(list[i].fstype);
-        free(list[i].mountpoint);
-        free(list[i].model);
-        free(list[i].transport);
-        free(list[i].label);
+        secure_g_free_string(&list[i].device);
+        secure_g_free_string(&list[i].uuid);
+        secure_g_free_string(&list[i].size_h);
+        secure_g_free_string(&list[i].fstype);
+        secure_g_free_string(&list[i].mountpoint);
+        secure_g_free_string(&list[i].model);
+        secure_g_free_string(&list[i].transport);
+        secure_g_free_string(&list[i].label);
     }
     free(list);
 }
 
 static gboolean uuid_is_connected(const char *uuid) {
-    if (!uuid || !uuid[0]) return FALSE;
-    char path[512];
-    snprintf(path, sizeof(path), "/dev/disk/by-uuid/%s", uuid);
+    if (!uuid || !uuid[0] || strlen(uuid) > 128) return FALSE;
+    for (const unsigned char *p = (const unsigned char *)uuid; *p; p++) {
+        if (!(g_ascii_isxdigit(*p) || *p == '-')) return FALSE;
+    }
+    char path[160];
+    int n = snprintf(path, sizeof(path), "/dev/disk/by-uuid/%s", uuid);
+    if (n < 0 || (size_t)n >= sizeof(path)) return FALSE;
     return access(path, F_OK) == 0;
 }
 
@@ -1191,33 +1949,33 @@ static void walk_lsblk(cJSON *arr, disk_info_t **list, int *count, int *cap) {
             disk_info_t *d = &(*list)[*count];
             memset(d, 0, sizeof(*d));
 
-            d->device = xstrdup(j_path->valuestring);
-            d->uuid = xstrdup(j_uuid->valuestring);
+            d->device = g_strdup(j_path->valuestring);
+            d->uuid = g_strdup(j_uuid->valuestring);
 
             cJSON *j_size = cJSON_GetObjectItem(dev, "size");
             if (j_size && cJSON_IsNumber(j_size)) {
                 d->size_bytes = (long long)j_size->valuedouble;
                 d->size_h = format_bytes(d->size_bytes);
             } else {
-                d->size_h = xstrdup("?");
+                d->size_h = g_strdup("?");
             }
 
             cJSON *j_fs = cJSON_GetObjectItem(dev, "fstype");
-            if (j_fs && cJSON_IsString(j_fs)) d->fstype = xstrdup(j_fs->valuestring);
+            if (j_fs && cJSON_IsString(j_fs)) d->fstype = g_strdup(j_fs->valuestring);
 
             cJSON *j_mnt = cJSON_GetObjectItem(dev, "mountpoint");
             if (j_mnt && cJSON_IsString(j_mnt) && j_mnt->valuestring[0])
-                d->mountpoint = xstrdup(j_mnt->valuestring);
+                d->mountpoint = g_strdup(j_mnt->valuestring);
 
             cJSON *j_model = cJSON_GetObjectItem(dev, "model");
-            if (j_model && cJSON_IsString(j_model)) d->model = xstrdup(j_model->valuestring);
+            if (j_model && cJSON_IsString(j_model)) d->model = g_strdup(j_model->valuestring);
 
             cJSON *j_tran = cJSON_GetObjectItem(dev, "tran");
-            if (j_tran && cJSON_IsString(j_tran)) d->transport = xstrdup(j_tran->valuestring);
+            if (j_tran && cJSON_IsString(j_tran)) d->transport = g_strdup(j_tran->valuestring);
 
             cJSON *j_label = cJSON_GetObjectItem(dev, "label");
             if (j_label && cJSON_IsString(j_label) && j_label->valuestring[0])
-                d->label = xstrdup(j_label->valuestring);
+                d->label = g_strdup(j_label->valuestring);
 
             d->connected = TRUE;
             (*count)++;
@@ -1231,30 +1989,35 @@ static void walk_lsblk(cJSON *arr, disk_info_t **list, int *count, int *cap) {
 
 static disk_info_t *list_disks(int *out_count) {
     *out_count = 0;
-    gchar *argv[] = { "lsblk", "-J", "-b",
+    gchar *argv[] = { "/usr/bin/lsblk", "-J", "-b",
         "-o", "PATH,UUID,SIZE,FSTYPE,MOUNTPOINT,MODEL,TRAN,TYPE,LABEL",
         NULL };
     gchar *out = NULL;
     GError *err = NULL;
     gint status = 0;
-    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+    if (!g_spawn_sync(NULL, argv, NULL, 0,
             NULL, NULL, &out, NULL, &status, &err)) {
         if (err) g_error_free(err);
-        g_free(out);
+        secure_g_free_string(&out);
         return NULL;
     }
-    if (!out || status != 0) { g_free(out); return NULL; }
+    if (!out || status != 0) { secure_g_free_string(&out); return NULL; }
 
     cJSON *root = cJSON_Parse(out);
-    g_free(out);
+    secure_g_free_string(&out);
     if (!root) return NULL;
 
     cJSON *devices = cJSON_GetObjectItem(root, "blockdevices");
-    if (!devices || !cJSON_IsArray(devices)) { cJSON_Delete(root); return NULL; }
+    if (!devices || !cJSON_IsArray(devices)) {
+        db_json_zero_strings(root);
+        cJSON_Delete(root);
+        return NULL;
+    }
 
     disk_info_t *list = NULL;
     int count = 0, cap = 0;
     walk_lsblk(devices, &list, &count, &cap);
+    db_json_zero_strings(root);
     cJSON_Delete(root);
     *out_count = count;
     return list;
@@ -1305,6 +2068,7 @@ static char *find_device_for_path(const char *path) {
         size_t mnt_len = strlen(mnt);
         if (mnt_len > path_len || mnt_len < best_len) continue;
         if (strncmp(use, mnt, mnt_len) != 0) continue;
+        if (mnt_len > 1 && use[mnt_len] != '\0' && use[mnt_len] != '/') continue;
         free(best_dev);
         best_dev = xstrdup(dev);
         best_len = mnt_len;
@@ -1317,25 +2081,25 @@ static char *find_device_for_path(const char *path) {
 static char *get_uuid_for_path(const char *mount_path) {
     char *dev = find_device_for_path(mount_path);
     if (!dev) return NULL;
-    if (strncmp(dev, "/dev/", 5) != 0) { free(dev); return NULL; }
+    if (strncmp(dev, "/dev/", 5) != 0) { secure_free_string(&dev); return NULL; }
 
-    gchar *argv[] = { "lsblk", "-no", "UUID", dev, NULL };
+    gchar *argv[] = { "/usr/bin/lsblk", "-no", "UUID", dev, NULL };
     gchar *out = NULL;
     GError *err = NULL;
-    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+    if (!g_spawn_sync(NULL, argv, NULL, 0,
             NULL, NULL, &out, NULL, NULL, &err)) {
         if (err) g_error_free(err);
-        free(dev);
-        g_free(out);
+        secure_free_string(&dev);
+        secure_g_free_string(&out);
         return NULL;
     }
-    free(dev);
+    secure_free_string(&dev);
     if (!out) return NULL;
 
     char *nl = strchr(out, '\n');
     if (nl) *nl = '\0';
     char *res = out[0] ? xstrdup(out) : NULL;
-    g_free(out);
+    secure_g_free_string(&out);
     return res;
 }
 
@@ -1343,29 +2107,29 @@ static char *collect_smart_data(const char *mount_path) {
     if (!mount_path) return NULL;
     char *dev = find_device_for_path(mount_path);
     if (!dev) return NULL;
-    if (strncmp(dev, "/dev/", 5) != 0) { free(dev); return NULL; }
+    if (strncmp(dev, "/dev/", 5) != 0) { secure_free_string(&dev); return NULL; }
 
-    gchar *argv[] = { "smartctl", "-j", "-H", "-i", "-A", dev, NULL };
+    gchar *argv[] = { "/usr/sbin/smartctl", "-j", "-H", "-i", "-A", dev, NULL };
     gchar *stdout_buf = NULL;
     gint exit_status = 0;
     GError *serr = NULL;
     gboolean ok = g_spawn_sync(NULL, argv, NULL,
-        G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL,
+        G_SPAWN_STDERR_TO_DEV_NULL,
         NULL, NULL, &stdout_buf, NULL, &exit_status, &serr);
-    free(dev);
+    secure_free_string(&dev);
 
     if (!ok || !stdout_buf) {
         if (serr) g_error_free(serr);
-        g_free(stdout_buf);
+        secure_g_free_string(&stdout_buf);
         return NULL;
     }
     if (exit_status != 0 || !stdout_buf[0]) {
-        g_free(stdout_buf);
+        secure_g_free_string(&stdout_buf);
         return NULL;
     }
 
     cJSON *root = cJSON_Parse(stdout_buf);
-    g_free(stdout_buf);
+    secure_g_free_string(&stdout_buf);
     if (!root) return NULL;
 
     cJSON *result = cJSON_CreateObject();
@@ -1451,8 +2215,10 @@ static char *collect_smart_data(const char *mount_path) {
         }
     }
 
+    db_json_zero_strings(root);
     cJSON_Delete(root);
     char *final = cJSON_PrintUnformatted(result);
+    db_json_zero_strings(result);
     cJSON_Delete(result);
     return final;
 }
@@ -1461,14 +2227,32 @@ static int db_set_entry_snapshot(db_manager_t *m, const char *label,
     const char *files, const char *smart_json,
     char *err_msg, size_t err_msg_sz)
 {
+    if (!m || !label || !files || strlen(files) > DB_MAX_INDEX_BYTES ||
+        (smart_json && strlen(smart_json) > 2 * 1024 * 1024)) {
+        snprintf(err_msg, err_msg_sz, "Index scan failed or exceeded safety limits; previous snapshot was kept");
+        return -1;
+    }
     for (int i = 0; i < m->entry_count; i++) {
         if (strcmp(m->entries[i].label, label) == 0) {
-            free(m->entries[i].files);
-            m->entries[i].files = (files && files[0]) ? xstrdup(files) : NULL;
-            free(m->entries[i].smart);
-            m->entries[i].smart = (smart_json && smart_json[0]) ? xstrdup(smart_json) : NULL;
+            char *new_files = (files && files[0]) ? xstrdup(files) : NULL;
+            char *new_smart = (smart_json && smart_json[0]) ? xstrdup(smart_json) : NULL;
+            char *old_files = m->entries[i].files;
+            char *old_smart = m->entries[i].smart;
+            long long old_snapshot = m->entries[i].last_snapshot;
+            m->entries[i].files = new_files;
+            m->entries[i].smart = new_smart;
             m->entries[i].last_snapshot = (long long)time(NULL);
-            return db_save(m, err_msg, err_msg_sz);
+            if (db_save(m, err_msg, err_msg_sz) != 0) {
+                secure_free_string(&m->entries[i].files);
+                secure_free_string(&m->entries[i].smart);
+                m->entries[i].files = old_files;
+                m->entries[i].smart = old_smart;
+                m->entries[i].last_snapshot = old_snapshot;
+                return -1;
+            }
+            secure_free_string(&old_files);
+            secure_free_string(&old_smart);
+            return 0;
         }
     }
     return -1;
@@ -1484,12 +2268,14 @@ static int count_lines(const char *s) {
 static long long total_bytes_in_files(const char *files) {
     if (!files) return 0;
     long long total = 0;
+    size_t copy_len = strlen(files) + 1;
     char *copy = xstrdup(files);
     char *save = NULL;
     for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char *tab = strchr(line, '\t');
         if (tab) total += atoll(tab + 1);
     }
+    sodium_memzero(copy, copy_len);
     free(copy);
     return total;
 }
@@ -1499,8 +2285,30 @@ static int db_add_entry(db_manager_t *m, const char *type, const char *size,
     const char *tag_full, const char *dpass, const char *notes,
     const char *alias, const char *uuid,
     char *err_msg, size_t err_msg_sz) {
+    if (!m || !type || !size || !cipher || !content_tag || !dsalt ||
+        !map_has_name(TYPE_MAP, TYPE_MAP_N, type) ||
+        !map_has_name(SIZE_MAP, SIZE_MAP_N, size) ||
+        !map_has_name(CIPHER_MAP, CIPHER_MAP_N, cipher) ||
+        strlen(content_tag) != 2 || !valid_ascii_tag_char((unsigned char)content_tag[0]) ||
+        !valid_ascii_tag_char((unsigned char)content_tag[1]) ||
+        !valid_alphabet_string(dsalt, 2)) {
+        snprintf(err_msg, err_msg_sz, "Invalid tag fields: use a known type, size and cipher, a two-character alphanumeric tag, and a valid salt");
+        return -1;
+    }
+    if ((tag_full && strlen(tag_full) > 4096) ||
+        (dpass && strlen(dpass) > 16384) ||
+        (notes && strlen(notes) > 1024 * 1024) ||
+        (alias && strlen(alias) > 4096) ||
+        (uuid && strlen(uuid) > 256)) {
+        snprintf(err_msg, err_msg_sz, "Entry field exceeds configured safety limit");
+        return -1;
+    }
+    if (m->entry_count >= DB_MAX_ENTRIES) {
+        snprintf(err_msg, err_msg_sz, "Database entry limit reached");
+        return -1;
+    }
     if (m->entry_count >= m->entry_cap) {
-        int new_cap = m->entry_cap * 2;
+        int new_cap = m->entry_cap > DB_MAX_ENTRIES / 2 ? DB_MAX_ENTRIES : m->entry_cap * 2;
         db_entry_t *ne = realloc(m->entries, new_cap * sizeof(db_entry_t));
         if (!ne) { snprintf(err_msg, err_msg_sz, "alloc failed"); return -1; }
         memset(ne + m->entry_cap, 0, (new_cap - m->entry_cap) * sizeof(db_entry_t));
@@ -1509,6 +2317,10 @@ static int db_add_entry(db_manager_t *m, const char *type, const char *size,
     db_entry_t *e = &m->entries[m->entry_count];
     db_entry_init(e);
     e->label = db_encode_label(m, type, size, content_tag, cipher, dsalt);
+    if (!e->label) {
+        snprintf(err_msg, err_msg_sz, "Cannot encode invalid tag fields");
+        return -1;
+    }
     e->type = xstrdup(type); e->size = xstrdup(size); e->cipher = xstrdup(cipher);
     e->content_tag = xstrdup(content_tag); e->dsalt = xstrdup(dsalt);
     e->tag_full = xstrdup(tag_full ? tag_full : "");
@@ -1517,17 +2329,35 @@ static int db_add_entry(db_manager_t *m, const char *type, const char *size,
     if (alias && alias[0]) e->alias = xstrdup(alias);
     if (uuid && uuid[0]) e->uuid = xstrdup(uuid);
     m->entry_count++;
-    return db_save(m, err_msg, err_msg_sz);
+    if (db_save(m, err_msg, err_msg_sz) != 0) {
+        m->entry_count--;
+        db_entry_clear(&m->entries[m->entry_count]);
+        memset(&m->entries[m->entry_count], 0, sizeof(db_entry_t));
+        return -1;
+    }
+    return 0;
 }
 
 static int db_remove_entry(db_manager_t *m, const char *label, char *err_msg, size_t err_msg_sz) {
+    if (!m || !label) return -1;
     for (int i = 0; i < m->entry_count; i++) {
         if (strcmp(m->entries[i].label, label) == 0) {
-            db_entry_clear(&m->entries[i]);
-            memmove(&m->entries[i], &m->entries[i+1], (m->entry_count - i - 1) * sizeof(db_entry_t));
+            db_entry_t removed = m->entries[i];
+            int old_count = m->entry_count;
+            memmove(&m->entries[i], &m->entries[i+1],
+                (size_t)(old_count - i - 1) * sizeof(db_entry_t));
             m->entry_count--;
             memset(&m->entries[m->entry_count], 0, sizeof(db_entry_t));
-            return db_save(m, err_msg, err_msg_sz);
+            if (db_save(m, err_msg, err_msg_sz) != 0) {
+                memmove(&m->entries[i+1], &m->entries[i],
+                    (size_t)(m->entry_count - i) * sizeof(db_entry_t));
+                m->entries[i] = removed;
+                m->entry_count++;
+                memset(&m->entries[m->entry_count], 0, sizeof(db_entry_t));
+                return -1;
+            }
+            db_entry_clear(&removed);
+            return 0;
         }
     }
     return -1;
@@ -1537,15 +2367,37 @@ static int db_update_entry(db_manager_t *m, const char *label,
     const char *new_dpass, const char *new_notes,
     const char *new_alias,
     char *err_msg, size_t err_msg_sz) {
+    if (!m || !label) return -1;
+    if ((new_dpass && strlen(new_dpass) > 16384) ||
+        (new_notes && strlen(new_notes) > 1024 * 1024) ||
+        (new_alias && strlen(new_alias) > 4096)) {
+        snprintf(err_msg, err_msg_sz, "Updated field exceeds configured safety limit");
+        return -1;
+    }
     for (int i = 0; i < m->entry_count; i++) {
         if (strcmp(m->entries[i].label, label) == 0) {
-            if (m->entries[i].dpass) { sec_strfree(m->entries[i].dpass); m->entries[i].dpass = NULL; }
-            if (new_dpass && new_dpass[0]) m->entries[i].dpass = sec_strdup(new_dpass);
-            free(m->entries[i].notes); m->entries[i].notes = NULL;
-            if (new_notes) m->entries[i].notes = xstrdup(new_notes);
-            free(m->entries[i].alias); m->entries[i].alias = NULL;
-            if (new_alias && new_alias[0]) m->entries[i].alias = xstrdup(new_alias);
-            return db_save(m, err_msg, err_msg_sz);
+            char *replacement_pass = (new_dpass && new_dpass[0]) ? sec_strdup(new_dpass) : NULL;
+            char *replacement_notes = new_notes ? xstrdup(new_notes) : NULL;
+            char *replacement_alias = (new_alias && new_alias[0]) ? xstrdup(new_alias) : NULL;
+            char *old_pass = m->entries[i].dpass;
+            char *old_notes = m->entries[i].notes;
+            char *old_alias = m->entries[i].alias;
+            m->entries[i].dpass = replacement_pass;
+            m->entries[i].notes = replacement_notes;
+            m->entries[i].alias = replacement_alias;
+            if (db_save(m, err_msg, err_msg_sz) != 0) {
+                if (m->entries[i].dpass) sec_strfree(m->entries[i].dpass);
+                secure_free_string(&m->entries[i].notes);
+                secure_free_string(&m->entries[i].alias);
+                m->entries[i].dpass = old_pass;
+                m->entries[i].notes = old_notes;
+                m->entries[i].alias = old_alias;
+                return -1;
+            }
+            if (old_pass) sec_strfree(old_pass);
+            secure_free_string(&old_notes);
+            secure_free_string(&old_alias);
+            return 0;
         }
     }
     return -1;
@@ -1564,7 +2416,8 @@ static gpg_key_info_t *gpg_list_keys(gpgme_ctx_t ctx, int secret_only, int *out_
         gerr = gpgme_op_keylist_next(ctx, &key);
         if (gerr == GPG_ERR_EOF) break;
         if (gerr != GPG_ERR_NO_ERROR) break;
-        if (key->revoked || key->expired || key->disabled || key->invalid) {
+        if (key->revoked || key->expired || key->disabled || key->invalid ||
+            !key->can_encrypt || (secret_only && !key->can_sign)) {
             gpgme_key_release(key);
             continue;
         }
@@ -1636,10 +2489,21 @@ static guint g_toast_timer_id = 0;
 static GHashTable *g_known_uuids = NULL;
 static gboolean g_uuids_initialized = FALSE;
 static gboolean g_batch_running = FALSE;
+static gboolean g_autolock_pending = FALSE;
 
 static char *config_path(void) {
     char *dir = g_build_filename(g_get_user_config_dir(), "diskpass", NULL);
-    g_mkdir_with_parents(dir, 0700);
+    if (!dir) return NULL;
+    if (g_mkdir_with_parents(dir, 0700) != 0) {
+        g_free(dir);
+        return NULL;
+    }
+    struct stat st;
+    if (g_lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+        chmod(dir, 0700) != 0) {
+        g_free(dir);
+        return NULL;
+    }
     char *path = g_build_filename(dir, "config", NULL);
     g_free(dir);
     return path;
@@ -1647,19 +2511,33 @@ static char *config_path(void) {
 
 static void save_config(void) {
     char *path = config_path();
+    if (!path) return;
     GKeyFile *kf = g_key_file_new();
     g_key_file_set_string(kf, "main", "lang", g_lang);
     if (g_app.current_file)
         g_key_file_set_string(kf, "main", "last_db", g_app.current_file);
-    gsize len;
+    gsize len = 0;
     char *data = g_key_file_to_data(kf, &len, NULL);
     if (data) {
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        char *tmp_path = g_strdup_printf("%s.tmp.XXXXXX", path);
+        int fd = tmp_path ? g_mkstemp_full(tmp_path, O_WRONLY | O_CLOEXEC, 0600) : -1;
+        gboolean ok = FALSE;
         if (fd >= 0) {
-            ssize_t w = write(fd, data, len);
-            (void)w;
-            close(fd);
+            if (fchmod(fd, 0600) == 0 && write_all_fd(fd, data, (size_t)len) == 0 && fsync(fd) == 0)
+                ok = TRUE;
+            if (close(fd) != 0) ok = FALSE;
+            if (ok && rename(tmp_path, path) != 0) ok = FALSE;
+            if (!ok && tmp_path) unlink(tmp_path);
+            if (ok) {
+                char *dir = g_path_get_dirname(path);
+                if (dir) {
+                    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+                    g_free(dir);
+                }
+            }
         }
+        g_free(tmp_path);
         g_free(data);
     }
     g_key_file_free(kf);
@@ -1668,10 +2546,14 @@ static void save_config(void) {
 
 static void load_config(void) {
     char *path = config_path();
+    if (!path) return;
     GKeyFile *kf = g_key_file_new();
-    if (g_key_file_load_from_file(kf, path, 0, NULL)) {
+    struct stat st;
+    if (g_lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid() &&
+        g_key_file_load_from_file(kf, path, 0, NULL)) {
         char *lang = g_key_file_get_string(kf, "main", "lang", NULL);
-        if (lang && lang[0]) snprintf(g_lang, sizeof(g_lang), "%s", lang);
+        if (lang && (strcmp(lang, "ru") == 0 || strcmp(lang, "en") == 0))
+            snprintf(g_lang, sizeof(g_lang), "%s", lang);
         g_free(lang);
     }
     g_key_file_free(kf);
@@ -2180,6 +3062,7 @@ static void show_smart_grid(GtkGrid *grid, int *row, const char *smart_json) {
 
     #undef ADD_SMART_FIELD
 
+    db_json_zero_strings(root);
     cJSON_Delete(root);
     *row = r;
 }
@@ -2410,6 +3293,7 @@ static void on_lock_clicked(GtkButton *btn, gpointer user_data);
 
 static void on_lock_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
+    g_autolock_pending = FALSE;
     if (g_app.autolock_timer_id) {
         g_source_remove(g_app.autolock_timer_id);
         g_app.autolock_timer_id = 0;
@@ -2440,7 +3324,7 @@ static gboolean autolock_cb(gpointer user_data) {
     (void)user_data;
     g_app.autolock_timer_id = 0;
     if (g_batch_running) {
-        reset_autolock();
+        g_autolock_pending = TRUE;
         return G_SOURCE_REMOVE;
     }
     if (g_app.db) on_lock_clicked(NULL, NULL);
@@ -2494,15 +3378,23 @@ static void on_open_clicked(GtkButton *btn, gpointer user_data) {
         snprintf(info, sizeof(info), "%s %s", i18n("file"), g_app.current_file);
         gtk_label_set_text(GTK_LABEL(g_app.unlock_file_label), info);
         free(g_app.expected_fp); g_app.expected_fp = NULL;
-        FILE *fp = fopen(g_app.current_file, "r");
-        if (fp) {
-            char line[256];
-            if (fgets(line, sizeof(line), fp)) {
-                char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
-                char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
-                g_app.expected_fp = xstrdup(line);
-            }
-            fclose(fp);
+        int hfd = open(g_app.current_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+        if (hfd >= 0) {
+            struct stat hst;
+            if (fstat(hfd, &hst) == 0 && S_ISREG(hst.st_mode) && hst.st_size > 0 &&
+                (uint64_t)hst.st_size <= (uint64_t)DB_MAX_FILE_BYTES) {
+                FILE *fp = fdopen(hfd, "r");
+                if (fp) {
+                    char line[256];
+                    if (fgets(line, sizeof(line), fp)) {
+                        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+                        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+                        if (strlen(line) == 32 || strlen(line) == 40 || strlen(line) == 64)
+                            g_app.expected_fp = xstrdup(line);
+                    }
+                    fclose(fp);
+                } else close(hfd);
+            } else close(hfd);
         }
         if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
         g_app.db = calloc(1, sizeof(db_manager_t));
@@ -2546,7 +3438,7 @@ static void on_create_clicked(GtkButton *btn, gpointer user_data) {
         if (ensure_db_gpg(g_app.db) != 0) {
             db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL;
         } else {
-            populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.key_combo), 0, g_app.setup_err);
+            populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.key_combo), 1, g_app.setup_err);
             gtk_stack_set_visible_child_name(g_app.stack, "setup");
         }
     }
@@ -2589,8 +3481,6 @@ static void on_unlock_clicked(GtkButton *btn, gpointer user_data) {
     reset_autolock();
     gtk_stack_set_visible_child_name(g_app.stack, "main");
     refresh_entry_list();
-    if (!g_app.db->is_signed)
-        show_toast(i18n("unsigned_warn"), 8000, -1);
 }
 
 static void on_delete_clicked(GtkButton *btn, gpointer user_data) {
@@ -2896,6 +3786,8 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
         const char *tag_str = gtk_entry_get_text(GTK_ENTRY(vt));
         if (strlen(tag_str) < 2) {
+            if (vdp) gtk_entry_set_text(GTK_ENTRY(vdp), "");
+            gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(nt)), "", 0);
             gtk_widget_destroy(dlg);
             free_disk_list(ctx.disks, ctx.disk_count);
             return;
@@ -2942,12 +3834,14 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
         }
 
         free(label);
-        g_free(notes_val);
+        secure_g_free_string(&notes_val);
+        gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(nt)), "", 0);
         g_free(type_val);
         g_free(size_val);
         g_free(cipher_val);
     }
 
+    if (vdp) gtk_entry_set_text(GTK_ENTRY(vdp), "");
     gtk_widget_destroy(dlg);
     free_disk_list(ctx.disks, ctx.disk_count);
 }
@@ -3013,8 +3907,10 @@ static void on_edit_clicked(GtkButton *btn, gpointer user_data) {
             if (new_row) gtk_list_box_select_row(g_app.listbox, new_row);
             show_entry_details(idx);
         }
-        g_free(new_notes);
+        secure_g_free_string(&new_notes);
     }
+    if (vdp) gtk_entry_set_text(GTK_ENTRY(vdp), "");
+    gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(nt)), "", 0);
     gtk_widget_destroy(dlg);
 }
 
@@ -3173,8 +4069,8 @@ static void on_attach_snapshot_clicked(GtkButton *btn, gpointer user_data) {
         } else {
             show_save_error(err_buf);
         }
-        g_free(files);
-        g_free(smart_json);
+        secure_g_free_string(&files);
+        secure_g_free_string(&smart_json);
         g_free(folder);
         g_app.current_entry_idx = -1;
         refresh_entry_list();
@@ -3252,7 +4148,6 @@ static void on_batch_reindex_clicked(GtkButton *btn, gpointer user_data) {
         gtk_label_set_text(GTK_LABEL(lbl),
             (e->alias && e->alias[0]) ? e->alias : e->label);
         while (gtk_events_pending()) gtk_main_iteration();
-        reset_autolock();
 
         const char *mp = NULL;
         for (int k = 0; k < nd; k++) {
@@ -3272,12 +4167,18 @@ static void on_batch_reindex_clicked(GtkButton *btn, gpointer user_data) {
             total_done++;
         else
             total_err++;
-        g_free(files);
-        g_free(smart);
+        secure_g_free_string(&files);
+        secure_g_free_string(&smart);
     }
 
     free_disk_list(disks, nd);
     g_batch_running = FALSE;
+    if (g_autolock_pending) {
+        g_autolock_pending = FALSE;
+        gtk_widget_destroy(dlg);
+        if (g_app.db) on_lock_clicked(NULL, NULL);
+        return;
+    }
 
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(prog), 1.0);
     char done[128];
@@ -3339,17 +4240,18 @@ static gboolean on_search_file_click(GtkWidget *row, GdkEventButton *ev, gpointe
 
 static void free_str_list(gpointer p) {
     GList *l = p;
-    for (GList *i = l; i; i = i->next) g_free(i->data);
+    for (GList *i = l; i; i = i->next) secure_g_free_cb(i->data);
     g_list_free(l);
 }
 
 static GHashTable *build_cross_disk_index(db_manager_t *db) {
     GHashTable *h = g_hash_table_new_full(g_str_hash, g_str_equal,
-        g_free, free_str_list);
+        secure_g_free_cb, free_str_list);
     for (int i = 0; i < db->entry_count; i++) {
         db_entry_t *e = &db->entries[i];
         if (!e->files || !e->files[0]) continue;
         const char *disp = (e->alias && e->alias[0]) ? e->alias : e->label;
+        size_t copy_len = strlen(e->files) + 1;
         char *copy = strdup(e->files);
         if (!copy) continue;
         char *save = NULL;
@@ -3366,6 +4268,7 @@ static GHashTable *build_cross_disk_index(db_manager_t *db) {
             lst = g_list_append(lst, g_strdup(disp));
             g_hash_table_replace(h, g_strdup(ln), lst);
         }
+        sodium_memzero(copy, copy_len);
         free(copy);
     }
     return h;
@@ -3426,10 +4329,11 @@ static void on_find_changed(GtkSearchEntry *se, gpointer user_data) {
         db_entry_t *e = &db->entries[i];
         if (!e->files || !e->files[0]) continue;
 
+        size_t copy_len = strlen(e->files) + 1;
         char *copy = strdup(e->files);
         if (!copy) continue;
 
-        GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+        GPtrArray *paths = g_ptr_array_new_with_free_func(secure_g_free_cb);
         GArray *sizes = g_array_new(FALSE, FALSE, sizeof(long long));
 
         char *save = NULL;
@@ -3463,6 +4367,7 @@ static void on_find_changed(GtkSearchEntry *se, gpointer user_data) {
             g_ptr_array_add(paths, g_strdup(line));
             g_array_append_val(sizes, sz);
         }
+        sodium_memzero(copy, copy_len);
         free(copy);
 
         if (paths->len == 0) {
@@ -4572,6 +5477,11 @@ static void setup_accelerators(GtkWidget *win) {
 }
 
 int main(int argc, char **argv) {
+    struct rlimit no_core = { 0, 0 };
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+#ifdef __linux__
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
     umask(0077);
     setlocale(LC_ALL, "");
     if (!g_get_charset(NULL)) {
