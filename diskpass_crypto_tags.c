@@ -362,15 +362,13 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
     gpgme_decrypt_result_t dres = gpgme_op_decrypt_result(m->gpg_ctx);
     for (gpgme_recipient_t rec = dres ? dres->recipients : NULL; rec; rec = rec->next) {
         if (!rec->keyid || rec->status != GPG_ERR_NO_ERROR) continue;
-        size_t kid_len = strlen(rec->keyid);
-        if (kid_len < 8 || kid_len > 16) continue;
         for (gpgme_subkey_t sub = recipient_pub->subkeys; sub; sub = sub->next) {
-            if (!sub->fpr) continue;
-            size_t fpr_len = strlen(sub->fpr);
-            if (fpr_len >= kid_len &&
-                g_ascii_strcasecmp(sub->fpr + fpr_len - kid_len, rec->keyid) == 0) {
+            if (!sub->keyid) continue;
+            if (g_ascii_strcasecmp(sub->keyid, rec->keyid) == 0) {
                 recipient_matches = TRUE;
-                recipient_pqc = rec->pubkey_algo == GPGME_PK_KYBER;
+                recipient_pqc =
+                    rec->pubkey_algo == GPGME_PK_KYBER ||
+                    sub->pubkey_algo == GPGME_PK_KYBER;
                 break;
             }
         }
@@ -890,4 +888,3 @@ static void gpg_free_key_list(gpg_key_info_t *list, int count) {
     for (int i = 0; i < count; i++) { free(list[i].fingerprint); free(list[i].uid); }
     free(list);
 }
-
