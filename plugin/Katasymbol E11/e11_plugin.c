@@ -92,6 +92,7 @@ typedef struct {
     GtkWidget *length_mm;
     GtkWidget *density;
     GtkWidget *speed;
+    GtkWidget *summary_label;
 } E11Dialog;
 
 typedef struct {
@@ -1002,7 +1003,7 @@ static gboolean bluez_discover_device(E11Bluez *bz, const char *mac, char **out_
     } else if (remote_error_is(start_err, "org.bluez.Error.InProgress")) {
         g_clear_error(&start_err);
     } else {
-        g_clear_error(&start_err); 
+        g_clear_error(&start_err);
     }
 
     const gint64 deadline = g_get_monotonic_time() + (gint64)E11_DISCOVERY_MS * 1000;
@@ -1298,7 +1299,7 @@ static gboolean send_frame(E11Bluez *bz, const guint8 *frame, gsize len,
     }
     if (need_response) {
         GBytes *r = bluez_wait_packet(bz, -1, 1000);
-        if (r) g_bytes_unref(r); 
+        if (r) g_bytes_unref(r);
     }
     return !cancelled(bz->cancel, error);
 }
@@ -1458,7 +1459,7 @@ static gpointer e11_worker(gpointer user_data)
         p->address = detected;
         if (!bluez_connect(&bz, p->address, p->cancel, &error)) goto done;
         connected = TRUE;
-        
+
         save_settings(p->address, p->font_size, p->width_mm, p->length_mm,
                       p->density, p->speed, p->auto_detect);
     }
@@ -1536,17 +1537,112 @@ static gboolean start_print_job(const char *address, const char *text,
     return TRUE;
 }
 
-static GtkWidget *make_labeled_spin(GtkGrid *grid, int row, const char *label,
-                                    double min, double max, double step, double value)
+static GtkWidget *e11_section_title(const char *text)
 {
+    GtkWidget *label = gtk_label_new(NULL);
+    char *markup = g_markup_printf_escaped("<b>%s</b>", text ? text : "");
+    gtk_label_set_markup(GTK_LABEL(label), markup);
+    g_free(markup);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_widget_set_margin_bottom(label, 6);
+    return label;
+}
+
+static GtkWidget *e11_make_section(void)
+{
+    GtkWidget *frame = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(frame), GTK_SHADOW_NONE);
+    GtkStyleContext *ctx = gtk_widget_get_style_context(frame);
+    gtk_style_context_add_class(ctx, "e11-section");
+    return frame;
+}
+
+static GtkWidget *e11_param_field(GtkGrid *grid, int column, int row, const char *label,
+                                  double min, double max, double step, double value,
+                                  const char *unit)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_widget_set_hexpand(box, TRUE);
+
     GtkWidget *l = gtk_label_new(label);
     gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
-    gtk_grid_attach(grid, l, 0, row, 1, 1);
-    GtkWidget *s = gtk_spin_button_new_with_range(min, max, step);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s), value);
-    gtk_widget_set_hexpand(s, TRUE);
-    gtk_grid_attach(grid, s, 1, row, 1, 1);
-    return s;
+    GtkStyleContext *lctx = gtk_widget_get_style_context(l);
+    gtk_style_context_add_class(lctx, "dim-label");
+    gtk_box_pack_start(GTK_BOX(box), l, FALSE, FALSE, 0);
+
+    GtkWidget *row_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *spin = gtk_spin_button_new_with_range(min, max, step);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), value);
+    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(spin), TRUE);
+    gtk_widget_set_hexpand(spin, TRUE);
+    gtk_box_pack_start(GTK_BOX(row_box), spin, TRUE, TRUE, 0);
+
+    if (unit && unit[0]) {
+        GtkWidget *u = gtk_label_new(unit);
+        GtkStyleContext *uctx = gtk_widget_get_style_context(u);
+        gtk_style_context_add_class(uctx, "dim-label");
+        gtk_box_pack_start(GTK_BOX(row_box), u, FALSE, FALSE, 2);
+    }
+    gtk_box_pack_start(GTK_BOX(box), row_box, FALSE, FALSE, 0);
+    gtk_grid_attach(grid, box, column, row, 1, 1);
+    return spin;
+}
+
+static void e11_update_summary(E11Dialog *d)
+{
+    if (!d || !d->summary_label || !d->font_size || !d->width_mm || !d->length_mm ||
+        !d->density || !d->speed) return;
+    int font = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(d->font_size));
+    int width = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(d->width_mm));
+    int length = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(d->length_mm));
+    int density = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(d->density));
+    int speed = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(d->speed));
+    char *text = g_strdup_printf(
+        tr("e11_summary", "%d × %d mm · %d pt · density %d · speed %d"),
+        width, length, font, density, speed);
+    gtk_label_set_text(GTK_LABEL(d->summary_label), text ? text : "");
+    g_free(text);
+}
+
+static void e11_param_changed(GtkSpinButton *spin, gpointer user_data)
+{
+    (void)spin;
+    e11_update_summary((E11Dialog *)user_data);
+}
+
+static void e11_install_dialog_css(GtkWidget *dialog)
+{
+    static gboolean installed = FALSE;
+    if (installed || !dialog) return;
+    GtkCssProvider *provider = gtk_css_provider_new();
+    const char *css =
+        ".e11-dialog .e11-section {"
+        "  background-color: alpha(@theme_fg_color, 0.035);"
+        "  border: 1px solid alpha(@theme_fg_color, 0.11);"
+        "  border-radius: 10px;"
+        "}"
+        ".e11-dialog textview {"
+        "  background-color: alpha(@theme_base_color, 0.72);"
+        "}"
+        ".e11-dialog .e11-summary {"
+        "  color: alpha(@theme_fg_color, 0.70);"
+        "  font-size: 0.92em;"
+        "}"
+        ".e11-dialog .e11-primary {"
+        "  min-height: 34px;"
+        "  min-width: 96px;"
+        "}";
+    GError *error = NULL;
+    if (gtk_css_provider_load_from_data(provider, css, -1, &error)) {
+        GdkScreen *screen = gtk_widget_get_screen(dialog);
+        if (screen) {
+            gtk_style_context_add_provider_for_screen(screen, GTK_STYLE_PROVIDER(provider),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+            installed = TRUE;
+        }
+    }
+    g_clear_error(&error);
+    g_object_unref(provider);
 }
 
 static void on_use_selected_label_clicked(GtkButton *button, gpointer user_data)
@@ -1593,58 +1689,135 @@ static void e11_action(gpointer user_data)
         tr("cancel", "Cancel"), GTK_RESPONSE_CANCEL,
         tr("e11_print", "Print"), GTK_RESPONSE_OK,
         NULL);
-    gtk_window_set_default_size(GTK_WINDOW(d.dialog), 580, 500);
+    gtk_window_set_default_size(GTK_WINDOW(d.dialog), 660, 520);
+    gtk_window_set_resizable(GTK_WINDOW(d.dialog), TRUE);
+    GtkStyleContext *dialog_ctx = gtk_widget_get_style_context(d.dialog);
+    gtk_style_context_add_class(dialog_ctx, "e11-dialog");
+    e11_install_dialog_css(d.dialog);
+
+    GtkWidget *print_button = gtk_dialog_get_widget_for_response(GTK_DIALOG(d.dialog), GTK_RESPONSE_OK);
+    if (print_button) {
+        GtkStyleContext *pctx = gtk_widget_get_style_context(print_button);
+        gtk_style_context_add_class(pctx, "suggested-action");
+        gtk_style_context_add_class(pctx, "e11-primary");
+        GtkWidget *print_icon = gtk_image_new_from_icon_name("printer-symbolic", GTK_ICON_SIZE_BUTTON);
+        gtk_button_set_image(GTK_BUTTON(print_button), print_icon);
+        gtk_button_set_always_show_image(GTK_BUTTON(print_button), TRUE);
+        gtk_widget_set_can_default(print_button, TRUE);
+        gtk_widget_grab_default(print_button);
+    }
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(d.dialog));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 14);
-    gtk_box_set_spacing(GTK_BOX(content), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(content), 18);
+    gtk_box_set_spacing(GTK_BOX(content), 12);
 
-    GtkWidget *hint = gtk_label_new(tr("e11_hint", "Native C E11 driver using BlueZ. The MAC can be detected automatically and is saved after successful discovery."));
+    GtkWidget *head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *printer_icon = gtk_image_new_from_icon_name("printer-symbolic", GTK_ICON_SIZE_DIALOG);
+    gtk_widget_set_valign(printer_icon, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(head), printer_icon, FALSE, FALSE, 0);
+    GtkWidget *head_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *heading = gtk_label_new(NULL);
+    char *heading_markup = g_markup_printf_escaped("<span size=\"large\"><b>%s</b></span>",
+        tr("e11_heading", "Label printing"));
+    gtk_label_set_markup(GTK_LABEL(heading), heading_markup);
+    g_free(heading_markup);
+    gtk_label_set_xalign(GTK_LABEL(heading), 0.0f);
+    gtk_box_pack_start(GTK_BOX(head_text), heading, FALSE, FALSE, 0);
+    GtkWidget *hint = gtk_label_new(tr("e11_hint_short", "Katasymbol E11 · Bluetooth via BlueZ"));
     gtk_label_set_xalign(GTK_LABEL(hint), 0.0f);
-    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
-    gtk_box_pack_start(GTK_BOX(content), hint, FALSE, FALSE, 0);
+    GtkStyleContext *hint_ctx = gtk_widget_get_style_context(hint);
+    gtk_style_context_add_class(hint_ctx, "dim-label");
+    gtk_box_pack_start(GTK_BOX(head_text), hint, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(head), head_text, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(content), head, FALSE, FALSE, 0);
 
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-    gtk_box_pack_start(GTK_BOX(content), grid, FALSE, FALSE, 0);
+    GtkWidget *printer_frame = e11_make_section();
+    GtkWidget *printer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(printer_box), 12);
+    gtk_container_add(GTK_CONTAINER(printer_frame), printer_box);
+    gtk_box_pack_start(GTK_BOX(printer_box), e11_section_title(tr("e11_section_printer", "Printer")), FALSE, FALSE, 0);
 
+    GtkWidget *mac_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     GtkWidget *mac_l = gtk_label_new(tr("e11_mac", "MAC address"));
     gtk_label_set_xalign(GTK_LABEL(mac_l), 0.0f);
-    gtk_grid_attach(GTK_GRID(grid), mac_l, 0, 0, 1, 1);
+    gtk_widget_set_size_request(mac_l, 118, -1);
+    gtk_box_pack_start(GTK_BOX(mac_row), mac_l, FALSE, FALSE, 0);
     d.address = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(d.address), "A4:93:40:43:41:2B");
     gtk_widget_set_hexpand(d.address, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), d.address, 1, 0, 1, 1);
+    gtk_box_pack_start(GTK_BOX(mac_row), d.address, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(printer_box), mac_row, FALSE, FALSE, 0);
 
-    d.auto_detect = gtk_check_button_new_with_label(tr("e11_auto_detect", "Automatically find E11 if the MAC is empty or the saved device is unavailable"));
+    d.auto_detect = gtk_check_button_new_with_label(tr("e11_auto_detect_short", "Find the printer automatically if needed"));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d.auto_detect), TRUE);
-    gtk_grid_attach(GTK_GRID(grid), d.auto_detect, 1, 1, 1, 1);
+    gtk_widget_set_margin_start(d.auto_detect, 128);
+    gtk_box_pack_start(GTK_BOX(printer_box), d.auto_detect, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), printer_frame, FALSE, FALSE, 0);
 
-    d.font_size = make_labeled_spin(GTK_GRID(grid), 2, tr("e11_font_size", "Font size"), 6, 160, 1, 40);
-    d.width_mm = make_labeled_spin(GTK_GRID(grid), 3, tr("e11_tape_width", "Tape width, mm"), 6, 24, 1, 12);
-    d.length_mm = make_labeled_spin(GTK_GRID(grid), 4, tr("e11_label_length", "Label length, mm"), 10, 300, 1, 40);
-    d.density = make_labeled_spin(GTK_GRID(grid), 5, tr("e11_density", "Density"), 0, 15, 1, 4);
-    d.speed = make_labeled_spin(GTK_GRID(grid), 6, tr("e11_speed", "Speed"), 1, 100, 1, 20);
+    GtkWidget *params_frame = e11_make_section();
+    GtkWidget *params_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(params_box), 12);
+    gtk_container_add(GTK_CONTAINER(params_frame), params_box);
+    gtk_box_pack_start(GTK_BOX(params_box), e11_section_title(tr("e11_section_label", "Label settings")), FALSE, FALSE, 0);
+
+    GtkWidget *params_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(params_grid), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(params_grid), 14);
+    gtk_grid_set_column_homogeneous(GTK_GRID(params_grid), TRUE);
+    gtk_box_pack_start(GTK_BOX(params_box), params_grid, FALSE, FALSE, 0);
+
+    d.font_size = e11_param_field(GTK_GRID(params_grid), 0, 0, tr("e11_font_size", "Font size"), 6, 160, 1, 40, "pt");
+    d.width_mm = e11_param_field(GTK_GRID(params_grid), 1, 0, tr("e11_tape_width_short", "Tape width"), 6, 24, 1, 12, "mm");
+    d.length_mm = e11_param_field(GTK_GRID(params_grid), 0, 1, tr("e11_label_length_short", "Label length"), 10, 300, 1, 40, "mm");
+    d.density = e11_param_field(GTK_GRID(params_grid), 1, 1, tr("e11_density", "Density"), 0, 15, 1, 4, NULL);
+    d.speed = e11_param_field(GTK_GRID(params_grid), 0, 2, tr("e11_speed", "Speed"), 1, 100, 1, 20, NULL);
+
+    d.summary_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(d.summary_label), 0.0f);
+    GtkStyleContext *summary_ctx = gtk_widget_get_style_context(d.summary_label);
+    gtk_style_context_add_class(summary_ctx, "e11-summary");
+    gtk_box_pack_start(GTK_BOX(params_box), d.summary_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), params_frame, FALSE, FALSE, 0);
+
+    g_signal_connect(d.font_size, "value-changed", G_CALLBACK(e11_param_changed), &d);
+    g_signal_connect(d.width_mm, "value-changed", G_CALLBACK(e11_param_changed), &d);
+    g_signal_connect(d.length_mm, "value-changed", G_CALLBACK(e11_param_changed), &d);
+    g_signal_connect(d.density, "value-changed", G_CALLBACK(e11_param_changed), &d);
+    g_signal_connect(d.speed, "value-changed", G_CALLBACK(e11_param_changed), &d);
+
+    GtkWidget *text_frame = e11_make_section();
+    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(text_box), 12);
+    gtk_container_add(GTK_CONTAINER(text_frame), text_box);
 
     GtkWidget *text_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *text_l = gtk_label_new(tr("e11_text", "Text"));
-    gtk_label_set_xalign(GTK_LABEL(text_l), 0.0f);
-    gtk_box_pack_start(GTK_BOX(text_row), text_l, TRUE, TRUE, 0);
-    GtkWidget *use_label_btn = gtk_button_new_with_label(tr("e11_use_selected", "Use selected disk label"));
+    gtk_box_pack_start(GTK_BOX(text_row), e11_section_title(tr("e11_section_text", "Label text")), TRUE, TRUE, 0);
+    GtkWidget *use_label_btn = gtk_button_new_with_label(tr("e11_use_selected_short", "Insert selected disk label"));
+    GtkWidget *insert_icon = gtk_image_new_from_icon_name("edit-paste-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(use_label_btn), insert_icon);
+    gtk_button_set_always_show_image(GTK_BUTTON(use_label_btn), TRUE);
+    GtkStyleContext *use_ctx = gtk_widget_get_style_context(use_label_btn);
+    gtk_style_context_add_class(use_ctx, "flat");
     gtk_box_pack_end(GTK_BOX(text_row), use_label_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(content), text_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(text_box), text_row, FALSE, FALSE, 0);
 
     GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sw, -1, 88);
     gtk_widget_set_vexpand(sw, TRUE);
     d.text_view = gtk_text_view_new();
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(d.text_view), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(d.text_view), 8);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(d.text_view), 8);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(d.text_view), 7);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(d.text_view), 7);
     gtk_container_add(GTK_CONTAINER(sw), d.text_view);
-    gtk_box_pack_start(GTK_BOX(content), sw, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(text_box), sw, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(content), text_frame, TRUE, TRUE, 0);
     g_signal_connect(use_label_btn, "clicked", G_CALLBACK(on_use_selected_label_clicked), d.text_view);
 
     load_settings(&d);
+    e11_update_summary(&d);
     if (initial_label) {
         GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(d.text_view));
         gtk_text_buffer_set_text(buf, initial_label, -1);
@@ -1768,8 +1941,8 @@ G_MODULE_EXPORT void diskpass_plugin_shutdown(void)
     if (cancel) g_cancellable_cancel(cancel);
     if (thread) g_thread_join(thread);
     if (cancel) {
-        g_object_unref(cancel); 
-        g_object_unref(cancel); 
+        g_object_unref(cancel);
+        g_object_unref(cancel);
     }
     if (host_api_v4() && g_host->set_status) g_host->set_status(NULL, 0);
     g_host = NULL;

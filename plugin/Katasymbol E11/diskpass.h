@@ -17,6 +17,7 @@
 #include <locale.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <limits.h>
 #include <math.h>
 #include <sys/resource.h>
@@ -27,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include <glib/gstdio.h>
 #include <glib-unix.h>
@@ -35,6 +37,21 @@
 #include <gpgme.h>
 #include <sodium.h>
 #include <cjson/cJSON.h>
+
+
+#include <sys/mman.h>
+#if defined(__FreeBSD__) || defined(__NetBSD__)
+#include <sys/procctl.h>
+#include <sys/types.h>
+#include <sys/ptrace.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/types.h>
+#include <sys/ptrace.h>
+#endif
+#if defined(__OpenBSD__)
+#include <unistd.h>
+#endif
 #endif
 
 #define DISKPASS_PLUGIN_ABI_VERSION 1u
@@ -44,16 +61,16 @@
 typedef void (*DiskPassPluginActionCallback)(gpointer user_data);
 
 typedef struct {
-    guint abi_version;           
-    const char *id;              
-    const char *name;            
-    const char *version;         
+    guint abi_version;
+    const char *id;
+    const char *name;
+    const char *version;
 } DiskPassPluginInfo;
 
 typedef struct {
     guint abi_version;
     const char *app_version;
-    const char *(*get_language)(void); 
+    const char *(*get_language)(void);
 
     gboolean (*register_action)(
         const char *action_id,
@@ -89,4 +106,4 @@ char *diskpass_ui_dup_selected_disk_label(void);
 void diskpass_ui_set_plugin_status(const char *text, guint timeout_ms);
 #endif
 
-#endif 
+#endif
