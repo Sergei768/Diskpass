@@ -1,25 +1,28 @@
+static void on_about_diskpass(GtkButton *item, gpointer data);
 #include "diskpass.h"
 
 typedef struct {
     GtkWindow *window;
     GtkStack *stack;
     GtkWidget *welcome_title, *welcome_desc, *lbl_lang_welcome;
-    GtkWidget *btn_open, *btn_create, *lang_combo_welcome;
+    GtkWidget *btn_open, *btn_open_stego, *btn_create, *lang_combo_welcome;
     GtkWidget *setup_title, *lbl_setup_file, *lbl_setup_key, *lbl_setup_lang;
     GtkWidget *setup_file_label, *key_combo, *lang_combo, *setup_err;
     GtkWidget *btn_setup_back, *btn_setup_create;
     GtkWidget *unlock_title, *lbl_unlock_file, *lbl_unlock_key;
-    GtkWidget *unlock_file_label, *unlock_key_combo, *unlock_err;
+    GtkWidget *unlock_file_label, *unlock_key_combo, *unlock_status, *unlock_err;
     GtkWidget *btn_unlock_back, *btn_unlock;
     GtkWidget *search;
     GtkListBox *listbox;
     GtkWidget *detail_box, *lbl_main, *grid, *notes_text;
     GtkWidget *btn_copy_label, *btn_copy_pass;
-    GtkWidget *btn_lock, *btn_add, *btn_edit, *btn_del, *btn_sch;
+    GtkWidget *btn_lock, *btn_add, *btn_edit, *btn_del, *btn_sch, *btn_settings, *btn_about;
     GtkWidget *btn_snapshot, *btn_find, *btn_batch;
-    GtkWidget *btn_refresh, *btn_smart, *btn_rekey, *btn_plugins;
+    GtkWidget *btn_refresh, *btn_smart, *btn_rekey, *btn_plugins, *btn_carrier;
     GtkWidget *btn_create_key_setup, *btn_create_key_unlock, *btn_create_key_main;
     GtkWidget *security_badge;
+    GtkWidget *privacy_shield;
+    GtkWidget *privacy_shield_title, *privacy_shield_desc;
     GtkWidget *plugin_status;
     GtkWidget *notes_lbl;
     GtkWidget *notes_sep;
@@ -35,9 +38,35 @@ typedef struct {
     int        toast_entry_idx;
     db_manager_t *db;
     char *current_file;
+    char *config_last_db; /* preserved across v5 -> protected-format migration */
     char *expected_fp;
+
+    char *mounted_carrier_path;
+    char *mounted_temp_db_path;
+    dev_t mounted_carrier_dev;
+    ino_t mounted_carrier_ino;
+    off_t mounted_carrier_size;
+    struct timespec mounted_carrier_mtim;
+
+
+    unsigned char mounted_carrier_hash[32];
+    gboolean mounted_carrier_identity_valid;
     guint clipboard_timer_id;
     guint autolock_timer_id;
+    guint privacy_shield_timer_id;
+    guint focus_lock_timer_id;
+    guint autolock_seconds;
+    guint clipboard_clear_seconds;
+    gboolean screenshot_guard;
+    gboolean lock_on_focus_loss;
+    gboolean camouflage_enabled;
+    char camouflage_hash[crypto_pwhash_STRBYTES];
+    /* A password-derived key only available after the numeric code is entered.
+     * Never persist this key (or the code) to a file. */
+    unsigned char camouflage_salt[crypto_pwhash_SALTBYTES];
+    unsigned char camouflage_config_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    gboolean camouflage_key_valid;
+    gboolean camouflage_legacy_config;
     guint connection_timer_id;
     GDBusConnection *session_bus;
     GDBusConnection *system_bus;
@@ -58,23 +87,43 @@ static GHashTable *g_known_uuids = NULL;
 static gboolean g_uuids_initialized = FALSE;
 static gboolean g_batch_running = FALSE;
 static gboolean g_autolock_pending = FALSE;
+static gboolean g_carrier_running = FALSE;
+static gboolean g_unlock_running = FALSE;
 
-static char *config_path(void) {
+
+static gboolean app_has_open_database(void) {
+    return g_app.db && g_app.db->file_path && g_app.db->file_path[0] &&
+        g_app.db->noise_key && g_app.db->noise_key_len == 32;
+}
+
+static void carrier_unmount_cleanup(void);
+static gboolean carrier_capture_identity(const char *path);
+static gboolean carrier_identity_unchanged(char *err_msg, size_t err_msg_sz);
+static void on_open_stego_clicked(GtkButton *btn, gpointer user_data);
+static int carrier_mounted_commit_hook(const char *db_path, char *err_msg, size_t err_msg_sz);
+static void privacy_shield_set(gboolean visible);
+
+static char *diskpass_private_dir(void) {
     const char *home = g_get_home_dir();
     if (!home || !home[0]) return NULL;
-
-    char *dir = g_build_filename(home, ".diskpass", NULL);
+    /* Override is for an explicit user-selected neutral directory. It must be
+     * absolute; do not silently use an environment-relative path. */
+    const char *override = g_getenv("DISKPASS_PRIVATE_DIR");
+    char *dir = (override && override[0] == '/') ? g_strdup(override) :
+        g_build_filename(home, ".diskpass", NULL);
     if (!dir) return NULL;
-    if (g_mkdir_with_parents(dir, 0700) != 0) {
-        g_free(dir);
-        return NULL;
-    }
+    if (g_mkdir_with_parents(dir, 0700) != 0) { g_free(dir); return NULL; }
     struct stat st;
-    if (g_lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
-        chmod(dir, 0700) != 0) {
-        g_free(dir);
-        return NULL;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 077) != 0 || chmod(dir, 0700) != 0) {
+        g_free(dir); return NULL;
     }
+    return dir;
+}
+
+static char *config_path(void) {
+    char *dir = diskpass_private_dir();
+    if (!dir) return NULL;
 
     char *path = g_build_filename(dir, "config", NULL);
     if (!path) {
@@ -82,9 +131,11 @@ static char *config_path(void) {
         return NULL;
     }
 
-    if (g_lstat(path, &st) != 0 && errno == ENOENT) {
+    struct stat st;
+    if (g_lstat(path, &st) != 0 && errno == ENOENT &&
+        !(g_getenv("DISKPASS_PRIVATE_DIR") && g_getenv("DISKPASS_PRIVATE_DIR")[0] == '/')) {
         char *old_path = g_build_filename(g_get_user_config_dir(), "diskpass", "config", NULL);
-        int in_fd = old_path ? open(old_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        int in_fd = old_path ? open(old_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK) : -1;
         if (in_fd >= 0) {
             struct stat old_st;
             gboolean ok = fstat(in_fd, &old_st) == 0 && S_ISREG(old_st.st_mode) &&
@@ -119,54 +170,204 @@ static char *config_path(void) {
     return path;
 }
 
-static void save_config(void) {
-    char *path = config_path();
-    if (!path) return;
-    GKeyFile *kf = g_key_file_new();
-    g_key_file_set_string(kf, "main", "lang", g_lang);
-    if (g_app.current_file)
-        g_key_file_set_string(kf, "main", "last_db", g_app.current_file);
-    gsize len = 0;
-    char *data = g_key_file_to_data(kf, &len, NULL);
-    if (data) {
-        char *tmp_path = g_strdup_printf("%s.tmp.XXXXXX", path);
-        int fd = tmp_path ? g_mkstemp_full(tmp_path, O_WRONLY | O_CLOEXEC, 0600) : -1;
-        gboolean ok = FALSE;
-        if (fd >= 0) {
-            if (fchmod(fd, 0600) == 0 && write_all_fd(fd, data, (size_t)len) == 0 && fsync(fd) == 0)
-                ok = TRUE;
-            if (close(fd) != 0) ok = FALSE;
-            if (ok && rename(tmp_path, path) != 0) ok = FALSE;
-            if (!ok && tmp_path) unlink(tmp_path);
-            if (ok) {
-                char *dir = g_path_get_dirname(path);
-                if (dir) {
-                    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-                    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
-                    g_free(dir);
-                }
-            }
-        }
-        g_free(tmp_path);
-        g_free(data);
-    }
-    g_key_file_free(kf);
-    g_free(path);
+/* Only the mode flag, Argon2id verifier and random KDF salt remain in the
+ * clear. User preferences (including last database path) are encrypted and
+ * authenticated using a separate key derived from the calculator code.
+ * This protects content, not the file name or the existence of DiskPass. */
+#define CAMOUFLAGE_CONFIG_AD "DiskPass protected configuration v1"
+#define CAMOUFLAGE_CONFIG_LIMIT (1024U * 1024U)
+
+static void apply_user_settings(GKeyFile *kf) {
+    char *lang = g_key_file_get_string(kf, "main", "lang", NULL);
+    if (lang && i18n_language_exists(lang)) i18n_set_language(lang);
+    g_free(lang);
+    GError *err = NULL;
+    gint n = g_key_file_get_integer(kf, "security", "autolock_seconds", &err);
+    if (!err && n >= 0 && n <= 86400) g_app.autolock_seconds = (guint)n;
+    g_clear_error(&err);
+    n = g_key_file_get_integer(kf, "security", "clipboard_clear_seconds", &err);
+    if (!err && n >= 5 && n <= 600) g_app.clipboard_clear_seconds = (guint)n;
+    g_clear_error(&err);
+    gboolean b = g_key_file_get_boolean(kf, "security", "screenshot_guard", &err);
+    if (!err) g_app.screenshot_guard = b;
+    g_clear_error(&err);
+    b = g_key_file_get_boolean(kf, "security", "lock_on_focus_loss", &err);
+    if (!err) g_app.lock_on_focus_loss = b;
+    g_clear_error(&err);
+    /* Preserve this setting during the v5 -> encrypted-format migration,
+     * even though the program does not automatically reopen the database. */
+    char *last_db = g_key_file_get_string(kf, "main", "last_db", NULL);
+    g_free(g_app.config_last_db);
+    g_app.config_last_db = last_db;
 }
 
-static void load_config(void) {
+static gboolean camouflage_read_salt(GKeyFile *kf) {
+    char *hex = g_key_file_get_string(kf, "camouflage", "config_salt", NULL);
+    if (!hex) return FALSE;
+    size_t written = 0;
+    gboolean ok = strlen(hex) == crypto_pwhash_SALTBYTES * 2 &&
+        sodium_hex2bin(g_app.camouflage_salt, sizeof(g_app.camouflage_salt),
+                       hex, strlen(hex), NULL, &written, NULL) == 0 &&
+        written == sizeof(g_app.camouflage_salt);
+    g_free(hex);
+    return ok;
+}
+
+static gboolean camouflage_decrypt_settings(GKeyFile *outer) {
+    if (!g_app.camouflage_key_valid) return FALSE;
+    char *nonce_hex = g_key_file_get_string(outer, "camouflage", "nonce", NULL);
+    char *payload_b64 = g_key_file_get_string(outer, "camouflage", "payload", NULL);
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    size_t nonce_len = 0;
+    gboolean ok = nonce_hex && payload_b64 &&
+        strlen(nonce_hex) == sizeof(nonce) * 2 &&
+        strlen(payload_b64) <= 2 * CAMOUFLAGE_CONFIG_LIMIT &&
+        sodium_hex2bin(nonce, sizeof(nonce), nonce_hex, strlen(nonce_hex),
+                       NULL, &nonce_len, NULL) == 0 && nonce_len == sizeof(nonce);
+    g_free(nonce_hex);
+    if (!ok) { g_free(payload_b64); return FALSE; }
+
+    gsize cipher_len = 0;
+    guchar *cipher = g_base64_decode(payload_b64, &cipher_len);
+    g_free(payload_b64);
+    if (!cipher || cipher_len <= crypto_aead_xchacha20poly1305_ietf_ABYTES ||
+        cipher_len > CAMOUFLAGE_CONFIG_LIMIT) {
+        g_free(cipher);
+        return FALSE;
+    }
+    unsigned char *plain = g_malloc(cipher_len + 1);
+    unsigned long long plain_len = 0;
+    const unsigned char ad[] = CAMOUFLAGE_CONFIG_AD;
+    ok = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        plain, &plain_len, NULL, cipher, (unsigned long long)cipher_len,
+        ad, sizeof(ad) - 1, nonce, g_app.camouflage_config_key) == 0 &&
+        plain_len <= CAMOUFLAGE_CONFIG_LIMIT;
+    sodium_memzero(cipher, cipher_len);
+    g_free(cipher);
+    if (ok) {
+        plain[plain_len] = 0;
+        GKeyFile *inner = g_key_file_new();
+        ok = g_utf8_validate((char *)plain, (gssize)plain_len, NULL) &&
+            g_key_file_load_from_data(inner, (char *)plain, (gsize)plain_len,
+                                      G_KEY_FILE_NONE, NULL);
+        if (ok) apply_user_settings(inner);
+        g_key_file_unref(inner);
+    }
+    sodium_memzero(plain, cipher_len + 1);
+    g_free(plain);
+    return ok;
+}
+
+static gboolean save_config(void) {
     char *path = config_path();
-    if (!path) return;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) { g_free(path); return; }
+    if (!path) return FALSE;
+    GKeyFile *prefs = g_key_file_new();
+    g_key_file_set_string(prefs, "main", "lang", g_lang);
+    g_key_file_set_integer(prefs, "security", "autolock_seconds", (gint)g_app.autolock_seconds);
+    g_key_file_set_integer(prefs, "security", "clipboard_clear_seconds", (gint)g_app.clipboard_clear_seconds);
+    g_key_file_set_boolean(prefs, "security", "screenshot_guard", g_app.screenshot_guard);
+    g_key_file_set_boolean(prefs, "security", "lock_on_focus_loss", g_app.lock_on_focus_loss);
+    if (!g_app.mounted_carrier_path) {
+        const char *last_db = g_app.current_file ? g_app.current_file : g_app.config_last_db;
+        if (last_db) g_key_file_set_string(prefs, "main", "last_db", last_db);
+    }
+
+    GKeyFile *kf = NULL;
+    gboolean ok = TRUE;
+    if (g_app.camouflage_enabled) {
+        if (!g_app.camouflage_key_valid || !g_app.camouflage_hash[0]) {
+            ok = FALSE; /* Never downgrade encrypted settings to plaintext. */
+        } else {
+            gsize inner_len = 0;
+            char *inner = g_key_file_to_data(prefs, &inner_len, NULL);
+            if (!inner || inner_len > CAMOUFLAGE_CONFIG_LIMIT - 1024) ok = FALSE;
+            if (ok) {
+                unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+                randombytes_buf(nonce, sizeof(nonce));
+                size_t capacity = inner_len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
+                unsigned char *cipher = g_malloc(capacity);
+                unsigned long long cipher_len = 0;
+                const unsigned char ad[] = CAMOUFLAGE_CONFIG_AD;
+                if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+                        cipher, &cipher_len, (unsigned char *)inner,
+                        (unsigned long long)inner_len,
+                        ad, sizeof(ad) - 1, NULL, nonce,
+                        g_app.camouflage_config_key) != 0 || cipher_len > capacity) {
+                    ok = FALSE;
+                } else {
+                    char salt_hex[crypto_pwhash_SALTBYTES * 2 + 1];
+                    char nonce_hex[sizeof(nonce) * 2 + 1];
+                    sodium_bin2hex(salt_hex, sizeof(salt_hex), g_app.camouflage_salt,
+                                   sizeof(g_app.camouflage_salt));
+                    sodium_bin2hex(nonce_hex, sizeof(nonce_hex), nonce, sizeof(nonce));
+                    char *encoded = g_base64_encode(cipher, (gsize)cipher_len);
+                    kf = g_key_file_new();
+                    g_key_file_set_boolean(kf, "camouflage", "enabled", TRUE);
+                    g_key_file_set_string(kf, "camouflage", "password_hash",
+                                          g_app.camouflage_hash);
+                    g_key_file_set_string(kf, "camouflage", "config_salt", salt_hex);
+                    g_key_file_set_string(kf, "camouflage", "nonce", nonce_hex);
+                    g_key_file_set_string(kf, "camouflage", "payload", encoded);
+                    g_free(encoded);
+                }
+                sodium_memzero(cipher, capacity);
+                g_free(cipher);
+                sodium_memzero(nonce, sizeof(nonce));
+            }
+            if (inner) { sodium_memzero(inner, inner_len); g_free(inner); }
+        }
+    } else {
+        kf = prefs;
+        g_key_file_set_boolean(kf, "camouflage", "enabled", FALSE);
+    }
+
+    if (ok && kf) {
+        gsize len = 0;
+        char *data = g_key_file_to_data(kf, &len, NULL);
+        if (!data) ok = FALSE;
+        if (data) {
+            char *tmp_path = g_strdup_printf("%s.tmp.XXXXXX", path);
+            int fd = tmp_path ? g_mkstemp_full(tmp_path, O_WRONLY | O_CLOEXEC, 0600) : -1;
+            ok = FALSE;
+            if (fd >= 0) {
+                if (fchmod(fd, 0600) == 0 && write_all_fd(fd, data, (size_t)len) == 0 && fsync(fd) == 0)
+                    ok = TRUE;
+                if (close(fd) != 0) ok = FALSE;
+                if (ok && rename(tmp_path, path) != 0) ok = FALSE;
+                if (!ok && tmp_path) unlink(tmp_path);
+                if (ok) {
+                    char *dir = g_path_get_dirname(path);
+                    if (dir) {
+                        int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                        if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+                        g_free(dir);
+                    }
+                }
+            }
+            g_free(tmp_path);
+            sodium_memzero(data, len);
+            g_free(data);
+        }
+    } else ok = FALSE;
+    if (kf && kf != prefs) g_key_file_unref(kf);
+    g_key_file_unref(prefs);
+    g_free(path);
+    return ok;
+}
+
+static gboolean load_config(void) {
+    char *path = config_path();
+    if (!path) return FALSE;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { g_free(path); return errno == ENOENT; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
-        (st.st_mode & (S_IWGRP | S_IWOTH)) || st.st_size < 0 || st.st_size > 1024 * 1024) {
-        close(fd); g_free(path); return;
+        (st.st_mode & (S_IWGRP | S_IWOTH)) || st.st_size < 0 || st.st_size > CAMOUFLAGE_CONFIG_LIMIT) {
+        close(fd); g_free(path); return FALSE;
     }
     gsize len = (gsize)st.st_size;
     char *data = g_malloc(len + 1);
-    if (!data) { close(fd); g_free(path); return; }
+    if (!data) { close(fd); g_free(path); return FALSE; }
     gsize off = 0;
     gboolean ok = TRUE;
     while (off < len) {
@@ -178,48 +379,91 @@ static void load_config(void) {
     close(fd);
     data[len] = '\0';
     GKeyFile *kf = g_key_file_new();
-    if (ok && g_utf8_validate(data, (gssize)len, NULL) &&
-        g_key_file_load_from_data(kf, data, len, G_KEY_FILE_NONE, NULL)) {
-        char *lang = g_key_file_get_string(kf, "main", "lang", NULL);
-        if (lang && i18n_language_exists(lang)) i18n_set_language(lang);
-        g_free(lang);
+    if (ok) ok = g_utf8_validate(data, (gssize)len, NULL) &&
+        g_key_file_load_from_data(kf, data, len, G_KEY_FILE_NONE, NULL);
+    if (ok) {
+        GError *err = NULL;
+        gboolean enabled = g_key_file_get_boolean(kf, "camouflage", "enabled", &err);
+        if (err) { enabled = FALSE; g_clear_error(&err); }
+        g_app.camouflage_enabled = enabled;
+        if (enabled) {
+            char *hash = g_key_file_get_string(kf, "camouflage", "password_hash", NULL);
+            ok = hash && strlen(hash) < sizeof(g_app.camouflage_hash) &&
+                g_str_has_prefix(hash, crypto_pwhash_STRPREFIX);
+            if (ok) g_strlcpy(g_app.camouflage_hash, hash, sizeof(g_app.camouflage_hash));
+            if (hash) { sodium_memzero(hash, strlen(hash)); g_free(hash); }
+            if (ok) {
+                if (g_key_file_has_key(kf, "camouflage", "payload", NULL)) {
+                    /* In protected format, settings are not parsed until the
+                     * user has authenticated and the code-derived key exists. */
+                    ok = camouflage_read_salt(kf);
+                    if (ok && g_app.camouflage_key_valid)
+                        ok = camouflage_decrypt_settings(kf);
+                    g_app.camouflage_legacy_config = FALSE;
+                } else if (!g_key_file_has_key(kf, "camouflage", "config_salt", NULL)) {
+                    /* One-time upgrade from v5's plain preferences. Keep its
+                     * settings in memory until successful PIN unlock, then
+                     * atomically replace this file with encrypted content. */
+                    if (!g_app.camouflage_legacy_config)
+                        randombytes_buf(g_app.camouflage_salt, sizeof(g_app.camouflage_salt));
+                    apply_user_settings(kf);
+                    g_app.camouflage_legacy_config = TRUE;
+                } else {
+                    ok = FALSE; /* Broken/incomplete protected configuration. */
+                }
+            }
+        } else {
+            g_app.camouflage_legacy_config = FALSE;
+            apply_user_settings(kf);
+        }
     }
-    sodium_memzero(data, len);
+    sodium_memzero(data, len + 1);
     g_free(data);
     g_key_file_unref(kf);
     g_free(path);
+    return ok;
 }
 
 static char *find_icon_path(void) {
-    char *home_icon = g_build_filename(g_get_home_dir(), ".diskpass", "disk-icon.png", NULL);
-    if (home_icon && g_file_test(home_icon, G_FILE_TEST_IS_REGULAR)) return home_icon;
-    g_free(home_icon);
-    char *p1 = g_build_filename(g_get_user_data_dir(), "diskpass", "disk-icon.png", NULL);
-    if (g_file_test(p1, G_FILE_TEST_EXISTS)) return p1;
-    g_free(p1);
-    char *p2 = g_build_filename("/usr/local/share/diskpass", "disk-icon.png", NULL);
-    if (g_file_test(p2, G_FILE_TEST_EXISTS)) return p2;
-    g_free(p2);
-    char *p3 = g_build_filename("/usr/share/diskpass", "disk-icon.png", NULL);
-    if (g_file_test(p3, G_FILE_TEST_EXISTS)) return p3;
-    g_free(p3);
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len > 0) {
-        exe_path[len] = '\0';
-        char *dir = g_path_get_dirname(exe_path);
-        char *p4 = g_build_filename(dir, "disk-icon.png", NULL);
+    char svg_exe[PATH_MAX];
+    ssize_t svg_len = readlink("/proc/self/exe", svg_exe, sizeof(svg_exe) - 1);
+    if (svg_len > 0) {
+        svg_exe[svg_len] = '\0';
+        char *dir = g_path_get_dirname(svg_exe);
+        char *path = g_build_filename(dir, "diskpass-icon.svg", NULL);
         g_free(dir);
-        if (g_file_test(p4, G_FILE_TEST_EXISTS)) return p4;
-        g_free(p4);
+        if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) return path;
+        g_free(path);
     }
-    if (g_file_test("disk-icon.png", G_FILE_TEST_EXISTS)) return g_strdup("disk-icon.png");
+    char *svg_dirs[] = {
+        diskpass_private_dir(),
+        g_build_filename(g_get_user_data_dir(), "diskpass", NULL),
+        g_strdup("/usr/local/share/diskpass"), g_strdup("/usr/share/diskpass"), g_strdup(".")
+    };
+    char *svg_found = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(svg_dirs); i++) {
+        if (!svg_found) {
+            char *path = g_build_filename(svg_dirs[i], "diskpass-icon.svg", NULL);
+            if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) svg_found = path;
+            else g_free(path);
+        }
+        g_free(svg_dirs[i]);
+    }
+    if (svg_found) return svg_found;
+
     return NULL;
 }
 
 static GdkPixbuf *load_icon(int size) {
-    if (icon_pb) return gdk_pixbuf_scale_simple(icon_pb, size, size, GDK_INTERP_BILINEAR);
-    return NULL;
+    if (size <= 0 || size > 4096) return NULL;
+    char *path = find_icon_path();
+    GdkPixbuf *pb = NULL;
+    if (path) {
+        if (!pb) pb = gdk_pixbuf_new_from_file_at_scale(path, size, size, TRUE, NULL);
+        g_free(path);
+    }
+    if (!pb && icon_pb) pb = gdk_pixbuf_scale_simple(icon_pb, size, size, GDK_INTERP_HYPER);
+    return pb;
 }
 
 static GtkWidget *make_icon_img(int size) {
@@ -243,12 +487,13 @@ static gboolean clipboard_clear_timer(gpointer user_data) {
 }
 
 static void clipboard_copy_secure(const char *text) {
+    if (!text) return;
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(cb, text, -1);
     GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
     gtk_clipboard_set_text(primary, "", 0);
     if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
-    g_app.clipboard_timer_id = g_timeout_add_seconds(30, clipboard_clear_timer, NULL);
+    g_app.clipboard_timer_id = g_timeout_add_seconds(g_app.clipboard_clear_seconds ? g_app.clipboard_clear_seconds : 30, clipboard_clear_timer, NULL);
 }
 
 static void on_gen_password(GtkButton *b, gpointer d) {
@@ -260,6 +505,19 @@ static void on_gen_password(GtkButton *b, gpointer d) {
 
 static void on_back_to_welcome(GtkButton *b, gpointer d) {
     (void)b; (void)d;
+    if (g_unlock_running) return;
+
+
+    g_db_external_commit_hook = NULL;
+    if (g_app.autolock_timer_id) {
+        g_source_remove(g_app.autolock_timer_id);
+        g_app.autolock_timer_id = 0;
+    }
+    g_autolock_pending = FALSE;
+    if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
+    free(g_app.current_file); g_app.current_file = NULL;
+    free(g_app.expected_fp); g_app.expected_fp = NULL;
+    carrier_unmount_cleanup();
     gtk_stack_set_visible_child_name(g_app.stack, "welcome");
 }
 
@@ -289,6 +547,12 @@ static gboolean on_window_state_changed(GtkWidget *w, GdkEventWindowState *ev,
         gtk_button_set_label(btn, "❐");
     else
         gtk_button_set_label(btn, "□");
+    if (app_has_open_database() && g_app.screenshot_guard) {
+        if (ev->new_window_state & GDK_WINDOW_STATE_ICONIFIED)
+            privacy_shield_set(TRUE);
+        else if (gtk_window_is_active(g_app.window))
+            privacy_shield_set(FALSE);
+    }
     return FALSE;
 }
 
@@ -317,6 +581,7 @@ static void update_ui_text(void) {
     if (g_app.welcome_title) gtk_label_set_text(GTK_LABEL(g_app.welcome_title), "DiskPass");
     if (g_app.welcome_desc) gtk_label_set_text(GTK_LABEL(g_app.welcome_desc), i18n("app_desc"));
     if (g_app.btn_open) gtk_button_set_label(GTK_BUTTON(g_app.btn_open), i18n("open_db"));
+    if (g_app.btn_open_stego) gtk_button_set_label(GTK_BUTTON(g_app.btn_open_stego), i18n("carrier_open_hidden_short"));
     if (g_app.btn_create) gtk_button_set_label(GTK_BUTTON(g_app.btn_create), i18n("create_db"));
     if (g_app.lbl_lang_welcome) gtk_label_set_text(GTK_LABEL(g_app.lbl_lang_welcome), i18n("language"));
     if (g_app.setup_title) gtk_label_set_text(GTK_LABEL(g_app.setup_title), i18n("setup_title"));
@@ -330,11 +595,16 @@ static void update_ui_text(void) {
     if (g_app.lbl_unlock_key) gtk_label_set_text(GTK_LABEL(g_app.lbl_unlock_key), i18n("pgp_key"));
     if (g_app.btn_unlock_back) gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock_back), i18n("back"));
     if (g_app.btn_unlock) gtk_button_set_label(GTK_BUTTON(g_app.btn_unlock), i18n("unlock_btn"));
+    if (g_app.unlock_status && g_unlock_running) gtk_label_set_text(GTK_LABEL(g_app.unlock_status), i18n("opening_db"));
     if (g_app.btn_lock) gtk_widget_set_tooltip_text(g_app.btn_lock, i18n("lock_db"));
     if (g_app.btn_add) gtk_widget_set_tooltip_text(g_app.btn_add, i18n("add_entry"));
     if (g_app.btn_edit) gtk_widget_set_tooltip_text(g_app.btn_edit, i18n("edit_entry"));
     if (g_app.btn_del) gtk_widget_set_tooltip_text(g_app.btn_del, i18n("del_entry"));
     if (g_app.btn_sch) gtk_widget_set_tooltip_text(g_app.btn_sch, i18n("show_schema"));
+    if (g_app.btn_about) gtk_widget_set_tooltip_text(g_app.btn_about, i18n("about_diskpass"));
+    if (g_app.btn_settings) gtk_widget_set_tooltip_text(g_app.btn_settings, i18n("security_settings"));
+    if (g_app.privacy_shield_title) gtk_label_set_text(GTK_LABEL(g_app.privacy_shield_title), i18n("privacy_screen_title"));
+    if (g_app.privacy_shield_desc) gtk_label_set_text(GTK_LABEL(g_app.privacy_shield_desc), i18n("privacy_screen_desc"));
     if (g_app.btn_snapshot) gtk_widget_set_tooltip_text(g_app.btn_snapshot, i18n("snapshot_btn"));
     if (g_app.btn_find) gtk_widget_set_tooltip_text(g_app.btn_find, i18n("find_btn"));
     if (g_app.btn_batch) gtk_widget_set_tooltip_text(g_app.btn_batch, i18n("batch_reindex"));
@@ -345,6 +615,7 @@ static void update_ui_text(void) {
     if (g_app.btn_create_key_unlock) gtk_widget_set_tooltip_text(g_app.btn_create_key_unlock, i18n("create_key"));
     if (g_app.btn_create_key_main) gtk_widget_set_tooltip_text(g_app.btn_create_key_main, i18n("create_key"));
     if (g_app.btn_plugins) gtk_widget_set_tooltip_text(g_app.btn_plugins, i18n("plugins"));
+    if (g_app.btn_carrier) gtk_widget_set_tooltip_text(g_app.btn_carrier, i18n("carrier_tools"));
     update_security_badge();
     if (g_app.search) gtk_entry_set_placeholder_text(GTK_ENTRY(g_app.search), i18n("search"));
     if (g_app.tree_filter) gtk_entry_set_placeholder_text(GTK_ENTRY(g_app.tree_filter), i18n("search"));
@@ -422,7 +693,7 @@ static void refresh_entry_list(void) {
 
         if (e->files && e->files[0]) {
             char fc[32];
-            snprintf(fc, sizeof(fc), "%d", count_lines(e->files));
+            snprintf(fc, sizeof(fc), "%d", e->file_count);
             GtkWidget *fl = gtk_label_new(fc);
             gtk_style_context_add_class(gtk_widget_get_style_context(fl), "row-count");
             gtk_box_pack_end(GTK_BOX(sub), fl, FALSE, FALSE, 0);
@@ -464,6 +735,7 @@ static void set_notes_visible(gboolean visible) {
     }
 }
 
+static void tree_fill_cancel(void);
 static void clear_details(void) {
     gtk_label_set_text(GTK_LABEL(g_app.lbl_main), i18n("select_entry"));
     GList *children = gtk_container_get_children(GTK_CONTAINER(g_app.grid));
@@ -473,6 +745,7 @@ static void clear_details(void) {
     gtk_widget_set_sensitive(g_app.btn_copy_label, FALSE);
     gtk_widget_set_sensitive(g_app.btn_copy_pass, FALSE);
 
+    tree_fill_cancel();
     if (g_app.tree_store) gtk_tree_store_clear(g_app.tree_store);
     set_tree_visible(FALSE);
     set_notes_visible(FALSE);
@@ -502,26 +775,35 @@ static char *g_tree_filter_needle = NULL;
 
 static gboolean tree_filter_func(GtkTreeModel *model, GtkTreeIter *iter, gpointer data) {
     (void)data;
-    if (!g_tree_filter_needle || !g_tree_filter_needle[0]) return TRUE;
+    gboolean visible = TRUE;
+    gtk_tree_model_get(model, iter, 3, &visible, -1);
+    return visible;
+}
 
-    char *name = NULL;
-    gtk_tree_model_get(model, iter, 0, &name, -1);
-    gboolean match = FALSE;
-    if (name) {
-        char *low = g_ascii_strdown(name, -1);
-        match = (strstr(low, g_tree_filter_needle) != NULL);
-        g_free(low);
-        g_free(name);
+static gboolean tree_update_visibility(GtkTreeModel *model, GtkTreeIter *iter) {
+    gboolean self_match = !g_tree_filter_needle || !g_tree_filter_needle[0];
+    if (!self_match) {
+        char *name = NULL;
+        gtk_tree_model_get(model, iter, 0, &name, -1);
+        if (name) {
+            char *low = g_ascii_strdown(name, -1);
+            self_match = strstr(low, g_tree_filter_needle) != NULL;
+            g_free(low);
+            g_free(name);
+        }
     }
-    if (match) return TRUE;
 
+    gboolean child_match = FALSE;
     GtkTreeIter child;
     if (gtk_tree_model_iter_children(model, &child, iter)) {
         do {
-            if (tree_filter_func(model, &child, data)) return TRUE;
+            if (tree_update_visibility(model, &child)) child_match = TRUE;
         } while (gtk_tree_model_iter_next(model, &child));
     }
-    return FALSE;
+
+    gboolean visible = self_match || child_match;
+    gtk_tree_store_set(GTK_TREE_STORE(model), iter, 3, visible, -1);
+    return visible;
 }
 
 static void on_tree_filter_changed(GtkSearchEntry *e, gpointer u) {
@@ -530,6 +812,14 @@ static void on_tree_filter_changed(GtkSearchEntry *e, gpointer u) {
 
     free(g_tree_filter_needle);
     g_tree_filter_needle = (txt && txt[0]) ? g_ascii_strdown(txt, -1) : NULL;
+
+    GtkTreeModel *store_model = GTK_TREE_MODEL(g_app.tree_store);
+    GtkTreeIter root;
+    if (gtk_tree_model_get_iter_first(store_model, &root)) {
+        do {
+            tree_update_visibility(store_model, &root);
+        } while (gtk_tree_model_iter_next(store_model, &root));
+    }
 
     GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(g_app.tree_view));
     if (GTK_IS_TREE_MODEL_FILTER(model))
@@ -617,19 +907,85 @@ static gboolean on_tree_button_press(GtkWidget *tv, GdkEventButton *ev, gpointer
     return TRUE;
 }
 
+
+typedef struct {
+    GList *next;
+    GtkTreeIter parent;
+    gboolean has_parent;
+} TreeFillFrame;
+static fs_node_t *g_tree_fill_root;
+static GArray *g_tree_fill_stack;
+static guint g_tree_fill_source;
+
+static void tree_fill_cancel(void) {
+    if (g_tree_fill_source) {
+        g_source_remove(g_tree_fill_source);
+        g_tree_fill_source = 0;
+    }
+    if (g_tree_fill_stack) {
+        g_array_free(g_tree_fill_stack, TRUE);
+        g_tree_fill_stack = NULL;
+    }
+    if (g_tree_fill_root) {
+        fs_node_free(g_tree_fill_root);
+        g_tree_fill_root = NULL;
+    }
+}
+
+static gboolean tree_fill_step(gpointer unused) {
+    (void)unused;
+    gint64 deadline = g_get_monotonic_time() + 4000;
+    unsigned inserted = 0;
+    while (g_tree_fill_stack && g_tree_fill_stack->len &&
+           inserted < 128 && g_get_monotonic_time() < deadline) {
+        guint top = g_tree_fill_stack->len - 1;
+        TreeFillFrame *frame = &g_array_index(g_tree_fill_stack, TreeFillFrame, top);
+        if (!frame->next) {
+            g_array_set_size(g_tree_fill_stack, top);
+            continue;
+        }
+        fs_node_t *node = frame->next->data;
+        frame->next = frame->next->prev;
+        GtkTreeIter iter;
+        char *size = (!node->is_dir && node->size >= 0) ? format_bytes(node->size) : NULL;
+        gtk_tree_store_insert_with_values(g_app.tree_store, &iter,
+            frame->has_parent ? &frame->parent : NULL, 0,
+            0, node->name, 1, node->is_dir, 2, size ? size : "", 3, TRUE, -1);
+        g_free(size);
+        inserted++;
+        if (node->is_dir && node->children) {
+            TreeFillFrame child = { g_list_last(node->children), iter, TRUE };
+            g_array_append_val(g_tree_fill_stack, child);
+        }
+    }
+    if (g_tree_fill_stack && g_tree_fill_stack->len) return G_SOURCE_CONTINUE;
+    g_tree_fill_source = 0;
+    tree_fill_cancel();
+    if (g_app.tree_filter) {
+        gtk_widget_set_sensitive(g_app.tree_filter, TRUE);
+        if (gtk_entry_get_text(GTK_ENTRY(g_app.tree_filter))[0])
+            on_tree_filter_changed(GTK_SEARCH_ENTRY(g_app.tree_filter), NULL);
+    }
+    if (g_app.tree_expand_btn) gtk_widget_set_sensitive(g_app.tree_expand_btn, TRUE);
+    return G_SOURCE_REMOVE;
+}
+
 static void build_file_tree(const char *files) {
+    tree_fill_cancel();
     if (!g_app.tree_store) return;
     gtk_tree_store_clear(g_app.tree_store);
+    if (g_app.tree_filter) gtk_widget_set_sensitive(g_app.tree_filter, TRUE);
+    if (g_app.tree_expand_btn) gtk_widget_set_sensitive(g_app.tree_expand_btn, TRUE);
     if (!files || !files[0]) return;
-    fs_node_t *root = fs_build_tree(files);
-    fs_to_store(root, g_app.tree_store, NULL);
-    fs_node_free(root);
+    g_tree_fill_root = fs_build_tree(files);
+    g_tree_fill_stack = g_array_new(FALSE, FALSE, sizeof(TreeFillFrame));
+    TreeFillFrame first = {0};
 
-    if (gtk_tree_model_iter_n_children(GTK_TREE_MODEL(g_app.tree_store), NULL) <= 100) {
-        GtkTreePath *p = gtk_tree_path_new_first();
-        gtk_tree_view_expand_row(GTK_TREE_VIEW(g_app.tree_view), p, FALSE);
-        gtk_tree_path_free(p);
-    }
+    first.next = g_list_last(g_tree_fill_root->children);
+    g_array_append_val(g_tree_fill_stack, first);
+    if (g_app.tree_filter) gtk_widget_set_sensitive(g_app.tree_filter, FALSE);
+    if (g_app.tree_expand_btn) gtk_widget_set_sensitive(g_app.tree_expand_btn, FALSE);
+    g_tree_fill_source = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, tree_fill_step, NULL, NULL);
 }
 
 static char *format_relative_time(long long ts) {
@@ -854,9 +1210,8 @@ static void show_entry_details(int idx) {
     }
 
     if (e->files && e->files[0]) {
-        int fc = count_lines(e->files);
-        long long total = total_bytes_in_files(e->files);
-        char *ts = format_bytes(total);
+        int fc = e->file_count;
+        char *ts = format_bytes(e->indexed_bytes);
         char hdr[200];
         snprintf(hdr, sizeof(hdr), "%s · %d · %s", i18n("files_on_disk"), fc, ts);
         g_free(ts);
@@ -870,7 +1225,8 @@ static void show_entry_details(int idx) {
         gtk_widget_hide(g_app.tree_collapse_btn);
         gtk_widget_hide(g_app.tree_filter);
         gtk_widget_hide(g_app.tree_sw);
-        if (g_app.tree_store) gtk_tree_store_clear(g_app.tree_store);
+        tree_fill_cancel();
+    if (g_app.tree_store) gtk_tree_store_clear(g_app.tree_store);
     }
 
     if (e->notes && e->notes[0]) {
@@ -948,6 +1304,7 @@ static void reset_autolock(void);
 static void on_lock_clicked(GtkButton *btn, gpointer user_data);
 static void update_db_write_controls(void);
 static void update_security_badge(void);
+static void request_system_security_lock(void);
 static void on_create_gpg_key_clicked(GtkButton *btn, gpointer user_data);
 static void populate_gpg_keys(GtkComboBoxText *combo, int secret_only, GtkWidget *err_label);
 
@@ -965,16 +1322,92 @@ static gboolean has_visible_modal_window(void) {
     return found;
 }
 
+static gboolean privacy_shield_hide_cb(gpointer user_data) {
+    (void)user_data;
+    g_app.privacy_shield_timer_id = 0;
+    if (g_app.privacy_shield && gtk_window_is_active(g_app.window))
+        gtk_widget_hide(g_app.privacy_shield);
+    return G_SOURCE_REMOVE;
+}
+
+static void privacy_shield_set(gboolean visible) {
+    if (!g_app.privacy_shield) return;
+    if (g_app.privacy_shield_timer_id) {
+        g_source_remove(g_app.privacy_shield_timer_id);
+        g_app.privacy_shield_timer_id = 0;
+    }
+    if (visible && app_has_open_database() && g_app.screenshot_guard) {
+        gtk_widget_show(g_app.privacy_shield);
+    } else {
+        gtk_widget_hide(g_app.privacy_shield);
+    }
+}
+
+static gboolean focus_lock_cb(gpointer user_data) {
+    (void)user_data;
+    g_app.focus_lock_timer_id = 0;
+    const char *visible = g_app.stack ? gtk_stack_get_visible_child_name(g_app.stack) : NULL;
+    if (!app_has_open_database() || g_unlock_running || g_strcmp0(visible, "main") != 0 ||
+        !g_app.lock_on_focus_loss || gtk_window_is_active(g_app.window) ||
+        has_visible_modal_window())
+        return G_SOURCE_REMOVE;
+    request_system_security_lock();
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_security_focus_out(GtkWidget *w, GdkEventFocus *ev, gpointer user_data) {
+    (void)w; (void)ev; (void)user_data;
+
+    const char *visible = g_app.stack ? gtk_stack_get_visible_child_name(g_app.stack) : NULL;
+    if (!app_has_open_database() || g_unlock_running || g_strcmp0(visible, "main") != 0 ||
+        has_visible_modal_window()) return FALSE;
+    if (g_app.screenshot_guard) privacy_shield_set(TRUE);
+    if (g_app.lock_on_focus_loss) {
+        if (g_app.focus_lock_timer_id) g_source_remove(g_app.focus_lock_timer_id);
+        g_app.focus_lock_timer_id = g_timeout_add(250, focus_lock_cb, NULL);
+    }
+    return FALSE;
+}
+
+static gboolean on_security_focus_in(GtkWidget *w, GdkEventFocus *ev, gpointer user_data) {
+    (void)w; (void)ev; (void)user_data;
+    if (g_app.focus_lock_timer_id) {
+        g_source_remove(g_app.focus_lock_timer_id);
+        g_app.focus_lock_timer_id = 0;
+    }
+    privacy_shield_set(FALSE);
+    reset_autolock();
+    return FALSE;
+}
+
+static gboolean on_security_key_press(GtkWidget *w, GdkEventKey *ev, gpointer user_data) {
+    (void)w; (void)user_data;
+    if (!ev || !app_has_open_database() || !g_app.screenshot_guard) return FALSE;
+    if (ev->keyval == GDK_KEY_Print || ev->keyval == GDK_KEY_Sys_Req) {
+        privacy_shield_set(TRUE);
+        g_app.privacy_shield_timer_id = g_timeout_add(1200, privacy_shield_hide_cb, NULL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void on_lock_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
+    privacy_shield_set(FALSE);
+    if (g_app.focus_lock_timer_id) {
+        g_source_remove(g_app.focus_lock_timer_id);
+        g_app.focus_lock_timer_id = 0;
+    }
     g_autolock_pending = FALSE;
     if (g_app.autolock_timer_id) {
         g_source_remove(g_app.autolock_timer_id);
         g_app.autolock_timer_id = 0;
     }
+    g_db_external_commit_hook = NULL;
     if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
     free(g_app.current_file); g_app.current_file = NULL;
     free(g_app.expected_fp); g_app.expected_fp = NULL;
+    carrier_unmount_cleanup();
     g_app.current_entry_idx = -1;
     clear_details();
     refresh_entry_list();
@@ -998,22 +1431,24 @@ static void on_lock_clicked(GtkButton *btn, gpointer user_data) {
 static gboolean autolock_cb(gpointer user_data) {
     (void)user_data;
     g_app.autolock_timer_id = 0;
-    if (g_batch_running || has_visible_modal_window()) {
+
+
+    if (g_batch_running || g_carrier_running || has_visible_modal_window()) {
         g_autolock_pending = TRUE;
         g_app.autolock_timer_id = g_timeout_add_seconds(1, autolock_cb, NULL);
         return G_SOURCE_REMOVE;
     }
     g_autolock_pending = FALSE;
-    if (g_app.db) on_lock_clicked(NULL, NULL);
+    if (app_has_open_database()) on_lock_clicked(NULL, NULL);
     return G_SOURCE_REMOVE;
 }
 
 static void reset_autolock(void) {
     if (g_app.autolock_timer_id) g_source_remove(g_app.autolock_timer_id);
     g_app.autolock_timer_id = 0;
-    if (g_app.db)
+    if (app_has_open_database() && g_app.autolock_seconds > 0)
         g_app.autolock_timer_id =
-            g_timeout_add_seconds(AUTOLOCK_SECONDS, autolock_cb, NULL);
+            g_timeout_add_seconds(g_app.autolock_seconds, autolock_cb, NULL);
 }
 
 static gboolean on_user_activity(GtkWidget *w, GdkEvent *ev, gpointer u) {
@@ -1023,8 +1458,9 @@ static gboolean on_user_activity(GtkWidget *w, GdkEvent *ev, gpointer u) {
 }
 
 static void request_system_security_lock(void) {
-    if (!g_app.db) return;
-    if (g_batch_running || has_visible_modal_window()) {
+    if (!app_has_open_database()) return;
+
+    if (g_batch_running || g_carrier_running || has_visible_modal_window()) {
         g_autolock_pending = TRUE;
         if (!g_app.autolock_timer_id)
             g_app.autolock_timer_id = g_timeout_add_seconds(1, autolock_cb, NULL);
@@ -1205,8 +1641,8 @@ static void on_create_gpg_key_clicked(GtkButton *btn, gpointer user_data) {
 
     GtkWidget *type_cb = gtk_combo_box_text_new();
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(type_cb), "pqc", i18n("key_type_pqc"));
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(type_cb), "default", i18n("key_type_classic"));
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(type_cb), "pqc");
+    gtk_widget_set_sensitive(type_cb, FALSE);
 
     GtkWidget *exp_cb = gtk_combo_box_text_new();
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(exp_cb), "1y", i18n("key_expiry_1y"));
@@ -1333,30 +1769,46 @@ static void on_create_gpg_key_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void populate_gpg_keys(GtkComboBoxText *combo, int secret_only, GtkWidget *err_label) {
+    (void)secret_only;
     gtk_combo_box_text_remove_all(combo);
     if (!g_app.db) return;
+
+
     int count = 0;
-    gpg_key_info_t *keys = gpg_list_keys(g_app.db->gpg_ctx, secret_only, &count);
-    if (!keys || count == 0) { gtk_label_set_text(GTK_LABEL(err_label), i18n("no_keys")); gpg_free_key_list(keys, count); return; }
-    int active = 0;
+    gpg_key_info_t *keys = gpg_list_keys(g_app.db->gpg_ctx, 0, &count);
+    if (!keys || count == 0) {
+        gtk_label_set_text(GTK_LABEL(err_label), i18n("no_keys"));
+        gpg_free_key_list(keys, count); return;
+    }
+
+
     for (int i = 0; i < count; i++) {
-        const char *mark = keys[i].has_pqc ? "[PQC / ML-KEM]" : i18n("no_quantum_mark");
-        char *display = g_strdup_printf("%s %s", mark, keys[i].uid);
+
+        char caps[128] = "";
+        if (keys[i].has_pqc) g_strlcat(caps, "[PQC] ", sizeof(caps));
+        if (keys[i].has_secret) g_strlcat(caps, "[SECRET] ", sizeof(caps));
+        else g_strlcat(caps, "[PUBLIC ONLY] ", sizeof(caps));
+        if (!keys[i].has_secret_sign) g_strlcat(caps, "[NO SIGN SECRET] ", sizeof(caps));
+        if (!keys[i].has_secret_encrypt) g_strlcat(caps, "[NO DECRYPT SECRET] ", sizeof(caps));
+        if (!keys[i].can_encrypt) g_strlcat(caps, "[NO ENCRYPT] ", sizeof(caps));
+        char *display = g_strdup_printf("%s %s", caps, keys[i].uid);
         gtk_combo_box_text_append(combo, keys[i].fingerprint, display);
         g_free(display);
-        if (g_app.expected_fp && strcmp(keys[i].fingerprint, g_app.expected_fp) == 0) active = i;
     }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+
+
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), -1);
     gtk_label_set_text(GTK_LABEL(err_label), "");
     gpg_free_key_list(keys, count);
 }
 
 static void on_change_key_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
+
 
     int count = 0;
-    gpg_key_info_t *keys = gpg_list_keys(g_app.db->gpg_ctx, 1, &count);
+    gpg_key_info_t *keys = gpg_list_keys(g_app.db->gpg_ctx, 0, &count);
     if (!keys || count == 0) {
         show_save_error(i18n("no_keys"));
         gpg_free_key_list(keys, count);
@@ -1386,16 +1838,21 @@ static void on_change_key_clicked(GtkButton *btn, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(new_box), gtk_label_new(i18n("change_key_new")), FALSE, FALSE, 0);
     GtkWidget *combo = gtk_combo_box_text_new();
     gtk_widget_set_hexpand(combo, TRUE);
-    int active = 0;
+
+
     for (int i = 0; i < count; i++) {
-        const char *mark = keys[i].has_pqc ? "[PQC / ML-KEM]" : i18n("no_quantum_mark");
-        char *display = g_strdup_printf("%s %s", mark, keys[i].uid);
+        char caps[128] = "";
+        if (keys[i].has_pqc) g_strlcat(caps, "[PQC] ", sizeof(caps));
+        if (keys[i].has_secret) g_strlcat(caps, "[SECRET] ", sizeof(caps));
+        else g_strlcat(caps, "[PUBLIC ONLY] ", sizeof(caps));
+        if (!keys[i].has_secret_sign) g_strlcat(caps, "[NO SIGN SECRET] ", sizeof(caps));
+        if (!keys[i].has_secret_encrypt) g_strlcat(caps, "[NO DECRYPT SECRET] ", sizeof(caps));
+        if (!keys[i].can_encrypt) g_strlcat(caps, "[NO ENCRYPT] ", sizeof(caps));
+        char *display = g_strdup_printf("%s %s", caps, keys[i].uid);
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), keys[i].fingerprint, display);
         g_free(display);
-        if (g_app.db->recipient && g_ascii_strcasecmp(keys[i].fingerprint, g_app.db->recipient) == 0)
-            active = i;
     }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), -1);
     gtk_box_pack_start(GTK_BOX(new_box), combo, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(content), new_box, FALSE, FALSE, 0);
     gtk_widget_show_all(dlg);
@@ -1404,22 +1861,23 @@ static void on_change_key_clicked(GtkButton *btn, gpointer user_data) {
         const gchar *selected = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
         if (selected && (!g_app.db->recipient || g_ascii_strcasecmp(selected, g_app.db->recipient) != 0)) {
             char *new_fp = xstrdup(selected);
-            gpgme_key_t pub = NULL, sec = NULL;
-            gpgme_error_t pe = gpgme_get_key(g_app.db->gpg_ctx, new_fp, &pub, 0);
-            gpgme_error_t se = gpgme_get_key(g_app.db->gpg_ctx, new_fp, &sec, 1);
-            gboolean valid = pe == GPG_ERR_NO_ERROR && se == GPG_ERR_NO_ERROR && pub && sec &&
-                !pub->revoked && !pub->expired && !pub->disabled && !pub->invalid && pub->can_encrypt &&
-                !sec->revoked && !sec->expired && !sec->disabled && !sec->invalid && sec->can_sign;
-            if (pub) gpgme_key_release(pub);
-            if (sec) gpgme_key_release(sec);
+            char key_err[256] = "";
+            gboolean valid = gpg_key_usable_for_database(g_app.db->gpg_ctx, new_fp,
+                g_app.db->require_pqc, key_err, sizeof(key_err));
             if (!valid) {
                 secure_free_string(&new_fp);
-                show_save_error(i18n("selected_key_invalid"));
+                show_save_error(key_err[0] ? key_err : i18n("selected_key_invalid"));
             } else {
                 char *old_fp = g_app.db->recipient;
                 g_app.db->recipient = new_fp;
                 char err[256] = "";
-                if (db_save(g_app.db, err, sizeof(err)) != 0) {
+                int history_before = g_app.db->history_count;
+                if (db_history_mark(g_app.db, "key_changed", "", &history_before, err, sizeof(err)) != 0) {
+                    secure_free_string(&g_app.db->recipient);
+                    g_app.db->recipient = old_fp;
+                    show_save_error(err);
+                } else if (db_save(g_app.db, err, sizeof(err)) != 0) {
+                    db_history_restore_count(g_app.db, history_before);
                     secure_free_string(&g_app.db->recipient);
                     g_app.db->recipient = old_fp;
                     show_save_error(err);
@@ -1440,6 +1898,53 @@ static void on_change_key_clicked(GtkButton *btn, gpointer user_data) {
     gpg_free_key_list(keys, count);
 }
 
+static gboolean prepare_unlock_for_db_path(const char *db_path, const char *display_path) {
+    if (!db_path || !db_path[0]) return FALSE;
+
+    free(g_app.current_file);
+    g_app.current_file = xstrdup(db_path);
+    if (!g_app.current_file) return FALSE;
+
+    char info[768];
+    snprintf(info, sizeof(info), "%s %s", i18n("file"),
+        (display_path && display_path[0]) ? display_path : db_path);
+    gtk_label_set_text(GTK_LABEL(g_app.unlock_file_label), info);
+
+    free(g_app.expected_fp); g_app.expected_fp = NULL;
+    int hfd = open(g_app.current_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (hfd >= 0) {
+        struct stat hst;
+        if (fstat(hfd, &hst) == 0 && S_ISREG(hst.st_mode) && hst.st_size > 0 &&
+            (uint64_t)hst.st_size <= (uint64_t)DB_MAX_FILE_BYTES) {
+            FILE *fp = fdopen(hfd, "r");
+            if (fp) {
+                char line[256];
+                if (fgets(line, sizeof(line), fp)) {
+                    char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+                    char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+                    if (strlen(line) == 32 || strlen(line) == 40 || strlen(line) == 64)
+                        g_app.expected_fp = xstrdup(line);
+                }
+                fclose(fp);
+            } else close(hfd);
+        } else close(hfd);
+    }
+
+    if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
+    g_app.db = calloc(1, sizeof(db_manager_t));
+    if (!g_app.db) return FALSE;
+    db_manager_init(g_app.db);
+    if (ensure_db_gpg(g_app.db) != 0) {
+        db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL;
+        return FALSE;
+    }
+    if (g_app.unlock_status) gtk_label_set_text(GTK_LABEL(g_app.unlock_status), "");
+    if (g_app.unlock_err) gtk_label_set_text(GTK_LABEL(g_app.unlock_err), "");
+    populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.unlock_key_combo), 1, g_app.unlock_err);
+    gtk_stack_set_visible_child_name(g_app.stack, "unlock");
+    return TRUE;
+}
+
 static void on_open_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
     GtkWidget *dlg = gtk_file_chooser_dialog_new(i18n("open_db"), g_app.window, GTK_FILE_CHOOSER_ACTION_OPEN,
@@ -1449,41 +1954,12 @@ static void on_open_clicked(GtkButton *btn, gpointer user_data) {
     gtk_file_filter_add_pattern(f, "*.dpdb");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
-        free(g_app.current_file);
         gchar *chosen_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-        g_app.current_file = xstrdup(chosen_path);
-        g_free(chosen_path);
-        char info[256];
-        snprintf(info, sizeof(info), "%s %s", i18n("file"), g_app.current_file);
-        gtk_label_set_text(GTK_LABEL(g_app.unlock_file_label), info);
-        free(g_app.expected_fp); g_app.expected_fp = NULL;
-        int hfd = open(g_app.current_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-        if (hfd >= 0) {
-            struct stat hst;
-            if (fstat(hfd, &hst) == 0 && S_ISREG(hst.st_mode) && hst.st_size > 0 &&
-                (uint64_t)hst.st_size <= (uint64_t)DB_MAX_FILE_BYTES) {
-                FILE *fp = fdopen(hfd, "r");
-                if (fp) {
-                    char line[256];
-                    if (fgets(line, sizeof(line), fp)) {
-                        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
-                        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
-                        if (strlen(line) == 32 || strlen(line) == 40 || strlen(line) == 64)
-                            g_app.expected_fp = xstrdup(line);
-                    }
-                    fclose(fp);
-                } else close(hfd);
-            } else close(hfd);
-        }
-        if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
-        g_app.db = calloc(1, sizeof(db_manager_t));
-        if (!g_app.db) { gtk_widget_destroy(dlg); return; }
-        db_manager_init(g_app.db);
-        if (ensure_db_gpg(g_app.db) != 0) {
-            db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL;
-        } else {
-            populate_gpg_keys(GTK_COMBO_BOX_TEXT(g_app.unlock_key_combo), 1, g_app.unlock_err);
-            gtk_stack_set_visible_child_name(g_app.stack, "unlock");
+        if (chosen_path) {
+            carrier_unmount_cleanup();
+            if (!prepare_unlock_for_db_path(chosen_path, chosen_path))
+                gtk_label_set_text(GTK_LABEL(g_app.unlock_err), i18n("file_corrupted"));
+            g_free(chosen_path);
         }
     }
     gtk_widget_destroy(dlg);
@@ -1498,6 +1974,7 @@ static void on_create_clicked(GtkButton *btn, gpointer user_data) {
     gtk_file_filter_add_pattern(f, "*.dpdb");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
+        carrier_unmount_cleanup();
         free(g_app.current_file);
         gchar *chosen_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
         g_app.current_file = xstrdup(chosen_path);
@@ -1530,6 +2007,14 @@ static void on_setup_create_clicked(GtkButton *btn, gpointer user_data) {
     gchar *recipient = (gchar*)gtk_combo_box_get_active_id(GTK_COMBO_BOX(g_app.key_combo));
     if (!recipient) { gtk_label_set_text(GTK_LABEL(g_app.setup_err), i18n("pgp_key")); return; }
     char err_buf[256] = "";
+
+
+    if (!g_app.db || !g_app.db->gpg_ctx ||
+        !gpg_key_usable_for_database(g_app.db->gpg_ctx, recipient, TRUE, err_buf, sizeof(err_buf))) {
+        gtk_label_set_text(GTK_LABEL(g_app.setup_err),
+            err_buf[0] ? err_buf : i18n("selected_key_invalid"));
+        return;
+    }
     if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
     g_app.db = db_manager_create(g_app.current_file, recipient, g_lang, err_buf, sizeof(err_buf));
     if (!g_app.db) { gtk_label_set_text(GTK_LABEL(g_app.setup_err), err_buf); return; }
@@ -1537,43 +2022,204 @@ static void on_setup_create_clicked(GtkButton *btn, gpointer user_data) {
     g_app.current_entry_idx = -1;
     if (g_known_uuids) g_hash_table_remove_all(g_known_uuids);
     g_uuids_initialized = FALSE;
-    save_config();
+    if (!save_config()) g_warning("DiskPass: configuration could not be saved");
     reset_autolock();
     gtk_stack_set_visible_child_name(g_app.stack, "main");
     refresh_entry_list();
     update_db_write_controls();
 }
 
-static void on_unlock_clicked(GtkButton *btn, gpointer user_data) {
-    (void)btn; (void)user_data;
-    if (!g_app.current_file) return;
-    gchar *selected_fp = (gchar*)gtk_combo_box_get_active_id(GTK_COMBO_BOX(g_app.unlock_key_combo));
-    if (!selected_fp) { gtk_label_set_text(GTK_LABEL(g_app.unlock_err), i18n("pgp_key")); return; }
-    char err_buf[256] = "";
-    if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
-    g_app.db = db_manager_open(g_app.current_file, selected_fp, err_buf, sizeof(err_buf));
-    if (!g_app.db) { gtk_label_set_text(GTK_LABEL(g_app.unlock_err), err_buf); return; }
+typedef struct {
+    char *path;
+    char *key_fingerprint;
+    gboolean mounted_carrier;
+} unlock_job_t;
+
+static void unlock_job_free(unlock_job_t *job) {
+    if (!job) return;
+    if (job->key_fingerprint) {
+        sodium_memzero(job->key_fingerprint, strlen(job->key_fingerprint));
+        g_free(job->key_fingerprint);
+    }
+    g_free(job->path);
+    g_free(job);
+}
+
+static void unlock_manager_free(gpointer data) {
+    db_manager_t *m = data;
+    if (!m) return;
+    db_manager_clear(m);
+    free(m);
+}
+
+static void unlock_set_busy(gboolean busy) {
+    g_unlock_running = busy;
+    if (g_app.btn_unlock) gtk_widget_set_sensitive(g_app.btn_unlock, !busy);
+    if (g_app.btn_unlock_back) gtk_widget_set_sensitive(g_app.btn_unlock_back, !busy);
+    if (g_app.unlock_key_combo) gtk_widget_set_sensitive(g_app.unlock_key_combo, !busy);
+    if (g_app.btn_create_key_unlock) gtk_widget_set_sensitive(g_app.btn_create_key_unlock, !busy);
+    if (g_app.unlock_status)
+        gtk_label_set_text(GTK_LABEL(g_app.unlock_status), busy ? i18n("opening_db") : "");
+}
+
+static void unlock_job_worker(GTask *task, gpointer source_object, gpointer task_data,
+    GCancellable *cancellable)
+{
+    (void)source_object; (void)cancellable;
+    unlock_job_t *job = task_data;
+    char err_buf[384] = "";
+    db_manager_t *opened = db_manager_open(job->path, job->key_fingerprint,
+        TRUE, TRUE, err_buf, sizeof(err_buf));
+    if (!opened) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s",
+            err_buf[0] ? err_buf : "Database open failed");
+        return;
+    }
+    g_task_return_pointer(task, opened, unlock_manager_free);
+}
+
+static void unlock_job_done(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)source; (void)user_data;
+    GTask *task = G_TASK(result);
+    unlock_job_t *job = g_task_get_task_data(task);
+    GError *error = NULL;
+    db_manager_t *opened = g_task_propagate_pointer(task, &error);
+    unlock_set_busy(FALSE);
+
+    if (!job || !g_app.current_file || strcmp(g_app.current_file, job->path) != 0) {
+        if (opened) unlock_manager_free(opened);
+        g_clear_error(&error);
+        return;
+    }
+
+    if (!opened) {
+        const char *unlock_msg = error && error->message ? error->message : i18n("file_corrupted");
+        if (unlock_msg && strcmp(unlock_msg, i18n("sig_mismatch")) == 0) unlock_msg = "";
+        gtk_label_set_text(GTK_LABEL(g_app.unlock_err), unlock_msg ? unlock_msg : "");
+        g_clear_error(&error);
+        return;
+    }
+
+    if (job->mounted_carrier) {
+        char carrier_err[256] = "";
+        if (!g_app.mounted_carrier_path || !g_app.mounted_temp_db_path ||
+            strcmp(g_app.mounted_temp_db_path, job->path) != 0 ||
+            !carrier_identity_unchanged(carrier_err, sizeof(carrier_err))) {
+            unlock_manager_free(opened);
+            gtk_label_set_text(GTK_LABEL(g_app.unlock_err),
+                carrier_err[0] ? carrier_err : i18n("carrier_changed_during_open"));
+            g_clear_error(&error);
+            return;
+        }
+    }
+
+
+    if (!opened->has_commit_chain) {
+        unlock_set_busy(TRUE);
+        GtkWidget *dlg = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE, "%s", i18n("legacy_consent"));
+        gtk_dialog_add_buttons(GTK_DIALOG(dlg),
+            i18n("cancel"), GTK_RESPONSE_CANCEL,
+            i18n("legacy_open_read_only"), GTK_RESPONSE_NO,
+            i18n("legacy_convert"), GTK_RESPONSE_YES, NULL);
+        gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_CANCEL);
+        int choice = gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        opened->defer_chainless_consent = FALSE;
+        if (choice != GTK_RESPONSE_NO && choice != GTK_RESPONSE_YES) {
+            unlock_manager_free(opened);
+            unlock_set_busy(FALSE);
+            return;
+        }
+        if (choice == GTK_RESPONSE_YES) {
+
+            g_db_external_commit_hook = job->mounted_carrier ? carrier_mounted_commit_hook : NULL;
+            char conversion_err[512] = "";
+            opened->legacy_read_only = FALSE;
+            int rc = db_save(opened, conversion_err, sizeof(conversion_err));
+            if (rc != 0 || !opened->rollback_state_verified) {
+                opened->legacy_read_only = TRUE;
+                gtk_label_set_text(GTK_LABEL(g_app.unlock_err), rc != 0
+                    ? conversion_err : i18n("legacy_conversion_state_failed"));
+                g_db_external_commit_hook = NULL;
+                unlock_manager_free(opened);
+                unlock_set_busy(FALSE);
+                return;
+            }
+        }
+        unlock_set_busy(FALSE);
+    }
+    opened->defer_chainless_consent = FALSE;
+
+    if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
+    g_app.db = opened;
+    if (g_app.mounted_carrier_path)
+        g_db_external_commit_hook = carrier_mounted_commit_hook;
+    else
+        g_db_external_commit_hook = NULL;
+
+    gtk_label_set_text(GTK_LABEL(g_app.unlock_err), "");
     update_ui_text();
     g_app.current_entry_idx = -1;
     if (g_known_uuids) g_hash_table_remove_all(g_known_uuids);
     g_uuids_initialized = FALSE;
-    save_config();
+    if (!save_config()) g_warning("DiskPass: configuration could not be saved");
     reset_autolock();
     gtk_stack_set_visible_child_name(g_app.stack, "main");
     refresh_entry_list();
     update_db_write_controls();
-    if (!g_app.db->is_pqc_encrypted) {
-        if (db_recipient_has_pqc(g_app.db)) {
+    if (g_app.db->legacy_read_only) {
+        show_toast(i18n("legacy_read_only"), 15000, -1);
+    } else if (!g_app.db->is_pqc_encrypted) {
+        if (db_recipient_has_pqc(g_app.db))
             show_toast(i18n("legacy_upgrade_msg"), 12000, -1);
-        } else {
+        else
             show_toast(i18n("legacy_classic_msg"), 15000, -1);
-        }
+    } else if (g_app.mounted_carrier_path) {
+        show_toast(i18n("carrier_mounted_active"), 9000, -1);
     }
+    g_clear_error(&error);
+}
+
+static void on_unlock_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    if (!g_app.current_file || g_unlock_running) return;
+    const gchar *selected_fp = gtk_combo_box_get_active_id(GTK_COMBO_BOX(g_app.unlock_key_combo));
+    if (!selected_fp) { gtk_label_set_text(GTK_LABEL(g_app.unlock_err), i18n("pgp_key")); return; }
+    char key_err[256] = "";
+    if (!g_app.db || !g_app.db->gpg_ctx ||
+        !gpg_key_usable_for_unlock(g_app.db->gpg_ctx, selected_fp, key_err, sizeof(key_err))) {
+        gtk_label_set_text(GTK_LABEL(g_app.unlock_err),
+            key_err[0] ? key_err : i18n("selected_key_invalid"));
+        return;
+    }
+
+    unlock_job_t *job = g_new0(unlock_job_t, 1);
+    if (!job) {
+        gtk_label_set_text(GTK_LABEL(g_app.unlock_err), "Out of memory");
+        return;
+    }
+    job->path = g_strdup(g_app.current_file);
+    job->key_fingerprint = g_strdup(selected_fp);
+    job->mounted_carrier = g_app.mounted_carrier_path != NULL;
+    if (!job->path || !job->key_fingerprint) {
+        unlock_job_free(job);
+        gtk_label_set_text(GTK_LABEL(g_app.unlock_err), "Out of memory");
+        return;
+    }
+
+    gtk_label_set_text(GTK_LABEL(g_app.unlock_err), "");
+    unlock_set_busy(TRUE);
+    GTask *task = g_task_new(NULL, NULL, unlock_job_done, NULL);
+    g_task_set_task_data(task, job, (GDestroyNotify)unlock_job_free);
+    g_task_run_in_thread(task, unlock_job_worker);
+    g_object_unref(task);
 }
 
 static void on_delete_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
     GtkListBoxRow *row = gtk_list_box_get_selected_row(g_app.listbox);
     if (!row) return;
     int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "entry_idx"));
@@ -1650,17 +2296,667 @@ static void show_save_error(const char *err) {
 }
 
 static void update_db_write_controls(void) {
-    gboolean writable = (g_app.db != NULL);
+    gboolean have_db = app_has_open_database();
+
+    gboolean writable = have_db && !g_app.db->legacy_read_only && !g_carrier_running;
     if (g_app.btn_add) gtk_widget_set_sensitive(g_app.btn_add, writable);
     if (g_app.btn_edit) gtk_widget_set_sensitive(g_app.btn_edit, writable);
     if (g_app.btn_del) gtk_widget_set_sensitive(g_app.btn_del, writable);
     if (g_app.btn_snapshot) gtk_widget_set_sensitive(g_app.btn_snapshot, writable);
+    if (g_app.btn_smart) gtk_widget_set_sensitive(g_app.btn_smart, writable);
     if (g_app.btn_batch) gtk_widget_set_sensitive(g_app.btn_batch, writable);
+    if (g_app.btn_find) gtk_widget_set_sensitive(g_app.btn_find, writable);
+    if (g_app.btn_rekey) gtk_widget_set_sensitive(g_app.btn_rekey, writable);
+    if (g_app.btn_carrier) gtk_widget_set_sensitive(g_app.btn_carrier,
+        have_db && !g_carrier_running && !g_batch_running);
+}
+
+typedef enum {
+    CARRIER_JOB_ATTACH = 1,
+    CARRIER_JOB_EXTRACT = 2,
+    CARRIER_JOB_OPEN = 3
+} carrier_job_mode_t;
+
+typedef struct {
+    carrier_job_mode_t mode;
+    char *input_path;
+    char *db_path;
+    char *output_path;
+    dev_t input_dev;
+    ino_t input_ino;
+    off_t input_size;
+    struct timespec input_mtim;
+    gboolean input_identity_valid;
+} carrier_job_t;
+
+static void carrier_job_free(carrier_job_t *job) {
+    if (!job) return;
+    g_free(job->input_path);
+    g_free(job->db_path);
+    g_free(job->output_path);
+    g_free(job);
+}
+
+static void carrier_job_worker(GTask *task, gpointer source_object, gpointer task_data,
+    GCancellable *cancellable)
+{
+    (void)source_object; (void)cancellable;
+    carrier_job_t *job = (carrier_job_t *)task_data;
+    char err[384] = "";
+    int rc = -1;
+    if (job && job->mode == CARRIER_JOB_ATTACH)
+        rc = carrier_attach_dpdb(job->input_path, job->db_path, job->output_path, err, sizeof(err));
+    else if (job && (job->mode == CARRIER_JOB_EXTRACT || job->mode == CARRIER_JOB_OPEN))
+        rc = carrier_extract_dpdb(job->input_path, job->output_path, err, sizeof(err));
+    if (rc == 0) g_task_return_boolean(task, TRUE);
+    else g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s", err[0] ? err : "Steganography operation failed");
+}
+
+static gboolean carrier_job_input_unchanged(const carrier_job_t *job) {
+    if (!job || !job->input_identity_valid || !job->input_path) return FALSE;
+    struct stat st;
+    if (lstat(job->input_path, &st) != 0 || !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) return FALSE;
+    return st.st_dev == job->input_dev && st.st_ino == job->input_ino &&
+        st.st_size == job->input_size && st.st_mtim.tv_sec == job->input_mtim.tv_sec &&
+        st.st_mtim.tv_nsec == job->input_mtim.tv_nsec;
+}
+
+static void carrier_job_done(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)source; (void)user_data;
+    GTask *task = G_TASK(result);
+    carrier_job_t *job = (carrier_job_t *)g_task_get_task_data(task);
+    GError *error = NULL;
+    gboolean ok = g_task_propagate_boolean(task, &error);
+    g_carrier_running = FALSE;
+    update_db_write_controls();
+    if (!ok) {
+        if (job && job->mode == CARRIER_JOB_OPEN && job->output_path) (void)unlink(job->output_path);
+        GtkWidget *dlg = gtk_message_dialog_new(g_app.window,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s",
+            error && error->message ? error->message : i18n("carrier_failed"));
+        gtk_window_set_title(GTK_WINDOW(dlg), i18n("carrier_tools"));
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        g_clear_error(&error);
+        return;
+    }
+
+    if (job && job->mode == CARRIER_JOB_OPEN) {
+        if (!carrier_job_input_unchanged(job)) {
+            if (job->output_path) (void)unlink(job->output_path);
+            GtkWidget *dlg = gtk_message_dialog_new(g_app.window,
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s", i18n("carrier_changed_during_open"));
+            gtk_dialog_run(GTK_DIALOG(dlg)); gtk_widget_destroy(dlg);
+            return;
+        }
+
+        carrier_unmount_cleanup();
+        g_app.mounted_carrier_path = g_strdup(job->input_path);
+        g_app.mounted_temp_db_path = g_strdup(job->output_path);
+        if (!g_app.mounted_carrier_path || !g_app.mounted_temp_db_path ||
+            !carrier_capture_identity(g_app.mounted_carrier_path) ||
+            !prepare_unlock_for_db_path(g_app.mounted_temp_db_path, g_app.mounted_carrier_path)) {
+            if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); g_app.db = NULL; }
+            free(g_app.current_file); g_app.current_file = NULL;
+            free(g_app.expected_fp); g_app.expected_fp = NULL;
+            carrier_unmount_cleanup();
+            GtkWidget *dlg = gtk_message_dialog_new(g_app.window,
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s", i18n("carrier_open_failed"));
+            gtk_dialog_run(GTK_DIALOG(dlg)); gtk_widget_destroy(dlg);
+            return;
+        }
+        show_toast(i18n("carrier_open_ready"), 7000, -1);
+        return;
+    }
+    show_toast(i18n("carrier_done"), 7000, -1);
+}
+
+static void carrier_start_job(carrier_job_t *job) {
+    if (!job || g_carrier_running) { carrier_job_free(job); return; }
+    g_carrier_running = TRUE;
+    update_db_write_controls();
+    show_toast(i18n("carrier_working"), 5000, -1);
+    GTask *task = g_task_new(NULL, NULL, carrier_job_done, NULL);
+    g_task_set_task_data(task, job, (GDestroyNotify)carrier_job_free);
+    g_task_run_in_thread(task, carrier_job_worker);
+    g_object_unref(task);
+}
+
+static gboolean carrier_suffix_ci(const char *path, const char *suffix) {
+    if (!path || !suffix) return FALSE;
+    size_t lp = strlen(path), ls = strlen(suffix);
+    return lp >= ls && g_ascii_strcasecmp(path + lp - ls, suffix) == 0;
+}
+
+static const char *carrier_kind_ui_name(carrier_kind_t kind) {
+    switch (kind) {
+        case CARRIER_KIND_JPEG: return "JPEG / DCT";
+        case CARRIER_KIND_MP3: return "MP3 / ID3 cover";
+        case CARRIER_KIND_FLAC: return "FLAC / PICTURE cover";
+        case CARRIER_KIND_WAV: return "PCM WAV / sample LSB";
+        case CARRIER_KIND_IMAGE: return "Lossless image / pixel LSB";
+        default: return "Unsupported";
+    }
+}
+
+static const char *carrier_preferred_ext(const char *path, carrier_kind_t kind) {
+    if (kind == CARRIER_KIND_WAV) return ".wav";
+    if (kind == CARRIER_KIND_MP3) return ".mp3";
+    if (kind == CARRIER_KIND_FLAC) return ".flac";
+    if (kind == CARRIER_KIND_JPEG) return carrier_suffix_ci(path, ".jpeg") ? ".jpeg" : ".jpg";
+    if (kind == CARRIER_KIND_IMAGE) {
+        if (carrier_suffix_ci(path, ".bmp")) return ".bmp";
+        if (carrier_suffix_ci(path, ".webp")) return ".webp";
+        if (carrier_suffix_ci(path, ".tiff")) return ".tiff";
+        if (carrier_suffix_ci(path, ".tif")) return ".tif";
+        if (carrier_suffix_ci(path, ".ppm")) return ".ppm";
+        if (carrier_suffix_ci(path, ".pnm")) return ".pnm";
+        if (carrier_suffix_ci(path, ".tga")) return ".tga";
+        return ".png";
+    }
+    return ".png";
+}
+
+static gchar *carrier_default_output_name(const char *path, carrier_kind_t kind) {
+    gchar *base = g_path_get_basename(path ? path : "carrier");
+    const char *ext = carrier_preferred_ext(path, kind);
+    if (!base) return g_strdup_printf("stego%s", ext);
+    char *dot = strrchr(base, '.');
+    gchar *out = (dot && dot != base)
+        ? g_strdup_printf("%.*s-stego%s", (int)(dot - base), base, ext)
+        : g_strdup_printf("%s-stego%s", base, ext);
+    g_free(base);
+    return out;
+}
+
+static gchar *carrier_choose_open(const char *title) {
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(title, g_app.window,
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        i18n("cancel"), GTK_RESPONSE_CANCEL,
+        i18n("carrier_open"), GTK_RESPONSE_OK, NULL);
+
+    GtkFileFilter *supported = gtk_file_filter_new();
+    gtk_file_filter_set_name(supported, i18n("carrier_supported"));
+    const char *patterns[] = {
+        "*.jpg","*.jpeg","*.jpe","*.jfif","*.png","*.webp","*.bmp","*.tif","*.tiff","*.ppm","*.pnm","*.tga",
+        "*.gif","*.ico","*.xpm","*.svg","*.pgm","*.pbm","*.wav","*.mp3","*.flac",
+        "*.JPG","*.JPEG","*.JPE","*.JFIF","*.PNG","*.WEBP","*.BMP","*.TIF","*.TIFF","*.PPM","*.PNM","*.TGA",
+        "*.GIF","*.ICO","*.XPM","*.SVG","*.PGM","*.PBM","*.WAV","*.MP3","*.FLAC"
+    };
+    for (size_t i = 0; i < sizeof(patterns)/sizeof(patterns[0]); i++)
+        gtk_file_filter_add_pattern(supported, patterns[i]);
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), supported);
+
+    GtkFileFilter *images = gtk_file_filter_new();
+    gtk_file_filter_set_name(images, i18n("carrier_images"));
+    const char *image_mimes[] = {
+        "image/jpeg","image/png","image/webp","image/bmp","image/tiff","image/gif",
+        "image/x-icon","image/x-portable-anymap","image/x-tga","image/x-xpixmap","image/svg+xml"
+    };
+    for (size_t i = 0; i < sizeof(image_mimes)/sizeof(image_mimes[0]); i++)
+        gtk_file_filter_add_mime_type(images, image_mimes[i]);
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), images);
+
+    GtkFileFilter *audio = gtk_file_filter_new();
+    gtk_file_filter_set_name(audio, i18n("carrier_audio"));
+    gtk_file_filter_add_mime_type(audio, "audio/x-wav");
+    gtk_file_filter_add_mime_type(audio, "audio/wav");
+    gtk_file_filter_add_mime_type(audio, "audio/mpeg");
+    gtk_file_filter_add_mime_type(audio, "audio/flac");
+    gtk_file_filter_add_pattern(audio, "*.wav"); gtk_file_filter_add_pattern(audio, "*.WAV");
+    gtk_file_filter_add_pattern(audio, "*.mp3"); gtk_file_filter_add_pattern(audio, "*.MP3");
+    gtk_file_filter_add_pattern(audio, "*.flac"); gtk_file_filter_add_pattern(audio, "*.FLAC");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), audio);
+
+    GtkFileFilter *all = gtk_file_filter_new();
+    gtk_file_filter_set_name(all, i18n("carrier_all_files"));
+    gtk_file_filter_add_pattern(all, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), all);
+
+    gchar *path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK)
+        path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+    gtk_widget_destroy(dlg);
+    return path;
+}
+
+static gchar *carrier_replace_extension(gchar *path, const char *ext) {
+    if (!path || !ext) return path;
+    if (carrier_suffix_ci(path, ext)) return path;
+    char *slash = strrchr(path, G_DIR_SEPARATOR);
+    char *dot = strrchr(path, '.');
+    gchar *fixed = (dot && (!slash || dot > slash))
+        ? g_strdup_printf("%.*s%s", (int)(dot - path), path, ext)
+        : g_strconcat(path, ext, NULL);
+    g_free(path);
+    return fixed;
+}
+
+static gchar *carrier_choose_save(const char *title, const char *suggested, gboolean dpdb) {
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(title, g_app.window,
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        i18n("cancel"), GTK_RESPONSE_CANCEL,
+        i18n("save"), GTK_RESPONSE_OK, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    if (suggested && *suggested) gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), suggested);
+
+    const char *expected = ".dpdb";
+    const char *label = "DiskPass (*.dpdb)";
+    if (!dpdb) {
+        static const struct { const char *ext; const char *label; } fmts[] = {
+            {".jpeg","JPEG DCT (*.jpeg)"},{".jpg","JPEG DCT (*.jpg)"},{".wav","PCM WAV (*.wav)"},
+            {".mp3","MP3 stego cover (*.mp3)"},{".flac","FLAC stego cover (*.flac)"},
+            {".webp","Lossless WebP (*.webp)"},{".tiff","TIFF (*.tiff)"},{".tif","TIFF (*.tif)"},
+            {".bmp","BMP (*.bmp)"},{".ppm","PPM (*.ppm)"},{".pnm","PNM/PPM (*.pnm)"},
+            {".tga","TGA (*.tga)"},{".png","PNG (*.png)"}
+        };
+        expected = ".png"; label = "PNG (*.png)";
+        for (size_t i=0;i<sizeof(fmts)/sizeof(fmts[0]);i++) {
+            if (carrier_suffix_ci(suggested, fmts[i].ext)) { expected=fmts[i].ext; label=fmts[i].label; break; }
+        }
+    }
+    GtkFileFilter *f = gtk_file_filter_new();
+    gtk_file_filter_set_name(f, label);
+    gchar *pattern = g_strdup_printf("*%s", expected);
+    gtk_file_filter_add_pattern(f, pattern); g_free(pattern);
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
+
+    gchar *path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK)
+        path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+    gtk_widget_destroy(dlg);
+    return carrier_replace_extension(path, expected);
+}
+
+static char *carrier_make_private_temp_db(char *err_msg, size_t err_msg_sz) {
+    const char *base = g_get_user_runtime_dir();
+    if (!base || !base[0]) base = g_get_user_cache_dir();
+    if (!base || !base[0]) {
+        snprintf(err_msg, err_msg_sz, "No private runtime directory is available");
+        return NULL;
+    }
+    char *dir = g_build_filename(base, "diskpass", "stego-open", NULL);
+    if (!dir) { snprintf(err_msg, err_msg_sz, "Out of memory for runtime path"); return NULL; }
+    if (g_mkdir_with_parents(dir, 0700) != 0 || chmod(dir, 0700) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot create private stego runtime directory: %s", strerror(errno));
+        g_free(dir); return NULL;
+    }
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+        (st.st_mode & (S_IRWXG | S_IRWXO))) {
+        snprintf(err_msg, err_msg_sz, "Stego runtime directory is not private");
+        g_free(dir); return NULL;
+    }
+    char hex[33];
+    for (int attempt = 0; attempt < 32; attempt++) {
+        unsigned char rnd[16]; randombytes_buf(rnd, sizeof(rnd));
+        for (size_t i = 0; i < sizeof(rnd); i++) snprintf(hex + i*2, 3, "%02x", rnd[i]);
+        sodium_memzero(rnd, sizeof(rnd));
+        char *path = g_strdup_printf("%s/%s.dpdb", dir, hex);
+        if (!path) break;
+        if (lstat(path, &st) != 0 && errno == ENOENT) { g_free(dir); return path; }
+        g_free(path);
+    }
+    snprintf(err_msg, err_msg_sz, "Cannot allocate a unique private database path");
+    g_free(dir);
+    return NULL;
+}
+
+static gboolean carrier_capture_identity(const char *path) {
+    struct stat st;
+    if (!path || lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+        g_app.mounted_carrier_identity_valid = FALSE;
+        return FALSE;
+    }
+
+
+    if (st.st_nlink != 1) {
+        g_app.mounted_carrier_identity_valid = FALSE;
+        return FALSE;
+    }
+
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        g_app.mounted_carrier_identity_valid = FALSE;
+        return FALSE;
+    }
+    char hash_err[128] = "";
+    if (stego_keyed_hash_fd(fd, (uint64_t)st.st_size, g_app.mounted_carrier_hash,
+            hash_err, sizeof(hash_err)) != 0) {
+        close(fd);
+        g_app.mounted_carrier_identity_valid = FALSE;
+        return FALSE;
+    }
+    close(fd);
+
+    g_app.mounted_carrier_dev = st.st_dev;
+    g_app.mounted_carrier_ino = st.st_ino;
+    g_app.mounted_carrier_size = st.st_size;
+    g_app.mounted_carrier_mtim = st.st_mtim;
+    g_app.mounted_carrier_identity_valid = TRUE;
+    return TRUE;
+}
+
+static void carrier_unmount_cleanup(void) {
+    g_db_external_commit_hook = NULL;
+    if (g_app.mounted_temp_db_path) {
+        (void)unlink(g_app.mounted_temp_db_path);
+        size_t n = strlen(g_app.mounted_temp_db_path) + sizeof(".bak");
+        char *bak = malloc(n);
+        if (bak) { snprintf(bak, n, "%s.bak", g_app.mounted_temp_db_path); (void)unlink(bak); free(bak); }
+    }
+    g_free(g_app.mounted_carrier_path); g_app.mounted_carrier_path = NULL;
+    g_free(g_app.mounted_temp_db_path); g_app.mounted_temp_db_path = NULL;
+    g_app.mounted_carrier_identity_valid = FALSE;
+}
+
+static gboolean carrier_identity_unchanged(char *err_msg, size_t err_msg_sz) {
+    if (!g_app.mounted_carrier_path || !g_app.mounted_carrier_identity_valid) {
+        snprintf(err_msg, err_msg_sz, "Steganographic carrier is not mounted");
+        return FALSE;
+    }
+    struct stat st;
+    if (lstat(g_app.mounted_carrier_path, &st) != 0 || !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+        snprintf(err_msg, err_msg_sz, "Mounted carrier is no longer the same regular file");
+        return FALSE;
+    }
+    if (st.st_dev != g_app.mounted_carrier_dev || st.st_ino != g_app.mounted_carrier_ino ||
+        st.st_size != g_app.mounted_carrier_size ||
+        st.st_mtim.tv_sec != g_app.mounted_carrier_mtim.tv_sec ||
+        st.st_mtim.tv_nsec != g_app.mounted_carrier_mtim.tv_nsec) {
+        snprintf(err_msg, err_msg_sz,
+            "The steganographic carrier changed outside DiskPass; refusing to overwrite it");
+        return FALSE;
+    }
+
+
+    if (st.st_nlink != 1) {
+        snprintf(err_msg, err_msg_sz,
+            "Carrier has multiple hard links; refusing to overwrite (potential attack)");
+        return FALSE;
+    }
+    int fd = open(g_app.mounted_carrier_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot re-open carrier for integrity check: %s", strerror(errno));
+        return FALSE;
+    }
+    unsigned char current_hash[32];
+    char hash_err[128] = "";
+    gboolean hash_ok = (stego_keyed_hash_fd(fd, (uint64_t)st.st_size, current_hash,
+            hash_err, sizeof(hash_err)) == 0);
+    close(fd);
+    if (!hash_ok || sodium_memcmp(current_hash, g_app.mounted_carrier_hash, 32) != 0) {
+        sodium_memzero(current_hash, sizeof(current_hash));
+        snprintf(err_msg, err_msg_sz,
+            "Carrier content integrity check failed; the file was modified outside DiskPass");
+        return FALSE;
+    }
+    sodium_memzero(current_hash, sizeof(current_hash));
+    return TRUE;
+}
+
+static int carrier_mounted_commit_hook(const char *db_path, char *err_msg, size_t err_msg_sz) {
+    if (!g_app.mounted_carrier_path || !db_path ||
+        !g_app.mounted_temp_db_path || strcmp(db_path, g_app.mounted_temp_db_path) != 0) {
+        snprintf(err_msg, err_msg_sz, "Invalid steganographic mount state");
+        return -1;
+    }
+    if (!carrier_identity_unchanged(err_msg, err_msg_sz)) return -1;
+
+    carrier_kind_t kind = carrier_detect_kind(g_app.mounted_carrier_path);
+    if (kind == CARRIER_KIND_UNKNOWN) {
+        snprintf(err_msg, err_msg_sz, "Mounted carrier format is no longer recognized");
+        return -1;
+    }
+    const char *ext = carrier_preferred_ext(g_app.mounted_carrier_path, kind);
+    char *dir = g_path_get_dirname(g_app.mounted_carrier_path);
+    if (!dir) { snprintf(err_msg, err_msg_sz, "Cannot resolve carrier directory"); return -1; }
+
+    char *stage = NULL;
+    for (int attempt = 0; attempt < 32 && !stage; attempt++) {
+        unsigned char rnd[12]; char hex[25];
+        randombytes_buf(rnd, sizeof(rnd));
+        for (size_t i=0;i<sizeof(rnd);i++) snprintf(hex+i*2,3,"%02x",rnd[i]);
+        sodium_memzero(rnd,sizeof(rnd));
+        char *candidate = g_strdup_printf("%s/.diskpass-stego-%s%s", dir, hex, ext);
+        struct stat st;
+        if (candidate && lstat(candidate, &st) != 0 && errno == ENOENT) stage = candidate;
+        else g_free(candidate);
+    }
+    g_free(dir);
+    if (!stage) { snprintf(err_msg, err_msg_sz, "Cannot allocate carrier update path"); return -1; }
+
+    g_atomic_int_set(&g_stego_replace_existing_payload, 1);
+    int rc = carrier_attach_dpdb(g_app.mounted_carrier_path, db_path, stage, err_msg, err_msg_sz);
+    g_atomic_int_set(&g_stego_replace_existing_payload, 0);
+    if (rc != 0) { (void)unlink(stage); g_free(stage); return -1; }
+    if (!carrier_identity_unchanged(err_msg, err_msg_sz)) {
+        (void)unlink(stage); g_free(stage); return -1;
+    }
+    if (rename(stage, g_app.mounted_carrier_path) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot atomically replace steganographic carrier: %s", strerror(errno));
+        (void)unlink(stage); g_free(stage); return -1;
+    }
+    carrier_fsync_parent(g_app.mounted_carrier_path);
+    g_free(stage);
+    if (!carrier_capture_identity(g_app.mounted_carrier_path)) {
+
+        fprintf(stderr, "DiskPass: warning: updated stego carrier identity could not be captured; reopen before the next write\n");
+    }
+    return 0;
+}
+
+static void on_open_stego_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    if (g_carrier_running || g_batch_running) return;
+
+    gchar *carrier = carrier_choose_open(i18n("carrier_choose_open_hidden"));
+    if (!carrier) return;
+    carrier_kind_t kind = carrier_detect_kind(carrier);
+    if (kind == CARRIER_KIND_UNKNOWN) {
+        GtkWidget *bad = gtk_message_dialog_new(g_app.window,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s", i18n("carrier_unsupported"));
+        gtk_dialog_run(GTK_DIALOG(bad)); gtk_widget_destroy(bad); g_free(carrier); return;
+    }
+
+    char err[384] = "";
+    char *temp_db = carrier_make_private_temp_db(err, sizeof(err));
+    if (!temp_db) {
+        show_save_error(err[0] ? err : i18n("carrier_open_failed"));
+        g_free(carrier); return;
+    }
+
+    carrier_job_t *job = g_new0(carrier_job_t, 1);
+    if (!job) {
+        (void)unlink(temp_db); g_free(temp_db); g_free(carrier);
+        show_save_error("Out of memory"); return;
+    }
+    job->mode = CARRIER_JOB_OPEN;
+    job->input_path = carrier;
+    job->output_path = temp_db;
+    struct stat cst;
+    if (lstat(carrier, &cst) != 0 || !S_ISREG(cst.st_mode) || S_ISLNK(cst.st_mode)) {
+        carrier_job_free(job);
+        show_save_error(i18n("carrier_open_failed"));
+        return;
+    }
+    job->input_dev = cst.st_dev; job->input_ino = cst.st_ino; job->input_size = cst.st_size;
+    job->input_mtim = cst.st_mtim; job->input_identity_valid = TRUE;
+    carrier_start_job(job);
+}
+
+static void carrier_choice_clicked(GtkButton *button, gpointer user_data) {
+    GtkDialog *dlg = GTK_DIALOG(user_data);
+    gint response = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "carrier-response"));
+    gtk_dialog_response(dlg, response);
+}
+
+static GtkWidget *carrier_choice_button(GtkDialog *dlg, const char *icon_name,
+    const char *title, const char *description, gint response)
+{
+    GtkWidget *button = gtk_button_new();
+    gtk_widget_set_hexpand(button, TRUE);
+    gtk_widget_set_halign(button, GTK_ALIGN_FILL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(button), "carrier-choice");
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(row), 1);
+
+    GtkWidget *icon = gtk_image_new_from_icon_name(icon_name, GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(icon), "carrier-choice-icon");
+    gtk_box_pack_start(GTK_BOX(row), icon, FALSE, FALSE, 0);
+
+    GtkWidget *texts = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(texts, TRUE);
+    GtkWidget *title_lbl = gtk_label_new(title);
+    gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0f);
+    gtk_style_context_add_class(gtk_widget_get_style_context(title_lbl), "carrier-choice-title");
+    gtk_box_pack_start(GTK_BOX(texts), title_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *desc_lbl = gtk_label_new(description);
+    gtk_label_set_xalign(GTK_LABEL(desc_lbl), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(desc_lbl), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(desc_lbl), 42);
+    gtk_style_context_add_class(gtk_widget_get_style_context(desc_lbl), "carrier-choice-desc");
+    gtk_box_pack_start(GTK_BOX(texts), desc_lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), texts, TRUE, TRUE, 0);
+
+    GtkWidget *arrow = gtk_image_new_from_icon_name("go-next-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_valign(arrow, GTK_ALIGN_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(arrow), "carrier-choice-arrow");
+    gtk_box_pack_end(GTK_BOX(row), arrow, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(button), row);
+    g_object_set_data(G_OBJECT(button), "carrier-response", GINT_TO_POINTER(response));
+    g_signal_connect(button, "clicked", G_CALLBACK(carrier_choice_clicked), dlg);
+    return button;
+}
+
+static GtkWidget *carrier_format_row(const char *title, const char *value) {
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *name = gtk_label_new(title);
+    gtk_widget_set_size_request(name, 105, -1);
+    gtk_label_set_xalign(GTK_LABEL(name), 0.0f);
+    gtk_style_context_add_class(gtk_widget_get_style_context(name), "carrier-format-name");
+    gtk_box_pack_start(GTK_BOX(row), name, FALSE, FALSE, 0);
+
+    GtkWidget *desc = gtk_label_new(value);
+    gtk_label_set_xalign(GTK_LABEL(desc), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(desc), TRUE);
+    gtk_widget_set_hexpand(desc, TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(desc), "carrier-format-value");
+    gtk_box_pack_start(GTK_BOX(row), desc, TRUE, TRUE, 0);
+    return row;
+}
+
+static gint carrier_run_action_dialog(void) {
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("carrier_tools"), g_app.window,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("cancel"), GTK_RESPONSE_CANCEL, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 520, -1);
+    gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
+    install_dialog_title(GTK_WINDOW(dlg), i18n("carrier_tools"));
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 15);
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+
+    const char *badge_path = g_app.mounted_carrier_path ? g_app.mounted_carrier_path :
+        (g_app.db && g_app.db->file_path ? g_app.db->file_path : "database.dpdb");
+    gchar *db_name = g_path_get_basename(badge_path);
+    gchar *db_text = g_strdup_printf("%s: %s", i18n("carrier_current_db"), db_name ? db_name : "database.dpdb");
+    GtkWidget *db_badge = gtk_label_new(db_text);
+    gtk_label_set_xalign(GTK_LABEL(db_badge), 0.0f);
+    gtk_label_set_ellipsize(GTK_LABEL(db_badge), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars(GTK_LABEL(db_badge), 42);
+    gtk_style_context_add_class(gtk_widget_get_style_context(db_badge), "carrier-current-db");
+    gtk_box_pack_start(GTK_BOX(content), db_badge, FALSE, FALSE, 0);
+    g_free(db_text);
+    g_free(db_name);
+
+    GtkWidget *attach = carrier_choice_button(GTK_DIALOG(dlg), "mail-attachment-symbolic",
+        i18n("carrier_attach_short"), i18n("carrier_attach_desc"), 1);
+    gtk_box_pack_start(GTK_BOX(content), attach, FALSE, FALSE, 0);
+
+    GtkWidget *extract = carrier_choice_button(GTK_DIALOG(dlg), "document-save-symbolic",
+        i18n("carrier_extract_short"), i18n("carrier_extract_desc"), 2);
+    gtk_box_pack_start(GTK_BOX(content), extract, FALSE, FALSE, 0);
+
+    GtkWidget *expander = gtk_expander_new(i18n("carrier_formats_title"));
+    gtk_style_context_add_class(gtk_widget_get_style_context(expander), "carrier-expander");
+    GtkWidget *formats = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(formats), 7);
+    gtk_box_pack_start(GTK_BOX(formats), carrier_format_row(
+        i18n("carrier_formats_images"), i18n("carrier_formats_images_list")), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(formats), carrier_format_row(
+        i18n("carrier_formats_audio"), i18n("carrier_formats_audio_list")), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(formats), carrier_format_row(
+        i18n("carrier_formats_sources"), i18n("carrier_formats_sources_list")), FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(expander), formats);
+    gtk_box_pack_start(GTK_BOX(content), expander, FALSE, FALSE, 0);
+
+    GtkWidget *note = gtk_label_new(i18n("carrier_safe_note"));
+    gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(note), "carrier-note");
+    gtk_box_pack_start(GTK_BOX(content), note, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dlg);
+    gint response = gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    return response;
+}
+
+static void on_carrier_tools_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    if (g_carrier_running || g_batch_running || !app_has_open_database()) return;
+
+    gint response = carrier_run_action_dialog();
+
+    if (response == 1) {
+        gchar *carrier = carrier_choose_open(i18n("carrier_choose_file"));
+        if (!carrier) return;
+        carrier_kind_t kind = carrier_detect_kind(carrier);
+        if (kind == CARRIER_KIND_UNKNOWN) {
+            GtkWidget *bad = gtk_message_dialog_new(g_app.window,
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+                "%s", i18n("carrier_unsupported"));
+            gtk_dialog_run(GTK_DIALOG(bad)); gtk_widget_destroy(bad); g_free(carrier); return;
+        }
+        gchar *method = g_strdup_printf("%s: %s", i18n("carrier_detected"), carrier_kind_ui_name(kind));
+        show_toast(method, 3500, -1); g_free(method);
+        gchar *suggested = carrier_default_output_name(carrier, kind);
+        gchar *output = carrier_choose_save(i18n("carrier_choose_output"), suggested, FALSE);
+        g_free(suggested);
+        if (!output) { g_free(carrier); return; }
+        carrier_job_t *job = g_new0(carrier_job_t, 1);
+        job->mode = CARRIER_JOB_ATTACH;
+        job->input_path = carrier;
+        job->db_path = g_strdup(g_app.db->file_path);
+        job->output_path = output;
+        carrier_start_job(job);
+    } else if (response == 2) {
+        gchar *joined = carrier_choose_open(i18n("carrier_choose_joined"));
+        if (!joined) return;
+        gchar *output = carrier_choose_save(i18n("carrier_extract_to"), "extracted.dpdb", TRUE);
+        if (!output) { g_free(joined); return; }
+        carrier_job_t *job = g_new0(carrier_job_t, 1);
+        job->mode = CARRIER_JOB_EXTRACT;
+        job->input_path = joined;
+        job->output_path = output;
+        carrier_start_job(job);
+    }
 }
 
 typedef struct {
     GtkWidget *radio_auto;
     GtkWidget *radio_manual;
+    GtkWidget *disk_section;
     GtkWidget *disk_combo;
     GtkWidget *refresh_btn;
     GtkWidget *type_combo;
@@ -1705,8 +3001,11 @@ static void on_disk_combo_changed(GtkComboBox *cb, gpointer user_data) {
     add_ctx_t *ctx = user_data;
     const char *id = gtk_combo_box_get_active_id(cb);
     if (!id) return;
-    int idx = atoi(id);
-    if (idx < 0 || idx >= ctx->disk_count) return;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(id, &end, 10);
+    if (errno != 0 || !end || *end || parsed < 0 || parsed >= ctx->disk_count) return;
+    int idx = (int)parsed;
     disk_info_t *d = &ctx->disks[idx];
 
     if (ctx->uuid_label) {
@@ -1715,7 +3014,7 @@ static void on_disk_combo_changed(GtkComboBox *cb, gpointer user_data) {
         gtk_label_set_text(GTK_LABEL(ctx->uuid_label), buf);
     }
 
-    const char *guess_type = transport_to_type(d->transport);
+    const char *guess_type = transport_to_type(d->transport, d->rotational);
     if (guess_type) {
         GtkTreeModel *model = gtk_combo_box_get_model(GTK_COMBO_BOX(ctx->type_combo));
         GtkTreeIter it;
@@ -1755,23 +3054,34 @@ static void on_disk_refresh(GtkButton *b, gpointer user_data) {
 static void on_add_mode_changed(GtkToggleButton *btn, gpointer user_data) {
     add_ctx_t *ctx = user_data;
     if (!gtk_toggle_button_get_active(btn)) return;
+
     gboolean auto_mode = (btn == GTK_TOGGLE_BUTTON(ctx->radio_auto));
-    gtk_widget_set_sensitive(ctx->disk_combo, auto_mode);
+
+    if (ctx->disk_section) {
+        if (auto_mode)
+            gtk_widget_show_all(ctx->disk_section);
+        else
+            gtk_widget_hide(ctx->disk_section);
+    }
+
+    gtk_widget_set_sensitive(ctx->disk_combo, auto_mode && ctx->disk_count > 0);
     gtk_widget_set_sensitive(ctx->refresh_btn, auto_mode);
     gtk_widget_set_sensitive(ctx->size_combo, !auto_mode);
+
     if (auto_mode)
         on_disk_combo_changed(GTK_COMBO_BOX(ctx->disk_combo), ctx);
 }
 
 static void on_add_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
 
     GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("add_entry"), g_app.window,
         GTK_DIALOG_MODAL,
         i18n("cancel"), GTK_RESPONSE_CANCEL,
         i18n("create"), GTK_RESPONSE_OK, NULL);
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 520, 600);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 520, -1);
     install_dialog_title(GTK_WINDOW(dlg), i18n("add_entry"));
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
@@ -1790,6 +3100,8 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(mode_box), ctx.radio_manual, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), mode_box, FALSE, FALSE, 0);
 
+    ctx.disk_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 7);
+
     GtkWidget *disk_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     ctx.disk_combo = gtk_combo_box_text_new();
     gtk_widget_set_hexpand(ctx.disk_combo, TRUE);
@@ -1798,13 +3110,15 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     ctx.refresh_btn = gtk_button_new_from_icon_name("view-refresh-symbolic",
         GTK_ICON_SIZE_BUTTON);
     gtk_box_pack_start(GTK_BOX(disk_row), ctx.refresh_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(content), disk_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctx.disk_section), disk_row, FALSE, FALSE, 0);
 
     ctx.uuid_label = gtk_label_new("");
     gtk_style_context_add_class(gtk_widget_get_style_context(ctx.uuid_label), "dim-label");
     gtk_label_set_xalign(GTK_LABEL(ctx.uuid_label), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(ctx.uuid_label), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_box_pack_start(GTK_BOX(content), ctx.uuid_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctx.disk_section), ctx.uuid_label, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(content), ctx.disk_section, FALSE, FALSE, 0);
 
     GtkGrid *grid = GTK_GRID(gtk_grid_new());
     gtk_grid_set_column_spacing(grid, 12);
@@ -1846,7 +3160,11 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_grid_attach(grid, ph, 1, row++, 1, 1);
 
     gtk_grid_attach(grid, gtk_label_new(i18n("tag_min")), 0, row, 1, 1);
-    GtkWidget *vt = gtk_entry_new(); gtk_widget_set_hexpand(vt, TRUE);
+    GtkWidget *vt = gtk_entry_new();
+    gtk_widget_set_hexpand(vt, TRUE);
+    gtk_widget_set_size_request(vt, -1, 42);
+    gtk_widget_set_margin_top(vt, 2);
+    gtk_widget_set_margin_bottom(vt, 2);
     gtk_grid_attach(grid, vt, 1, row++, 1, 1);
 
     gtk_grid_attach(grid, gtk_label_new(i18n("salt")), 0, row, 1, 1);
@@ -1880,6 +3198,11 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
 
     gtk_widget_show_all(dlg);
 
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx.radio_manual)))
+        on_add_mode_changed(GTK_TOGGLE_BUTTON(ctx.radio_manual), &ctx);
+    else
+        on_add_mode_changed(GTK_TOGGLE_BUTTON(ctx.radio_auto), &ctx);
+
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
         const char *tag_str = gtk_entry_get_text(GTK_ENTRY(vt));
         if (strlen(tag_str) < 2) {
@@ -1912,9 +3235,11 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
             ctx.disk_count > 0) {
             const char *id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ctx.disk_combo));
             if (id) {
-                int di = atoi(id);
-                if (di >= 0 && di < ctx.disk_count)
-                    uuid_to_save = ctx.disks[di].uuid;
+                errno = 0;
+                char *end = NULL;
+                long parsed = strtol(id, &end, 10);
+                if (errno == 0 && end && !*end && parsed >= 0 && parsed < ctx.disk_count)
+                    uuid_to_save = ctx.disks[(int)parsed].uuid;
             }
         }
 
@@ -1944,8 +3269,9 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void on_edit_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
     GtkListBoxRow *row = gtk_list_box_get_selected_row(g_app.listbox);
     if (!row) return;
     int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "entry_idx"));
@@ -2013,9 +3339,776 @@ static void on_edit_clicked(GtkButton *btn, gpointer user_data) {
     secure_free_string(&entry_label);
 }
 
+static GtkWidget *settings_row_new(const char *title, const char *desc, GtkWidget *control) {
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_set_margin_top(row, 6);
+    gtk_widget_set_margin_bottom(row, 6);
+    GtkWidget *text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_hexpand(text, TRUE);
+    GtkWidget *ttl = gtk_label_new(title);
+    gtk_label_set_xalign(GTK_LABEL(ttl), 0.0f);
+    /* Let the text column shrink instead of pushing switches and buttons
+     * outside the right edge of the security dialog on narrow screens. */
+    gtk_label_set_ellipsize(GTK_LABEL(ttl), PANGO_ELLIPSIZE_END);
+    gtk_label_set_width_chars(GTK_LABEL(ttl), 1);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ttl), "settings-row-title");
+    gtk_box_pack_start(GTK_BOX(text), ttl, FALSE, FALSE, 0);
+    if (desc && *desc) {
+        GtkWidget *d = gtk_label_new(desc);
+        gtk_label_set_xalign(GTK_LABEL(d), 0.0f);
+        gtk_label_set_line_wrap(GTK_LABEL(d), TRUE);
+        gtk_label_set_line_wrap_mode(GTK_LABEL(d), PANGO_WRAP_WORD_CHAR);
+        gtk_label_set_width_chars(GTK_LABEL(d), 1);
+        gtk_label_set_max_width_chars(GTK_LABEL(d), 44);
+        gtk_style_context_add_class(gtk_widget_get_style_context(d), "settings-row-desc");
+        gtk_box_pack_start(GTK_BOX(text), d, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(row), text, TRUE, TRUE, 0);
+    if (control) {
+        gtk_widget_set_valign(control, GTK_ALIGN_CENTER);
+        gtk_box_pack_end(GTK_BOX(row), control, FALSE, FALSE, 0);
+    }
+    return row;
+}
+
+static void combo_append_seconds(GtkComboBoxText *combo, guint seconds, const char *label) {
+    char id[24];
+    snprintf(id, sizeof(id), "%u", seconds);
+    gtk_combo_box_text_append(combo, id, label);
+}
+
+static guint combo_active_seconds(GtkComboBox *combo, guint fallback) {
+    const char *id = gtk_combo_box_get_active_id(combo);
+    if (!id || !*id) return fallback;
+    char *end = NULL;
+    unsigned long n = strtoul(id, &end, 10);
+    if (!end || *end || n > 86400UL) return fallback;
+    return (guint)n;
+}
+
+typedef struct {
+    char *path;
+    char *key;
+    gboolean carrier_checked;
+    char *carrier_path;
+    dev_t carrier_dev;
+    ino_t carrier_ino;
+    off_t carrier_size;
+    struct timespec carrier_mtim;
+} integrity_task_ctx_t;
+
+typedef struct {
+    gboolean opened;
+    gboolean signature_ok;
+    gboolean pqc_encrypted;
+    gboolean policy_ok;
+    gboolean commit_chain;
+    gboolean rollback_ok;
+    gboolean structure_ok;
+    gboolean permissions_ok;
+    gboolean carrier_checked;
+    gboolean carrier_ok;
+    int entry_count;
+    int filter_count;
+    int history_count;
+    uint64_t generation;
+    char *error;
+} integrity_report_t;
+
+static void integrity_task_ctx_free(integrity_task_ctx_t *ctx) {
+    if (!ctx) return;
+    secure_free_string(&ctx->path);
+    secure_free_string(&ctx->key);
+    secure_free_string(&ctx->carrier_path);
+    g_free(ctx);
+}
+
+static void integrity_report_free(integrity_report_t *r) {
+    if (!r) return;
+    secure_free_string(&r->error);
+    g_free(r);
+}
+
+static gboolean integrity_stat_matches(const integrity_task_ctx_t *ctx) {
+    if (!ctx || !ctx->carrier_checked || !ctx->carrier_path) return TRUE;
+    struct stat st;
+    if (lstat(ctx->carrier_path, &st) != 0 || !S_ISREG(st.st_mode)) return FALSE;
+    return st.st_dev == ctx->carrier_dev && st.st_ino == ctx->carrier_ino &&
+        st.st_size == ctx->carrier_size && st.st_mtim.tv_sec == ctx->carrier_mtim.tv_sec &&
+        st.st_mtim.tv_nsec == ctx->carrier_mtim.tv_nsec;
+}
+
+static void integrity_check_worker(GTask *task, gpointer source_object,
+    gpointer task_data, GCancellable *cancellable)
+{
+    (void)source_object; (void)cancellable;
+    integrity_task_ctx_t *ctx = task_data;
+    integrity_report_t *r = g_new0(integrity_report_t, 1);
+    if (!r) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NO_SPACE,
+            "Cannot allocate integrity report");
+        return;
+    }
+
+    struct stat st;
+    if (ctx && ctx->path && lstat(ctx->path, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_uid == getuid() && (st.st_mode & 077) == 0)
+        r->permissions_ok = TRUE;
+
+    r->carrier_checked = ctx ? ctx->carrier_checked : FALSE;
+    r->carrier_ok = integrity_stat_matches(ctx);
+
+    char err[512] = "";
+    db_manager_t *check = (ctx && ctx->path)
+        ? db_manager_open(ctx->path, ctx->key, FALSE, FALSE, err, sizeof(err)) : NULL;
+    if (!check) {
+        r->error = xstrdup(err[0] ? err : "Cannot open database for integrity verification");
+        g_task_return_pointer(task, r, (GDestroyNotify)integrity_report_free);
+        return;
+    }
+
+    r->opened = TRUE;
+    r->signature_ok = check->is_signed;
+    r->pqc_encrypted = check->is_pqc_encrypted;
+    r->policy_ok = !check->require_pqc || check->is_pqc_encrypted;
+    r->commit_chain = check->has_commit_chain;
+    r->rollback_ok = check->has_commit_chain && check->rollback_state_verified;
+    r->entry_count = check->entry_count;
+    r->filter_count = check->filter_count;
+    r->history_count = check->history_count;
+    r->generation = check->generation;
+
+    char structure_err[512] = "";
+    r->structure_ok = db_validate_loaded_integrity(check, structure_err, sizeof(structure_err)) == 0;
+    if (!r->structure_ok)
+        r->error = xstrdup(structure_err[0] ? structure_err : "Database structure verification failed");
+
+    db_manager_clear(check);
+    free(check);
+    g_task_return_pointer(task, r, (GDestroyNotify)integrity_report_free);
+}
+
+static void integrity_check_done(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    GtkWidget *wait = GTK_WIDGET(user_data);
+    GError *err = NULL;
+    integrity_report_t *report = g_task_propagate_pointer(G_TASK(res), &err);
+    if (!report) {
+        report = g_new0(integrity_report_t, 1);
+        if (report) report->error = xstrdup(err ? err->message : "Integrity check failed");
+    }
+    if (err) g_error_free(err);
+    if (report)
+        g_object_set_data_full(G_OBJECT(wait), "integrity-report", report,
+            (GDestroyNotify)integrity_report_free);
+    gtk_dialog_response(GTK_DIALOG(wait), GTK_RESPONSE_OK);
+    g_object_unref(wait);
+}
+
+static void integrity_result_row(GtkBox *box, const char *title,
+    const char *detail, int state)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_margin_top(row, 5);
+    gtk_widget_set_margin_bottom(row, 5);
+    GtkWidget *mark = gtk_label_new(state > 0 ? "✓" : state == 0 ? "⚠" : "✕");
+    gtk_widget_set_valign(mark, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(mark),
+        state > 0 ? "integrity-ok" : state == 0 ? "integrity-warn" : "integrity-bad");
+    gtk_box_pack_start(GTK_BOX(row), mark, FALSE, FALSE, 0);
+    GtkWidget *text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *ttl = gtk_label_new(title);
+    gtk_label_set_xalign(GTK_LABEL(ttl), 0.0f);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ttl), "settings-row-title");
+    gtk_box_pack_start(GTK_BOX(text), ttl, FALSE, FALSE, 0);
+    if (detail && detail[0]) {
+        GtkWidget *d = gtk_label_new(detail);
+        gtk_label_set_xalign(GTK_LABEL(d), 0.0f);
+        gtk_label_set_line_wrap(GTK_LABEL(d), TRUE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(d), "settings-row-desc");
+        gtk_box_pack_start(GTK_BOX(text), d, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(row), text, TRUE, TRUE, 0);
+    gtk_box_pack_start(box, row, FALSE, FALSE, 0);
+}
+
+static void show_integrity_report(GtkWindow *parent, const integrity_report_t *r) {
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("integrity_title"), parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("close"), GTK_RESPONSE_CLOSE, NULL);
+    install_dialog_title(GTK_WINDOW(dlg), i18n("integrity_title"));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 560, -1);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_margin_start(box, 20); gtk_widget_set_margin_end(box, 20);
+    gtk_widget_set_margin_top(box, 14); gtk_widget_set_margin_bottom(box, 10);
+    gtk_box_pack_start(GTK_BOX(area), box, TRUE, TRUE, 0);
+
+    if (!r || !r->opened) {
+        integrity_result_row(GTK_BOX(box), i18n("integrity_container"),
+            r && r->error ? r->error : i18n("integrity_failed"), -1);
+    } else {
+        integrity_result_row(GTK_BOX(box), i18n("integrity_container"),
+            i18n("integrity_container_ok"), 1);
+        integrity_result_row(GTK_BOX(box), i18n("integrity_signature"),
+            r->signature_ok ? i18n("integrity_signature_ok") : i18n("integrity_signature_bad"),
+            r->signature_ok ? 1 : -1);
+        integrity_result_row(GTK_BOX(box), i18n("integrity_pqc"),
+            r->pqc_encrypted ? i18n("integrity_pqc_ok") : i18n("integrity_pqc_legacy"),
+            r->pqc_encrypted ? 1 : (r->policy_ok ? 0 : -1));
+        integrity_result_row(GTK_BOX(box), i18n("integrity_commit"),
+            r->commit_chain ? i18n("integrity_commit_ok") : i18n("integrity_commit_legacy"),
+            r->commit_chain ? 1 : 0);
+        integrity_result_row(GTK_BOX(box), i18n("integrity_rollback"),
+            r->rollback_ok ? i18n("integrity_rollback_ok") : i18n("integrity_rollback_warn"),
+            r->rollback_ok ? 1 : 0);
+        integrity_result_row(GTK_BOX(box), i18n("integrity_structure"),
+            r->structure_ok ? i18n("integrity_structure_ok") :
+                (r->error ? r->error : i18n("integrity_structure_bad")),
+            r->structure_ok ? 1 : -1);
+        integrity_result_row(GTK_BOX(box), i18n("integrity_permissions"),
+            r->permissions_ok ? i18n("integrity_permissions_ok") : i18n("integrity_permissions_warn"),
+            r->permissions_ok ? 1 : 0);
+        if (r->carrier_checked)
+            integrity_result_row(GTK_BOX(box), i18n("integrity_carrier"),
+                r->carrier_ok ? i18n("integrity_carrier_ok") : i18n("integrity_carrier_bad"),
+                r->carrier_ok ? 1 : -1);
+
+        char summary[256];
+        snprintf(summary, sizeof(summary), "Entries: %d · filters: %d · history events: %d · generation: %llu",
+            r->entry_count, r->filter_count, r->history_count,
+            (unsigned long long)r->generation);
+        GtkWidget *sum = gtk_label_new(summary);
+        gtk_label_set_xalign(GTK_LABEL(sum), 0.0f);
+        gtk_widget_set_margin_top(sum, 10);
+        gtk_style_context_add_class(gtk_widget_get_style_context(sum), "settings-note");
+        gtk_box_pack_start(GTK_BOX(box), sum, FALSE, FALSE, 0);
+    }
+    gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+static void on_integrity_check_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    if (!app_has_open_database() || !g_app.current_file) {
+        show_save_error(i18n("integrity_open_required"));
+        return;
+    }
+
+    integrity_task_ctx_t *ctx = g_new0(integrity_task_ctx_t, 1);
+    if (!ctx) { show_save_error("Out of memory"); return; }
+    ctx->path = xstrdup(g_app.current_file);
+    ctx->key = xstrdup(g_app.db->recipient ? g_app.db->recipient : "");
+    if (g_app.mounted_carrier_path && g_app.mounted_carrier_identity_valid) {
+        ctx->carrier_checked = TRUE;
+        ctx->carrier_path = xstrdup(g_app.mounted_carrier_path);
+        ctx->carrier_dev = g_app.mounted_carrier_dev;
+        ctx->carrier_ino = g_app.mounted_carrier_ino;
+        ctx->carrier_size = g_app.mounted_carrier_size;
+        ctx->carrier_mtim = g_app.mounted_carrier_mtim;
+    }
+    if (!ctx->path || !ctx->key || (ctx->carrier_checked && !ctx->carrier_path)) {
+        integrity_task_ctx_free(ctx);
+        show_save_error("Out of memory");
+        return;
+    }
+
+    GtkWindow *parent = g_app.window;
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(btn));
+    if (GTK_IS_WINDOW(top)) parent = GTK_WINDOW(top);
+    GtkWidget *wait = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(wait), parent);
+    gtk_window_set_modal(GTK_WINDOW(wait), TRUE);
+    gtk_window_set_deletable(GTK_WINDOW(wait), FALSE);
+    install_dialog_title(GTK_WINDOW(wait), i18n("integrity_title"));
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(wait));
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(row), 20);
+    GtkWidget *spinner = gtk_spinner_new();
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_box_pack_start(GTK_BOX(row), spinner, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), gtk_label_new(i18n("integrity_running")), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(area), row, TRUE, TRUE, 0);
+    gtk_widget_show_all(wait);
+
+    GTask *task = g_task_new(NULL, NULL, integrity_check_done, g_object_ref(wait));
+    g_task_set_task_data(task, ctx, (GDestroyNotify)integrity_task_ctx_free);
+    g_task_run_in_thread(task, integrity_check_worker);
+    g_object_unref(task);
+    gtk_dialog_run(GTK_DIALOG(wait));
+    integrity_report_t *report = g_object_steal_data(G_OBJECT(wait), "integrity-report");
+    gtk_widget_destroy(wait);
+    show_integrity_report(parent, report);
+    integrity_report_free(report);
+}
+
+static const char *history_action_label(const char *action) {
+    if (!action) return i18n("history_action_unknown");
+    if (strcmp(action, "database_created") == 0) return i18n("history_action_database_created");
+    if (strcmp(action, "entry_added") == 0) return i18n("history_action_entry_added");
+    if (strcmp(action, "entry_updated") == 0) return i18n("history_action_entry_updated");
+    if (strcmp(action, "entry_removed") == 0) return i18n("history_action_entry_removed");
+    if (strcmp(action, "snapshot_updated") == 0) return i18n("history_action_snapshot_updated");
+    if (strcmp(action, "smart_updated") == 0) return i18n("history_action_smart_updated");
+    if (strcmp(action, "filter_added") == 0) return i18n("history_action_filter_added");
+    if (strcmp(action, "filter_removed") == 0) return i18n("history_action_filter_removed");
+    if (strcmp(action, "key_changed") == 0) return i18n("history_action_key_changed");
+    if (strcmp(action, "batch_snapshot") == 0) return i18n("history_action_batch_snapshot");
+    return i18n("history_action_unknown");
+}
+
+static void on_history_clicked(GtkButton *btn, gpointer user_data) {
+    (void)user_data;
+    if (!app_has_open_database()) {
+        show_save_error(i18n("history_open_required"));
+        return;
+    }
+    GtkWindow *parent = g_app.window;
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(btn));
+    if (GTK_IS_WINDOW(top)) parent = GTK_WINDOW(top);
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("history_title"), parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("close"), GTK_RESPONSE_CLOSE, NULL);
+    install_dialog_title(GTK_WINDOW(dlg), i18n("history_title"));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 640, 500);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(outer, 16); gtk_widget_set_margin_end(outer, 16);
+    gtk_widget_set_margin_top(outer, 12); gtk_widget_set_margin_bottom(outer, 10);
+    gtk_box_pack_start(GTK_BOX(area), outer, TRUE, TRUE, 0);
+
+    char head[128];
+    snprintf(head, sizeof(head), "Stored history events: %d / %d",
+        g_app.db->history_count, DB_MAX_HISTORY);
+    GtkWidget *headline = gtk_label_new(head);
+    gtk_label_set_xalign(GTK_LABEL(headline), 0.0f);
+    gtk_style_context_add_class(gtk_widget_get_style_context(headline), "settings-row-desc");
+    gtk_box_pack_start(GTK_BOX(outer), headline, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(sw, TRUE);
+    GtkWidget *list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(sw), list);
+    gtk_box_pack_start(GTK_BOX(outer), sw, TRUE, TRUE, 0);
+
+    if (g_app.db->history_count == 0) {
+        GtkWidget *empty = gtk_label_new(i18n("history_empty"));
+        gtk_widget_set_margin_top(empty, 24);
+        gtk_widget_set_margin_bottom(empty, 24);
+        gtk_container_add(GTK_CONTAINER(list), empty);
+    } else {
+        for (int i = g_app.db->history_count - 1; i >= 0; i--) {
+            const db_history_event_t *ev = &g_app.db->history[i];
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *rb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+            gtk_widget_set_margin_start(rb, 10); gtk_widget_set_margin_end(rb, 10);
+            gtk_widget_set_margin_top(rb, 8); gtk_widget_set_margin_bottom(rb, 8);
+            GtkWidget *title = gtk_label_new(history_action_label(ev->action));
+            gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
+            gtk_style_context_add_class(gtk_widget_get_style_context(title), "settings-row-title");
+            gtk_box_pack_start(GTK_BOX(rb), title, FALSE, FALSE, 0);
+
+            if (ev->target && ev->target[0]) {
+                char *target = g_strdup_printf("%s %s", i18n("history_target"), ev->target);
+                GtkWidget *t = gtk_label_new(target ? target : ev->target);
+                g_free(target);
+                gtk_label_set_xalign(GTK_LABEL(t), 0.0f);
+                gtk_label_set_ellipsize(GTK_LABEL(t), PANGO_ELLIPSIZE_MIDDLE);
+                gtk_style_context_add_class(gtk_widget_get_style_context(t), "settings-row-desc");
+                gtk_box_pack_start(GTK_BOX(rb), t, FALSE, FALSE, 0);
+            }
+
+            char timebuf[64] = "";
+            time_t ts = (time_t)ev->timestamp;
+            struct tm tmv;
+            if (localtime_r(&ts, &tmv)) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tmv);
+            char meta[160];
+            snprintf(meta, sizeof(meta), "%s · generation %llu",
+                timebuf[0] ? timebuf : "?", (unsigned long long)ev->generation);
+            GtkWidget *m = gtk_label_new(meta);
+            gtk_label_set_xalign(GTK_LABEL(m), 0.0f);
+            gtk_style_context_add_class(gtk_widget_get_style_context(m), "settings-row-desc");
+            gtk_box_pack_start(GTK_BOX(rb), m, FALSE, FALSE, 0);
+            gtk_container_add(GTK_CONTAINER(row), rb);
+            gtk_container_add(GTK_CONTAINER(list), row);
+        }
+    }
+
+    GtkWidget *note = gtk_label_new(i18n("history_note"));
+    gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(note), "settings-note");
+    gtk_box_pack_start(GTK_BOX(outer), note, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+/* Switching windows must not start a nested gtk_main() from an idle
+ * handler: that can leave the main application apparently unresponsive. */
+static void camouflage_calculator_finished(gboolean unlocked, gpointer user_data) {
+    (void)user_data;
+    if (!unlocked) {
+        gtk_main_quit();
+        return;
+    }
+    g_app.camouflage_key_valid = TRUE;
+    if (!load_config()) {
+        g_warning("DiskPass: protected configuration failed authentication");
+        sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+        g_app.camouflage_key_valid = FALSE;
+        gtk_main_quit();
+        return;
+    }
+    /* The real DiskPass window and launcher are visible again only while the
+     * DiskPass interface is on screen. Calculator mode remains configured for
+     * the next application start. */
+    if (!diskpass_sync_launcher_icon(FALSE))
+        g_warning("DiskPass: could not restore launcher icon");
+    gtk_window_set_icon_name(g_app.window, "diskpass");
+    gtk_window_set_title(g_app.window, "DiskPass");
+    if (!gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "diskpass") && icon_pb)
+        gtk_window_set_icon(g_app.window, icon_pb);
+    gtk_widget_show(GTK_WIDGET(g_app.window));
+    gtk_window_present(g_app.window);
+}
+
+/* Run only after the settings dialog has been destroyed. The database is
+ * locked and both clipboards are cleared before the first calculator frame. */
+static gboolean camouflage_activate_idle(gpointer user_data) {
+    (void)user_data;
+    if (!g_app.camouflage_enabled || !g_app.window) return G_SOURCE_REMOVE;
+    on_lock_clicked(NULL, NULL);
+    gtk_widget_hide(GTK_WIDGET(g_app.window));
+    if (!diskpass_calculator_show_async(g_app.camouflage_hash,
+            g_app.camouflage_salt, g_app.camouflage_config_key,
+            camouflage_calculator_finished, NULL)) {
+        /* If the calculator cannot be shown, do not leave DiskPass hidden. */
+        g_warning("DiskPass: calculator window could not be opened");
+        gtk_widget_show(GTK_WIDGET(g_app.window));
+        gtk_window_present(g_app.window);
+        (void)diskpass_sync_launcher_icon(FALSE);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean camouflage_valid_pin(const char *pin) {
+    gsize len = pin ? strlen(pin) : 0;
+    if (len < 8 || len > 32) return FALSE;
+    for (gsize i = 0; i < len; i++)
+        if (!g_ascii_isdigit(pin[i])) return FALSE;
+    return TRUE;
+}
+
+static void camouflage_show_error(GtkWindow *parent, const char *message) {
+    GtkWidget *alert = gtk_message_dialog_new(parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", message);
+    gtk_dialog_run(GTK_DIALOG(alert));
+    gtk_widget_destroy(alert);
+}
+
+/* The access code is collected only when the calculator switch is turned on.
+ * Keep its hash temporary until the parent Settings dialog is saved. */
+typedef struct {
+    GtkWindow *settings_window;
+    char pending_hash[crypto_pwhash_STRBYTES];
+    unsigned char pending_salt[crypto_pwhash_SALTBYTES];
+    unsigned char pending_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    gboolean asking;
+} camouflage_switch_ctx_t;
+
+static gboolean camouflage_ask_new_pin(GtkWindow *parent,
+                                       char out_hash[crypto_pwhash_STRBYTES],
+                                       unsigned char out_salt[crypto_pwhash_SALTBYTES],
+                                       unsigned char out_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES]) {
+    GtkWidget *dlg = gtk_dialog_new_with_buttons("Код доступа к DiskPass", parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("cancel"), GTK_RESPONSE_CANCEL,
+        "Установить код", GTK_RESPONSE_ACCEPT, NULL);
+    install_dialog_title(GTK_WINDOW(dlg), "Код доступа к DiskPass");
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 430, 250);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    GtkWidget *fields = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(content), fields, TRUE, TRUE, 0);
+
+    GtkWidget *explanation = gtk_label_new(
+        "Задайте отдельный код из 8–32 цифр. В калькуляторе введите его и нажмите =, чтобы открыть DiskPass.");
+    gtk_label_set_xalign(GTK_LABEL(explanation), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(explanation), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(explanation), 45);
+    gtk_box_pack_start(GTK_BOX(fields), explanation, FALSE, FALSE, 0);
+
+    GtkWidget *pin_label = gtk_label_new("Новый код");
+    gtk_label_set_xalign(GTK_LABEL(pin_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(fields), pin_label, FALSE, FALSE, 0);
+    GtkWidget *pin = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(pin), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(pin), GTK_INPUT_PURPOSE_PIN);
+    gtk_entry_set_max_length(GTK_ENTRY(pin), 32);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pin), "8–32 цифры");
+    gtk_box_pack_start(GTK_BOX(fields), pin, FALSE, FALSE, 0);
+
+    GtkWidget *confirm_label = gtk_label_new("Подтвердите код");
+    gtk_label_set_xalign(GTK_LABEL(confirm_label), 0.0f);
+    gtk_box_pack_start(GTK_BOX(fields), confirm_label, FALSE, FALSE, 0);
+    GtkWidget *confirm = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(confirm), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(confirm), GTK_INPUT_PURPOSE_PIN);
+    gtk_entry_set_max_length(GTK_ENTRY(confirm), 32);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(confirm), "Повторите код");
+    gtk_box_pack_start(GTK_BOX(fields), confirm, FALSE, FALSE, 0);
+
+    gboolean succeeded = FALSE;
+    gtk_widget_show_all(dlg);
+    gtk_widget_grab_focus(pin);
+    while (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        const char *first = gtk_entry_get_text(GTK_ENTRY(pin));
+        const char *second = gtk_entry_get_text(GTK_ENTRY(confirm));
+        size_t len = strlen(first);
+        if (!camouflage_valid_pin(first) || len != strlen(second) ||
+            sodium_memcmp(first, second, len) != 0) {
+            camouflage_show_error(GTK_WINDOW(dlg),
+                "Коды должны совпадать и содержать от 8 до 32 цифр.");
+            gtk_widget_grab_focus(pin);
+            continue;
+        }
+        char hash[crypto_pwhash_STRBYTES] = {0};
+        if (crypto_pwhash_str(hash, first, (unsigned long long)len,
+                crypto_pwhash_OPSLIMIT_MODERATE,
+                crypto_pwhash_MEMLIMIT_MODERATE) != 0) {
+            camouflage_show_error(GTK_WINDOW(dlg), "Не удалось защитить секретный код.");
+            sodium_memzero(hash, sizeof(hash));
+            continue;
+        }
+        randombytes_buf(out_salt, crypto_pwhash_SALTBYTES);
+        if (crypto_pwhash(out_key, crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+                first, (unsigned long long)len, out_salt,
+                crypto_pwhash_OPSLIMIT_MODERATE,
+                crypto_pwhash_MEMLIMIT_MODERATE,
+                crypto_pwhash_ALG_ARGON2ID13) != 0) {
+            camouflage_show_error(GTK_WINDOW(dlg), "Не удалось получить ключ шифрования настроек.");
+            sodium_memzero(hash, sizeof(hash));
+            sodium_memzero(out_salt, crypto_pwhash_SALTBYTES);
+            sodium_memzero(out_key, crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
+            continue;
+        }
+        memcpy(out_hash, hash, sizeof(hash));
+        sodium_memzero(hash, sizeof(hash));
+        succeeded = TRUE;
+        break;
+    }
+    /* Clear both GTK buffers before destroying the transient dialog. */
+    gtk_entry_set_text(GTK_ENTRY(pin), "");
+    gtk_entry_set_text(GTK_ENTRY(confirm), "");
+    gtk_widget_destroy(dlg);
+    return succeeded;
+}
+
+static void camouflage_switch_changed(GObject *object, GParamSpec *pspec,
+                                      gpointer user_data) {
+    (void)pspec;
+    camouflage_switch_ctx_t *ctx = user_data;
+    if (ctx->asking) return;
+
+    GtkSwitch *sw = GTK_SWITCH(object);
+    if (!gtk_switch_get_active(sw)) {
+        sodium_memzero(ctx->pending_hash, sizeof(ctx->pending_hash));
+        sodium_memzero(ctx->pending_salt, sizeof(ctx->pending_salt));
+        sodium_memzero(ctx->pending_key, sizeof(ctx->pending_key));
+        return;
+    }
+
+    ctx->asking = TRUE;
+    sodium_memzero(ctx->pending_hash, sizeof(ctx->pending_hash));
+    sodium_memzero(ctx->pending_salt, sizeof(ctx->pending_salt));
+    sodium_memzero(ctx->pending_key, sizeof(ctx->pending_key));
+    gboolean ok = camouflage_ask_new_pin(ctx->settings_window, ctx->pending_hash,
+                                          ctx->pending_salt, ctx->pending_key);
+    ctx->asking = FALSE;
+    if (!ok) {
+        /* Cancelling the code dialog must not enable calculator mode. */
+        sodium_memzero(ctx->pending_hash, sizeof(ctx->pending_hash));
+        sodium_memzero(ctx->pending_salt, sizeof(ctx->pending_salt));
+        sodium_memzero(ctx->pending_key, sizeof(ctx->pending_key));
+        gtk_switch_set_active(sw, FALSE);
+    }
+}
+
+static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("security_settings"), g_app.window,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("cancel"), GTK_RESPONSE_CANCEL,
+        i18n("save"), GTK_RESPONSE_ACCEPT, NULL);
+    install_dialog_title(GTK_WINDOW(dlg), i18n("security_settings"));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 670, 620);
+    gtk_window_set_resizable(GTK_WINDOW(dlg), TRUE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
+
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(area), 12);
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(area), scroll, TRUE, TRUE, 0);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(scroll), box);
+
+    GtkWidget *screen_sw = gtk_switch_new();
+    gtk_switch_set_active(GTK_SWITCH(screen_sw), g_app.screenshot_guard);
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("screenshot_guard"),
+        i18n("screenshot_guard_desc"), screen_sw), FALSE, FALSE, 0);
+
+    GtkWidget *focus_sw = gtk_switch_new();
+    gtk_switch_set_active(GTK_SWITCH(focus_sw), g_app.lock_on_focus_loss);
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("lock_on_focus_loss"),
+        i18n("lock_on_focus_loss_desc"), focus_sw), FALSE, FALSE, 0);
+
+    GtkWidget *camouflage_sw = gtk_switch_new();
+    camouflage_switch_ctx_t camouflage_ctx = { .settings_window = GTK_WINDOW(dlg) };
+    /* Set the initial value before connecting so reopening Settings does not
+     * trigger a password prompt. Each later OFF -> ON change does. */
+    gtk_switch_set_active(GTK_SWITCH(camouflage_sw), g_app.camouflage_enabled);
+    g_signal_connect(camouflage_sw, "notify::active",
+        G_CALLBACK(camouflage_switch_changed), &camouflage_ctx);
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new("Режим калькулятора",
+        "При включении задаётся код. Настройки шифруются этим кодом; ярлык скрывается только из меню GNOME.",
+        camouflage_sw), FALSE, FALSE, 0);
+
+    GtkWidget *autolock = gtk_combo_box_text_new();
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 0, i18n("never"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 60, i18n("one_minute"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 120, i18n("two_minutes"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 300, i18n("five_minutes"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 600, i18n("ten_minutes"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 900, i18n("fifteen_minutes"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(autolock), 1800, i18n("thirty_minutes"));
+    char aid[24]; snprintf(aid, sizeof(aid), "%u", g_app.autolock_seconds);
+    if (!gtk_combo_box_set_active_id(GTK_COMBO_BOX(autolock), aid))
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(autolock), "300");
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("autolock_timeout"),
+        i18n("autolock_timeout_desc"), autolock), FALSE, FALSE, 0);
+
+    GtkWidget *clip = gtk_combo_box_text_new();
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(clip), 15, i18n("fifteen_seconds"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(clip), 30, i18n("thirty_seconds"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(clip), 60, i18n("one_minute"));
+    combo_append_seconds(GTK_COMBO_BOX_TEXT(clip), 120, i18n("two_minutes"));
+    char cid[24]; snprintf(cid, sizeof(cid), "%u", g_app.clipboard_clear_seconds);
+    if (!gtk_combo_box_set_active_id(GTK_COMBO_BOX(clip), cid))
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(clip), "30");
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("clipboard_timeout"),
+        i18n("clipboard_timeout_desc"), clip), FALSE, FALSE, 0);
+
+    GtkWidget *always = gtk_label_new(i18n("always_on"));
+    gtk_style_context_add_class(gtk_widget_get_style_context(always), "settings-always-on");
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("system_lock_protection"),
+        i18n("system_lock_protection_desc"), always), FALSE, FALSE, 0);
+
+    GtkWidget *tools_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_margin_top(tools_sep, 10); gtk_widget_set_margin_bottom(tools_sep, 4);
+    gtk_box_pack_start(GTK_BOX(box), tools_sep, FALSE, FALSE, 0);
+
+    GtkWidget *integrity_btn = gtk_button_new_with_label(i18n("check_now"));
+    gtk_widget_set_sensitive(integrity_btn, app_has_open_database());
+    g_signal_connect(integrity_btn, "clicked", G_CALLBACK(on_integrity_check_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("integrity_check"),
+        i18n("integrity_check_desc"), integrity_btn), FALSE, FALSE, 0);
+
+    GtkWidget *history_btn = gtk_button_new_with_label(i18n("open_history"));
+    gtk_widget_set_sensitive(history_btn, app_has_open_database());
+    g_signal_connect(history_btn, "clicked", G_CALLBACK(on_history_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(box), settings_row_new(i18n("change_history"),
+        i18n("change_history_desc"), history_btn), FALSE, FALSE, 0);
+
+    GtkWidget *note = gtk_label_new(i18n("screenshot_guard_note"));
+    gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+    gtk_widget_set_margin_top(note, 8);
+    gtk_style_context_add_class(gtk_widget_get_style_context(note), "settings-note");
+    gtk_box_pack_start(GTK_BOX(box), note, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dlg);
+    gboolean accepted = FALSE;
+    while (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        gboolean enable_camouflage = gtk_switch_get_active(GTK_SWITCH(camouflage_sw));
+        if (enable_camouflage && !g_app.camouflage_hash[0] &&
+            !camouflage_ctx.pending_hash[0]) {
+            camouflage_show_error(GTK_WINDOW(dlg),
+                "Для включения режима калькулятора необходимо задать код доступа.");
+            continue;
+        }
+        /* Keep previous state so a failed write never enables an unusable mode. */
+        gboolean old_enabled = g_app.camouflage_enabled;
+        gboolean old_key_valid = g_app.camouflage_key_valid;
+        char old_hash[crypto_pwhash_STRBYTES];
+        unsigned char old_salt[crypto_pwhash_SALTBYTES];
+        unsigned char old_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+        memcpy(old_hash, g_app.camouflage_hash, sizeof(old_hash));
+        memcpy(old_salt, g_app.camouflage_salt, sizeof(old_salt));
+        memcpy(old_key, g_app.camouflage_config_key, sizeof(old_key));
+        if (enable_camouflage && camouflage_ctx.pending_hash[0]) {
+            memcpy(g_app.camouflage_hash, camouflage_ctx.pending_hash,
+                   sizeof(g_app.camouflage_hash));
+            memcpy(g_app.camouflage_salt, camouflage_ctx.pending_salt,
+                   sizeof(g_app.camouflage_salt));
+            memcpy(g_app.camouflage_config_key, camouflage_ctx.pending_key,
+                   sizeof(g_app.camouflage_config_key));
+            g_app.camouflage_key_valid = TRUE;
+        }
+        g_app.camouflage_enabled = enable_camouflage;
+        g_app.screenshot_guard = gtk_switch_get_active(GTK_SWITCH(screen_sw));
+        g_app.lock_on_focus_loss = gtk_switch_get_active(GTK_SWITCH(focus_sw));
+        g_app.autolock_seconds = combo_active_seconds(GTK_COMBO_BOX(autolock), 300);
+        g_app.clipboard_clear_seconds = combo_active_seconds(GTK_COMBO_BOX(clip), 30);
+        if (!save_config()) {
+            g_app.camouflage_enabled = old_enabled;
+            memcpy(g_app.camouflage_hash, old_hash, sizeof(old_hash));
+            memcpy(g_app.camouflage_salt, old_salt, sizeof(old_salt));
+            memcpy(g_app.camouflage_config_key, old_key, sizeof(old_key));
+            g_app.camouflage_key_valid = old_key_valid;
+            camouflage_show_error(GTK_WINDOW(dlg),
+                "Не удалось безопасно сохранить настройки. Режим не изменён.");
+            sodium_memzero(old_hash, sizeof(old_hash));
+            sodium_memzero(old_salt, sizeof(old_salt));
+            sodium_memzero(old_key, sizeof(old_key));
+            continue;
+        }
+        sodium_memzero(old_hash, sizeof(old_hash));
+        sodium_memzero(old_salt, sizeof(old_salt));
+        sodium_memzero(old_key, sizeof(old_key));
+        if (!enable_camouflage) {
+            sodium_memzero(g_app.camouflage_hash, sizeof(g_app.camouflage_hash));
+            sodium_memzero(g_app.camouflage_salt, sizeof(g_app.camouflage_salt));
+            sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+            g_app.camouflage_key_valid = FALSE;
+        }
+        if (!g_app.screenshot_guard) privacy_shield_set(FALSE);
+        reset_autolock();
+        if (!diskpass_sync_launcher_icon(g_app.camouflage_enabled))
+            g_warning("DiskPass: could not update user launcher icon");
+        accepted = TRUE;
+        break;
+    }
+    sodium_memzero(camouflage_ctx.pending_hash, sizeof(camouflage_ctx.pending_hash));
+    sodium_memzero(camouflage_ctx.pending_salt, sizeof(camouflage_ctx.pending_salt));
+    sodium_memzero(camouflage_ctx.pending_key, sizeof(camouflage_ctx.pending_key));
+    gtk_widget_destroy(dlg);
+    if (accepted && g_app.camouflage_enabled)
+        g_idle_add(camouflage_activate_idle, NULL);
+}
+
 static void on_schema_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database()) return;
     GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("schema_title"), g_app.window, GTK_DIALOG_MODAL, i18n("close"), GTK_RESPONSE_CLOSE, NULL);
     gtk_window_set_default_size(GTK_WINDOW(dlg), 460, 440);
     install_dialog_title(GTK_WINDOW(dlg), i18n("schema_title"));
@@ -2104,88 +4197,186 @@ static void on_schema_clicked(GtkButton *btn, gpointer user_data) {
     gtk_widget_destroy(dlg);
 }
 
+typedef struct {
+    int idx;
+    char *entry_label;
+    char *folder;
+    GtkWidget *wait;
+} snapshot_task_ctx_t;
+
+typedef struct {
+    char *files;
+    char *smart;
+    char *uuid;
+} snapshot_task_result_t;
+
+static void snapshot_task_ctx_free(gpointer data) {
+    snapshot_task_ctx_t *ctx = data;
+    if (!ctx) return;
+    secure_free_string(&ctx->entry_label);
+    secure_g_free_string(&ctx->folder);
+    g_free(ctx);
+}
+
+static void snapshot_task_result_free(gpointer data) {
+    snapshot_task_result_t *r = data;
+    if (!r) return;
+    secure_g_free_string(&r->files);
+    secure_free_string(&r->smart);
+    secure_free_string(&r->uuid);
+    g_free(r);
+}
+
+static void snapshot_scan_worker(GTask *task, gpointer source_object,
+    gpointer task_data, GCancellable *cancellable)
+{
+    (void)source_object;
+    snapshot_task_ctx_t *ctx = task_data;
+    if (!ctx || (cancellable && g_cancellable_is_cancelled(cancellable))) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Snapshot scan cancelled");
+        return;
+    }
+
+    snapshot_task_result_t *r = g_new0(snapshot_task_result_t, 1);
+    r->files = scan_directory_recursive(ctx->folder);
+    if (!cancellable || !g_cancellable_is_cancelled(cancellable))
+        r->smart = collect_smart_data(ctx->folder);
+    if (!cancellable || !g_cancellable_is_cancelled(cancellable))
+        r->uuid = get_uuid_for_path(ctx->folder);
+
+    if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+        snapshot_task_result_free(r);
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Snapshot scan cancelled");
+        return;
+    }
+    g_task_return_pointer(task, r, snapshot_task_result_free);
+}
+
+static void snapshot_scan_done(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GTask *task = G_TASK(res);
+    snapshot_task_ctx_t *ctx = g_task_get_task_data(task);
+    GError *task_err = NULL;
+    snapshot_task_result_t *r = g_task_propagate_pointer(task, &task_err);
+
+    if (ctx && ctx->wait && GTK_IS_WIDGET(ctx->wait)) {
+        gtk_widget_destroy(ctx->wait);
+        ctx->wait = NULL;
+    }
+    if (task_err) {
+        if (task_err->code != G_IO_ERROR_CANCELLED)
+            show_save_error(task_err->message);
+        g_error_free(task_err);
+        return;
+    }
+    if (!ctx || !r || !app_has_open_database() || ctx->idx < 0 || ctx->idx >= g_app.db->entry_count) {
+        snapshot_task_result_free(r);
+        return;
+    }
+
+    db_entry_t *e = &g_app.db->entries[ctx->idx];
+    if (!e->label || strcmp(e->label, ctx->entry_label) != 0) {
+        snapshot_task_result_free(r);
+        show_save_error("The selected database entry changed while scanning");
+        return;
+    }
+
+    char err_buf[256] = "";
+    char *old_uuid = NULL;
+    gboolean uuid_changed = FALSE;
+    if ((!e->uuid || !e->uuid[0]) && r->uuid && r->uuid[0]) {
+        old_uuid = e->uuid;
+        e->uuid = xstrdup(r->uuid);
+        uuid_changed = TRUE;
+    }
+
+    if (db_set_entry_snapshot(g_app.db, ctx->entry_label, r->files, r->smart,
+            err_buf, sizeof(err_buf)) == 0) {
+        if (uuid_changed) secure_free_string(&old_uuid);
+        char msg[512];
+        char health_buf[32] = "";
+        if (r->smart) {
+            cJSON *smart = cJSON_Parse(r->smart);
+            if (smart) {
+                cJSON *h = cJSON_GetObjectItem(smart, "health");
+                if (h && cJSON_IsString(h))
+                    snprintf(health_buf, sizeof(health_buf), "%s", h->valuestring);
+                cJSON_Delete(smart);
+            }
+        }
+        int indexed_count = e->file_count;
+        if (health_buf[0])
+            snprintf(msg, sizeof(msg), "%s: %d · SMART %s",
+                i18n("indexed_files"), indexed_count, health_buf);
+        else
+            snprintf(msg, sizeof(msg), "%s: %d · %s",
+                i18n("indexed_files"), indexed_count, i18n("smart_unavailable"));
+
+        GtkWidget *info = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
+        gtk_dialog_run(GTK_DIALOG(info));
+        gtk_widget_destroy(info);
+    } else {
+        if (uuid_changed) {
+            secure_free_string(&e->uuid);
+            e->uuid = old_uuid;
+            old_uuid = NULL;
+        }
+        secure_free_string(&old_uuid);
+        show_save_error(err_buf);
+    }
+
+    snapshot_task_result_free(r);
+    g_app.current_entry_idx = -1;
+    refresh_entry_list();
+    GtkListBoxRow *new_row = gtk_list_box_get_row_at_index(g_app.listbox, ctx->idx);
+    if (new_row) gtk_list_box_select_row(g_app.listbox, new_row);
+}
+
 static void on_attach_snapshot_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)btn; (void)user_data;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
     GtkListBoxRow *row = gtk_list_box_get_selected_row(g_app.listbox);
     if (!row) return;
     int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "entry_idx"));
     if (idx < 0 || idx >= g_app.db->entry_count) return;
-    db_entry_t *e = &g_app.db->entries[idx];
-    char *entry_label = xstrdup(e->label);
 
     GtkWidget *dlg = gtk_file_chooser_dialog_new(
         i18n("snapshot_title"), g_app.window, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
         i18n("cancel"), GTK_RESPONSE_CANCEL,
         i18n("scan"), GTK_RESPONSE_OK, NULL);
 
-    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
-        gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-
-        GtkWidget *wait = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
-            GTK_MESSAGE_INFO, GTK_BUTTONS_NONE, "%s", i18n("scanning"));
-        gtk_widget_show_all(wait);
-        while (gtk_events_pending()) gtk_main_iteration();
-
-        char *files = scan_directory_recursive(folder);
-        char *smart_json = collect_smart_data(folder);
-        gtk_widget_destroy(wait);
-
-        char err_buf[256] = "";
-        if (g_app.db && db_set_entry_snapshot(g_app.db, entry_label, files, smart_json, err_buf, sizeof(err_buf)) == 0) {
-            char msg[512];
-            char health_buf[32] = "";
-            if (smart_json) {
-                cJSON *s = cJSON_Parse(smart_json);
-                if (s) {
-                    cJSON *h = cJSON_GetObjectItem(s, "health");
-                    if (h && cJSON_IsString(h))
-                        snprintf(health_buf, sizeof(health_buf), "%s", h->valuestring);
-                    cJSON_Delete(s);
-                }
-            }
-            if (health_buf[0])
-                snprintf(msg, sizeof(msg), "%s: %d · SMART %s",
-                    i18n("indexed_files"), count_lines(files), health_buf);
-            else
-                snprintf(msg, sizeof(msg), "%s: %d · %s",
-                    i18n("indexed_files"), count_lines(files),
-                    i18n("smart_unavailable"));
-
-            e = (g_app.db && idx >= 0 && idx < g_app.db->entry_count) ? &g_app.db->entries[idx] : NULL;
-            if (e && (!e->uuid || !e->uuid[0])) {
-                char *detected = get_uuid_for_path(folder);
-                if (detected && detected[0]) {
-                    char *old_uuid = e->uuid;
-                    e->uuid = xstrdup(detected);
-                    if (db_save(g_app.db, err_buf, sizeof(err_buf)) != 0) {
-                        secure_free_string(&e->uuid);
-                        e->uuid = old_uuid;
-                        show_save_error(err_buf);
-                    } else {
-                        secure_free_string(&old_uuid);
-                    }
-                }
-                secure_free_string(&detected);
-            }
-
-            GtkWidget *info = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
-                GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
-            gtk_dialog_run(GTK_DIALOG(info));
-            gtk_widget_destroy(info);
-        } else {
-            show_save_error(err_buf);
-        }
-        secure_g_free_string(&files);
-        secure_free_string(&smart_json);
-        g_free(folder);
-        g_app.current_entry_idx = -1;
-        refresh_entry_list();
-        GtkListBoxRow *new_row = gtk_list_box_get_row_at_index(g_app.listbox, idx);
-        if (new_row) gtk_list_box_select_row(g_app.listbox, new_row);
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) != GTK_RESPONSE_OK) {
+        gtk_widget_destroy(dlg);
+        return;
     }
+
+    gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+    char *entry_label = xstrdup(g_app.db->entries[idx].label);
     gtk_widget_destroy(dlg);
-    secure_free_string(&entry_label);
+    if (!folder || !entry_label) {
+        secure_g_free_string(&folder);
+        secure_free_string(&entry_label);
+        show_save_error("Unable to allocate snapshot task");
+        return;
+    }
+
+    GtkWidget *wait = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_NONE, "%s", i18n("scanning"));
+    gtk_window_set_deletable(GTK_WINDOW(wait), FALSE);
+    gtk_widget_show_all(wait);
+
+    snapshot_task_ctx_t *ctx = g_new0(snapshot_task_ctx_t, 1);
+    ctx->idx = idx;
+    ctx->entry_label = entry_label;
+    ctx->folder = folder;
+    ctx->wait = wait;
+
+    GTask *task = g_task_new(NULL, NULL, snapshot_scan_done, NULL);
+    g_task_set_task_data(task, ctx, snapshot_task_ctx_free);
+    g_task_run_in_thread(task, snapshot_scan_worker);
+    g_object_unref(task);
 }
 
 static gboolean block_close(GtkWidget *w, GdkEvent *e, gpointer u) {
@@ -2193,13 +4384,238 @@ static gboolean block_close(GtkWidget *w, GdkEvent *e, gpointer u) {
     return TRUE;
 }
 
-static void on_batch_reindex_clicked(GtkButton *btn, gpointer user_data) {
-    (void)btn; (void)user_data;
-    if (!g_app.db) return;
+typedef struct {
+    int entry_idx;
+    char *label;
+    char *uuid;
+} batch_scan_job_t;
 
-    int total_done = 0;
-    int total_skip = 0;
-    int total_err = 0;
+typedef struct {
+    int entry_idx;
+    char *label;
+    char *files;
+    char *smart;
+    gboolean skipped;
+    gboolean failed;
+} batch_scan_item_t;
+
+typedef struct {
+    int count;
+    batch_scan_item_t *items;
+} batch_scan_result_t;
+
+typedef struct {
+    GtkWidget *dlg;
+    GtkWidget *prog;
+    GtkWidget *lbl;
+    gulong block_close_handler_id;
+    guint pulse_id;
+    int job_count;
+    batch_scan_job_t *jobs;
+} batch_task_ctx_t;
+
+static void batch_task_ctx_free(gpointer data) {
+    batch_task_ctx_t *ctx = data;
+    if (!ctx) return;
+    for (int i = 0; i < ctx->job_count; i++) {
+        secure_free_string(&ctx->jobs[i].label);
+        secure_free_string(&ctx->jobs[i].uuid);
+    }
+    free(ctx->jobs);
+    g_free(ctx);
+}
+
+static void batch_scan_result_free(gpointer data) {
+    batch_scan_result_t *r = data;
+    if (!r) return;
+    for (int i = 0; i < r->count; i++) {
+        secure_free_string(&r->items[i].label);
+        secure_g_free_string(&r->items[i].files);
+        secure_free_string(&r->items[i].smart);
+    }
+    free(r->items);
+    g_free(r);
+}
+
+static gboolean batch_progress_pulse(gpointer data) {
+    batch_task_ctx_t *ctx = data;
+    if (!ctx || !ctx->prog || !GTK_IS_PROGRESS_BAR(ctx->prog)) return G_SOURCE_REMOVE;
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(ctx->prog));
+    return G_SOURCE_CONTINUE;
+}
+
+static void batch_scan_worker(GTask *task, gpointer source_object,
+    gpointer task_data, GCancellable *cancellable)
+{
+    (void)source_object;
+    batch_task_ctx_t *ctx = task_data;
+    if (!ctx) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "Batch task is missing context");
+        return;
+    }
+
+    int nd = 0;
+    disk_info_t *disks = list_disks(&nd);
+    batch_scan_result_t *result = g_new0(batch_scan_result_t, 1);
+    result->count = ctx->job_count;
+    result->items = calloc((size_t)result->count, sizeof(*result->items));
+    if (!result->items) {
+        free_disk_list(disks, nd);
+        g_free(result);
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NO_SPACE, "Out of memory while scanning disks");
+        return;
+    }
+
+    for (int i = 0; i < ctx->job_count; i++) {
+        if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+            free_disk_list(disks, nd);
+            batch_scan_result_free(result);
+            g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Batch scan cancelled");
+            return;
+        }
+
+        batch_scan_item_t *item = &result->items[i];
+        batch_scan_job_t *job = &ctx->jobs[i];
+        item->entry_idx = job->entry_idx;
+        item->label = xstrdup(job->label);
+
+        const char *mp = NULL;
+        for (int k = 0; k < nd; k++) {
+            if (disks[k].uuid && strcmp(disks[k].uuid, job->uuid) == 0 && disks[k].mountpoint) {
+                mp = disks[k].mountpoint;
+                break;
+            }
+        }
+        if (!mp) {
+            item->skipped = TRUE;
+            continue;
+        }
+
+        item->files = scan_directory_recursive(mp);
+        if (!item->files) {
+            item->failed = TRUE;
+            continue;
+        }
+        if (!cancellable || !g_cancellable_is_cancelled(cancellable))
+            item->smart = collect_smart_data(mp);
+    }
+
+    free_disk_list(disks, nd);
+    g_task_return_pointer(task, result, batch_scan_result_free);
+}
+
+static void batch_scan_done(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GTask *task = G_TASK(res);
+    batch_task_ctx_t *ctx = g_task_get_task_data(task);
+    GError *task_err = NULL;
+    batch_scan_result_t *result = g_task_propagate_pointer(task, &task_err);
+
+    if (ctx && ctx->pulse_id) {
+        g_source_remove(ctx->pulse_id);
+        ctx->pulse_id = 0;
+    }
+
+    int total_done = 0, total_skip = 0, total_err = 0;
+    if (task_err) {
+        if (task_err->code != G_IO_ERROR_CANCELLED)
+            show_save_error(task_err->message);
+        g_error_free(task_err);
+        total_err = ctx ? ctx->job_count : 1;
+    } else if (result && g_app.db) {
+        db_snapshot_backup_t *backups = calloc((size_t)g_app.db->entry_count, sizeof(*backups));
+        if (!backups) {
+            total_err = result->count;
+            show_save_error("Out of memory while committing batch reindex");
+        } else {
+            for (int i = 0; i < result->count; i++) {
+                batch_scan_item_t *item = &result->items[i];
+                if (item->skipped) { total_skip++; continue; }
+                if (item->failed || item->entry_idx < 0 || item->entry_idx >= g_app.db->entry_count) {
+                    total_err++;
+                    continue;
+                }
+                db_entry_t *e = &g_app.db->entries[item->entry_idx];
+                if (!e->label || strcmp(e->label, item->label) != 0) {
+                    total_err++;
+                    continue;
+                }
+                char err[256] = "";
+                if (db_set_entry_snapshot_nosave(g_app.db, item->label, item->files, item->smart,
+                        &backups[item->entry_idx], err, sizeof(err)) == 0)
+                    total_done++;
+                else
+                    total_err++;
+            }
+
+            if (total_done > 0) {
+                char save_err[256] = "";
+                char history_target[64];
+                snprintf(history_target, sizeof(history_target), "%d", total_done);
+                int history_before = g_app.db->history_count;
+                if (db_history_mark(g_app.db, "batch_snapshot", history_target,
+                        &history_before, save_err, sizeof(save_err)) != 0) {
+                    for (int i = 0; i < g_app.db->entry_count; i++)
+                        db_snapshot_backup_rollback(&backups[i]);
+                    total_err += total_done;
+                    total_done = 0;
+                    show_save_error(save_err);
+                } else if (db_save(g_app.db, save_err, sizeof(save_err)) == 0) {
+                    for (int i = 0; i < g_app.db->entry_count; i++)
+                        db_snapshot_backup_commit(&backups[i]);
+                } else {
+                    db_history_restore_count(g_app.db, history_before);
+                    for (int i = 0; i < g_app.db->entry_count; i++)
+                        db_snapshot_backup_rollback(&backups[i]);
+                    total_err += total_done;
+                    total_done = 0;
+                    show_save_error(save_err);
+                }
+            }
+            free(backups);
+        }
+    }
+
+    batch_scan_result_free(result);
+    g_batch_running = FALSE;
+
+    if (!ctx || !ctx->dlg || !GTK_IS_WIDGET(ctx->dlg)) return;
+    if (g_autolock_pending) {
+        g_autolock_pending = FALSE;
+        gtk_widget_destroy(ctx->dlg);
+        ctx->dlg = NULL;
+        if (app_has_open_database()) on_lock_clicked(NULL, NULL);
+        return;
+    }
+
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(ctx->prog), 1.0);
+    char done[128];
+    snprintf(done, sizeof(done), "Updated: %d, skipped: %d, errors: %d",
+        total_done, total_skip, total_err);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(ctx->prog), done);
+    gtk_label_set_text(GTK_LABEL(ctx->lbl), done);
+
+    g_app.current_entry_idx = -1;
+    refresh_entry_list();
+
+    if (ctx->block_close_handler_id) {
+        g_signal_handler_disconnect(ctx->dlg, ctx->block_close_handler_id);
+        ctx->block_close_handler_id = 0;
+    }
+    gtk_dialog_set_response_sensitive(GTK_DIALOG(ctx->dlg), GTK_RESPONSE_CLOSE, TRUE);
+    gtk_dialog_run(GTK_DIALOG(ctx->dlg));
+    gtk_widget_destroy(ctx->dlg);
+    ctx->dlg = NULL;
+}
+
+static void on_batch_reindex_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
+    (void)btn; (void)user_data;
+    if (!app_has_open_database() || g_batch_running || g_carrier_running) return;
+
+    int total = 0;
+    for (int i = 0; i < g_app.db->entry_count; i++)
+        if (g_app.db->entries[i].uuid && g_app.db->entries[i].uuid[0]) total++;
 
     GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("batch_title"),
         g_app.window, GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -2210,109 +4626,158 @@ static void on_batch_reindex_clicked(GtkButton *btn, gpointer user_data) {
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
     gtk_container_set_border_width(GTK_CONTAINER(content), 15);
     gtk_box_set_spacing(GTK_BOX(content), 12);
-
     GtkWidget *prog = gtk_progress_bar_new();
     gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(prog), TRUE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(prog), i18n("scanning"));
+    gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(prog), 0.04);
     gtk_box_pack_start(GTK_BOX(content), prog, FALSE, FALSE, 0);
-
-    GtkWidget *lbl = gtk_label_new("");
+    GtkWidget *lbl = gtk_label_new(i18n("scanning"));
     gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(content), lbl, FALSE, FALSE, 0);
-
     gtk_widget_show_all(dlg);
-
-    gulong block_close_handler_id =
-        g_signal_connect(dlg, "delete-event", G_CALLBACK(block_close), NULL);
-
-    int total = 0;
-    for (int i = 0; i < g_app.db->entry_count; i++)
-        if (g_app.db->entries[i].uuid && g_app.db->entries[i].uuid[0]) total++;
 
     if (total == 0) {
         gtk_label_set_text(GTK_LABEL(lbl), i18n("no_connected"));
-        if (block_close_handler_id) {
-            g_signal_handler_disconnect(dlg, block_close_handler_id);
-            block_close_handler_id = 0;
-        }
         gtk_dialog_run(GTK_DIALOG(dlg));
         gtk_widget_destroy(dlg);
         return;
     }
 
-    g_batch_running = TRUE;
-    reset_autolock();
-
-    int nd = 0;
-    disk_info_t *disks = list_disks(&nd);
-
-    int step = 0;
-    for (int i = 0; i < g_app.db->entry_count; i++) {
-        db_entry_t *e = &g_app.db->entries[i];
-        if (!e->uuid || !e->uuid[0]) continue;
-
-        step++;
-        double frac = (double)(step - 1) / (double)total;
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(prog), frac);
-        char pbuf[64];
-        snprintf(pbuf, sizeof(pbuf), i18n("batch_progress"), step, total);
-        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(prog), pbuf);
-        gtk_label_set_text(GTK_LABEL(lbl),
-            (e->alias && e->alias[0]) ? e->alias : e->label);
-        while (gtk_events_pending()) gtk_main_iteration();
-
-        const char *mp = NULL;
-        for (int k = 0; k < nd; k++) {
-            if (disks[k].uuid && strcmp(disks[k].uuid, e->uuid) == 0 &&
-                disks[k].mountpoint) {
-                mp = disks[k].mountpoint;
-                break;
-            }
-        }
-
-        if (!mp) { total_skip++; continue; }
-
-        char *files = scan_directory_recursive(mp);
-        char *smart = collect_smart_data(mp);
-        char err[256] = "";
-        if (db_set_entry_snapshot(g_app.db, e->label, files, smart, err, sizeof(err)) == 0)
-            total_done++;
-        else
-            total_err++;
-        secure_g_free_string(&files);
-        secure_free_string(&smart);
-    }
-
-    free_disk_list(disks, nd);
-    g_batch_running = FALSE;
-    if (g_autolock_pending) {
-        g_autolock_pending = FALSE;
+    batch_task_ctx_t *ctx = g_new0(batch_task_ctx_t, 1);
+    ctx->dlg = dlg;
+    ctx->prog = prog;
+    ctx->lbl = lbl;
+    ctx->job_count = total;
+    ctx->jobs = calloc((size_t)total, sizeof(*ctx->jobs));
+    if (!ctx->jobs) {
         gtk_widget_destroy(dlg);
-        if (g_app.db) on_lock_clicked(NULL, NULL);
+        g_free(ctx);
+        show_save_error("Out of memory while preparing batch reindex");
         return;
     }
 
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(prog), 1.0);
-    char done[128];
-    snprintf(done, sizeof(done), i18n("batch_done"), total_done, total_skip, total_err);
-    gtk_label_set_text(GTK_LABEL(lbl), done);
-
-    g_app.current_entry_idx = -1;
-    refresh_entry_list();
-
-    if (block_close_handler_id) {
-        g_signal_handler_disconnect(dlg, block_close_handler_id);
-        block_close_handler_id = 0;
+    int n = 0;
+    for (int i = 0; i < g_app.db->entry_count; i++) {
+        db_entry_t *e = &g_app.db->entries[i];
+        if (!e->uuid || !e->uuid[0]) continue;
+        ctx->jobs[n].entry_idx = i;
+        ctx->jobs[n].label = xstrdup(e->label);
+        ctx->jobs[n].uuid = xstrdup(e->uuid);
+        n++;
     }
-    gtk_dialog_run(GTK_DIALOG(dlg));
-    gtk_widget_destroy(dlg);
+
+    gtk_dialog_set_response_sensitive(GTK_DIALOG(dlg), GTK_RESPONSE_CLOSE, FALSE);
+    ctx->block_close_handler_id = g_signal_connect(dlg, "delete-event", G_CALLBACK(block_close), NULL);
+    ctx->pulse_id = g_timeout_add(100, batch_progress_pulse, ctx);
+
+    g_batch_running = TRUE;
+    reset_autolock();
+
+    GTask *task = g_task_new(NULL, NULL, batch_scan_done, NULL);
+    g_task_set_task_data(task, ctx, batch_task_ctx_free);
+    g_task_run_in_thread(task, batch_scan_worker);
+    g_object_unref(task);
 }
 
 static void check_new_disks(void);
 
+typedef struct {
+    int idx;
+    char *label;
+    char *uuid;
+    GtkWidget *wait;
+} smart_task_ctx_t;
+
+static void smart_task_ctx_free(gpointer data) {
+    smart_task_ctx_t *ctx = data;
+    if (!ctx) return;
+    secure_free_string(&ctx->label);
+    secure_free_string(&ctx->uuid);
+    g_free(ctx);
+}
+
+static void smart_refresh_worker(GTask *task, gpointer source_object,
+    gpointer task_data, GCancellable *cancellable)
+{
+    (void)source_object;
+    smart_task_ctx_t *ctx = task_data;
+    if (!ctx || (cancellable && g_cancellable_is_cancelled(cancellable))) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "SMART refresh cancelled");
+        return;
+    }
+
+    int nd = 0;
+    disk_info_t *disks = list_disks(&nd);
+    const char *mp = NULL;
+    for (int i = 0; i < nd; i++) {
+        if (disks[i].uuid && disks[i].mountpoint && strcmp(disks[i].uuid, ctx->uuid) == 0) {
+            mp = disks[i].mountpoint;
+            break;
+        }
+    }
+    if (!mp) {
+        free_disk_list(disks, nd);
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "SMART device is not connected");
+        return;
+    }
+
+    char *smart = collect_smart_data(mp);
+    free_disk_list(disks, nd);
+    if (!smart) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "SMART data is unavailable");
+        return;
+    }
+    g_task_return_pointer(task, smart, secure_free_cb);
+}
+
+static void smart_refresh_done(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GTask *task = G_TASK(res);
+    smart_task_ctx_t *ctx = g_task_get_task_data(task);
+    GError *task_err = NULL;
+    char *smart = g_task_propagate_pointer(task, &task_err);
+
+    if (ctx && ctx->wait && GTK_IS_WIDGET(ctx->wait)) {
+        gtk_widget_destroy(ctx->wait);
+        ctx->wait = NULL;
+    }
+    if (task_err) {
+        if (task_err->code == G_IO_ERROR_NOT_FOUND)
+            show_save_error(i18n("smart_no_device"));
+        else if (task_err->code != G_IO_ERROR_CANCELLED)
+            show_save_error(i18n("smart_unavailable"));
+        g_error_free(task_err);
+        return;
+    }
+    if (!ctx || !smart || !app_has_open_database() || ctx->idx < 0 || ctx->idx >= g_app.db->entry_count) {
+        secure_free_string(&smart);
+        return;
+    }
+
+    db_entry_t *e = &g_app.db->entries[ctx->idx];
+    if (!e->label || strcmp(e->label, ctx->label) != 0) {
+        secure_free_string(&smart);
+        show_save_error("The selected database entry changed while refreshing SMART");
+        return;
+    }
+
+    char err[256] = "";
+    if (db_set_entry_smart(g_app.db, ctx->label, smart, err, sizeof(err)) != 0) {
+        secure_free_string(&smart);
+        show_save_error(err);
+        return;
+    }
+    secure_free_string(&smart);
+    g_app.current_entry_idx = ctx->idx;
+    show_entry_details(ctx->idx);
+    show_toast(i18n("smart_refresh_done"), 5000, ctx->idx);
+}
+
 static void on_refresh_smart_clicked(GtkButton *b, gpointer u) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)b; (void)u;
-    if (!g_app.db) return;
+    if (!app_has_open_database() || g_app.db->legacy_read_only || g_carrier_running) return;
     GtkListBoxRow *row = gtk_list_box_get_selected_row(g_app.listbox);
     if (!row) {
         show_save_error(i18n("select_entry"));
@@ -2326,50 +4791,26 @@ static void on_refresh_smart_clicked(GtkButton *b, gpointer u) {
         return;
     }
 
-    int nd = 0;
-    disk_info_t *disks = list_disks(&nd);
-    const char *mp = NULL;
-    for (int i = 0; i < nd; i++) {
-        if (disks[i].uuid && disks[i].mountpoint && strcmp(disks[i].uuid, e->uuid) == 0) {
-            mp = disks[i].mountpoint;
-            break;
-        }
-    }
-    if (!mp) {
-        free_disk_list(disks, nd);
-        show_save_error(i18n("smart_no_device"));
-        return;
-    }
-
     GtkWidget *wait = gtk_message_dialog_new(g_app.window, GTK_DIALOG_MODAL,
         GTK_MESSAGE_INFO, GTK_BUTTONS_NONE, "%s", i18n("scanning"));
+    gtk_window_set_deletable(GTK_WINDOW(wait), FALSE);
     gtk_widget_show_all(wait);
-    while (gtk_events_pending()) gtk_main_iteration();
-    char *smart = collect_smart_data(mp);
-    gtk_widget_destroy(wait);
-    free_disk_list(disks, nd);
 
-    if (!smart) {
-        show_save_error(i18n("smart_unavailable"));
-        return;
-    }
-    char label_copy[128];
-    snprintf(label_copy, sizeof(label_copy), "%s", e->label ? e->label : "");
-    char err[256] = "";
-    if (db_set_entry_smart(g_app.db, label_copy, smart, err, sizeof(err)) != 0) {
-        secure_free_string(&smart);
-        show_save_error(err);
-        return;
-    }
-    secure_free_string(&smart);
-    g_app.current_entry_idx = idx;
-    show_entry_details(idx);
-    show_toast(i18n("smart_refresh_done"), 5000, idx);
+    smart_task_ctx_t *ctx = g_new0(smart_task_ctx_t, 1);
+    ctx->idx = idx;
+    ctx->label = xstrdup(e->label);
+    ctx->uuid = xstrdup(e->uuid);
+    ctx->wait = wait;
+
+    GTask *task = g_task_new(NULL, NULL, smart_refresh_done, NULL);
+    g_task_set_task_data(task, ctx, smart_task_ctx_free);
+    g_task_run_in_thread(task, smart_refresh_worker);
+    g_object_unref(task);
 }
 
 static void on_refresh_connections_clicked(GtkButton *b, gpointer u) {
     (void)b; (void)u;
-    if (!g_app.db) return;
+    if (!app_has_open_database()) return;
     int save_idx = g_app.current_entry_idx;
     check_new_disks();
     g_app.current_entry_idx = -1;
@@ -2418,35 +4859,56 @@ static void free_str_list(gpointer p) {
 }
 
 static GHashTable *build_cross_disk_index(db_manager_t *db) {
+    if (!db) return NULL;
+    const uint64_t max_cached_paths = 250000U;
+    uint64_t indexed_paths = 0;
+    for (int i = 0; i < db->entry_count; i++) {
+        const db_entry_t *e = &db->entries[i];
+        if (e->file_count <= 0) continue;
+        if ((uint64_t)e->file_count > max_cached_paths - indexed_paths) return NULL;
+        indexed_paths += (uint64_t)e->file_count;
+    }
     GHashTable *h = g_hash_table_new_full(g_str_hash, g_str_equal,
         secure_g_free_cb, free_str_list);
+    if (!h) return NULL;
     for (int i = 0; i < db->entry_count; i++) {
         db_entry_t *e = &db->entries[i];
         if (!e->files || !e->files[0]) continue;
         const char *disp = (e->alias && e->alias[0]) ? e->alias : e->label;
-        size_t copy_len = strlen(e->files) + 1;
-        char *copy = strdup(e->files);
-        if (!copy) continue;
-        char *save = NULL;
-        for (char *ln = strtok_r(copy, "\n", &save); ln;
-             ln = strtok_r(NULL, "\n", &save)) {
-            char *tab = strchr(ln, '\t');
-            if (tab) *tab = '\0';
-            if (!ln[0]) continue;
-            GList *lst = g_hash_table_lookup(h, ln);
-            gboolean dup = FALSE;
-            for (GList *q = lst; q; q = q->next)
-                if (strcmp((char *)q->data, disp) == 0) { dup = TRUE; break; }
-            if (dup) continue;
-            if (lst) {
-                lst = g_list_append(lst, g_strdup(disp));
-            } else {
-                lst = g_list_append(NULL, g_strdup(disp));
-                g_hash_table_insert(h, g_strdup(ln), lst);
+        const char *p = e->files;
+        while (*p) {
+            const char *line_end = strchr(p, '\n');
+            if (!line_end) line_end = p + strlen(p);
+            const char *tab = memchr(p, '\t', (size_t)(line_end - p));
+            const char *path_end = tab ? tab : line_end;
+            size_t path_len = (size_t)(path_end - p);
+            if (path_len > 0) {
+                char *path = g_strndup(p, path_len);
+                GList *lst = g_hash_table_lookup(h, path);
+                gboolean dup = FALSE;
+                for (GList *q = lst; q; q = q->next)
+                    if (strcmp((char *)q->data, disp) == 0) { dup = TRUE; break; }
+                if (!dup) {
+                    if (lst) {
+                        GList *updated = g_list_append(lst, g_strdup(disp));
+                        if (updated != lst) {
+                            g_hash_table_steal(h, path);
+                            g_hash_table_insert(h, path, updated);
+                        } else {
+                            g_free(path);
+                        }
+                    } else {
+                        lst = g_list_append(NULL, g_strdup(disp));
+                        g_hash_table_insert(h, path, lst);
+                        path = NULL;
+                    }
+                } else {
+                    g_free(path);
+                }
             }
+            if (!*line_end) break;
+            p = line_end + 1;
         }
-        sodium_memzero(copy, copy_len);
-        free(copy);
     }
     return h;
 }
@@ -2456,29 +4918,35 @@ static gboolean on_filter_chip_press(GtkWidget *w, GdkEventButton *e, gpointer u
 static void on_filter_add_clicked(GtkButton *b, gpointer u);
 static void rebuild_filt_box(GtkBox *fb, GtkSearchEntry *se, db_manager_t *db);
 
-static gboolean ascii_contains_ci(const char *haystack, const char *needle) {
+static gboolean ascii_contains_ci_n(const char *haystack, size_t hay_len, const char *needle) {
     if (!haystack || !needle) return FALSE;
     if (!*needle) return TRUE;
     size_t nlen = strlen(needle);
-    for (const unsigned char *h = (const unsigned char *)haystack; *h; h++) {
+    if (nlen > hay_len) return FALSE;
+    for (size_t pos = 0; pos + nlen <= hay_len; pos++) {
         size_t i = 0;
-        while (i < nlen && h[i] &&
-               g_ascii_tolower(h[i]) == g_ascii_tolower((guchar)needle[i]))
+        while (i < nlen &&
+               g_ascii_tolower((guchar)haystack[pos + i]) ==
+               g_ascii_tolower((guchar)needle[i]))
             i++;
         if (i == nlen) return TRUE;
     }
     return FALSE;
 }
 
-static gboolean path_matches_ext_filter(const char *path, const char *filter) {
+static gboolean path_matches_ext_filter_n(const char *path, size_t path_len, const char *filter) {
     if (!filter || !filter[0]) return TRUE;
-    if (!path) return FALSE;
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    const char *dot = strrchr(base, '.');
-    if (!dot || !dot[1]) return FALSE;
+    if (!path || path_len == 0) return FALSE;
+
+    const char *base = path;
+    for (size_t i = 0; i < path_len; i++)
+        if (path[i] == '/') base = path + i + 1;
+    const char *dot = NULL;
+    for (const char *p = base; p < path + path_len; p++)
+        if (*p == '.') dot = p;
+    if (!dot || dot + 1 >= path + path_len) return FALSE;
     const char *ext = dot + 1;
-    size_t ext_len = strlen(ext);
+    size_t ext_len = (size_t)((path + path_len) - ext);
 
     const char *p = filter;
     while (*p) {
@@ -2535,7 +5003,7 @@ static void on_find_changed_now(GtkSearchEntry *se) {
         }
     }
 
-    int total_files = 0;
+    uint64_t total_files = 0;
     int total_disks = 0;
     const int per_disk_limit = 200;
 
@@ -2543,33 +5011,38 @@ static void on_find_changed_now(GtkSearchEntry *se) {
         db_entry_t *e = &db->entries[i];
         if (!e->files || !e->files[0]) continue;
 
-        size_t copy_len = strlen(e->files) + 1;
-        char *copy = strdup(e->files);
-        if (!copy) continue;
-
         GPtrArray *paths = g_ptr_array_new_with_free_func(secure_g_free_cb);
         GArray *sizes = g_array_sized_new(FALSE, FALSE, sizeof(long long), per_disk_limit);
         int match_count = 0;
 
-        char *save = NULL;
-        for (char *line = strtok_r(copy, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            if (!line[0]) continue;
+        const char *p = e->files;
+        while (*p) {
+            const char *line_end = strchr(p, '\n');
+            if (!line_end) line_end = p + strlen(p);
+            const char *tab = memchr(p, '\t', (size_t)(line_end - p));
+            const char *path_end = tab ? tab : line_end;
+            size_t path_len = (size_t)(path_end - p);
             long long sz = -1;
-            char *tab = strchr(line, '\t');
-            if (tab) { *tab = '\0'; sz = atoll(tab + 1); }
-
-            if (q[0] && !ascii_contains_ci(line, q)) continue;
-            if (ext_filter && !path_matches_ext_filter(line, ext_filter)) continue;
-
-            match_count++;
-            if ((int)paths->len < per_disk_limit) {
-                g_ptr_array_add(paths, g_strdup(line));
-                g_array_append_val(sizes, sz);
+            if (tab && tab + 1 < line_end) {
+                char *endp = NULL;
+                errno = 0;
+                long long parsed = g_ascii_strtoll(tab + 1, &endp, 10);
+                if (errno == 0 && endp && endp <= line_end) sz = parsed;
             }
+
+            gboolean q_match = !q[0] || ascii_contains_ci_n(p, path_len, q);
+            gboolean ext_match = !ext_filter || path_matches_ext_filter_n(p, path_len, ext_filter);
+            if (path_len > 0 && q_match && ext_match) {
+                match_count++;
+                if ((int)paths->len < per_disk_limit) {
+                    g_ptr_array_add(paths, g_strndup(p, path_len));
+                    g_array_append_val(sizes, sz);
+                }
+            }
+
+            if (!*line_end) break;
+            p = line_end + 1;
         }
-        sodium_memzero(copy, copy_len);
-        free(copy);
 
         if (match_count == 0) {
             g_ptr_array_free(paths, TRUE);
@@ -2712,8 +5185,8 @@ static void on_find_changed_now(GtkSearchEntry *se) {
             gtk_label_set_text(GTK_LABEL(status), i18n("no_results"));
         } else {
             char buf[128];
-            snprintf(buf, sizeof(buf), "%d %s · %d %s",
-                total_files, i18n("files_found"), total_disks, i18n("disks_found"));
+            snprintf(buf, sizeof(buf), "%llu %s · %d %s",
+                (unsigned long long)total_files, i18n("files_found"), total_disks, i18n("disks_found"));
             gtk_label_set_text(GTK_LABEL(status), buf);
         }
     }
@@ -2781,6 +5254,7 @@ static void rebuild_filt_box(GtkBox *filt_box, GtkSearchEntry *se, db_manager_t 
     }
 
     GtkWidget *add_btn = gtk_button_new_with_label("+");
+    gtk_widget_set_sensitive(add_btn, !db->legacy_read_only);
     gtk_style_context_add_class(gtk_widget_get_style_context(add_btn), "filter-chip");
     g_signal_connect(add_btn, "clicked", G_CALLBACK(on_filter_add_clicked), se);
     gtk_box_pack_start(GTK_BOX(filt_box), add_btn, FALSE, FALSE, 0);
@@ -2817,6 +5291,8 @@ static void on_filter_chip_clicked(GtkToggleButton *btn, gpointer user_data) {
 }
 
 static void on_filter_delete_activate(GtkMenuItem *mi, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
+    if (g_carrier_running) return;
     GtkSearchEntry *se = GTK_SEARCH_ENTRY(user_data);
     db_manager_t *db = g_object_get_data(G_OBJECT(se), "db");
     GtkWidget *filt_box = g_object_get_data(G_OBJECT(se), "filt_box");
@@ -2829,7 +5305,18 @@ static void on_filter_delete_activate(GtkMenuItem *mi, gpointer user_data) {
     db->filter_count--;
 
     char err_buf[256] = "";
+    int history_before = db->history_count;
+    if (db_history_mark(db, "filter_removed", removed.name ? removed.name : "",
+            &history_before, err_buf, sizeof(err_buf)) != 0) {
+        memmove(&db->filters[idx + 1], &db->filters[idx],
+            (db->filter_count - idx) * sizeof(search_filter_t));
+        db->filters[idx] = removed;
+        db->filter_count++;
+        show_save_error(err_buf);
+        return;
+    }
     if (db_save(db, err_buf, sizeof(err_buf)) != 0) {
+        db_history_restore_count(db, history_before);
         memmove(&db->filters[idx + 1], &db->filters[idx],
             (db->filter_count - idx) * sizeof(search_filter_t));
         db->filters[idx] = removed;
@@ -2859,6 +5346,7 @@ static gboolean on_filter_chip_press(GtkWidget *w, GdkEventButton *ev, gpointer 
     GtkWidget *menu = gtk_menu_new();
     g_signal_connect_swapped(menu, "selection-done", G_CALLBACK(gtk_widget_destroy), menu);
     GtkWidget *mi = gtk_menu_item_new_with_label(i18n("filter_delete"));
+    gtk_widget_set_sensitive(mi, !g_app.db || !g_app.db->legacy_read_only);
     g_object_set_data(G_OBJECT(mi), "filter_idx", GINT_TO_POINTER(idx));
     g_signal_connect(mi, "activate", G_CALLBACK(on_filter_delete_activate), user_data);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
@@ -2868,7 +5356,9 @@ static gboolean on_filter_chip_press(GtkWidget *w, GdkEventButton *ev, gpointer 
 }
 
 static void on_filter_add_clicked(GtkButton *b, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)b;
+    if (g_carrier_running) return;
     GtkSearchEntry *se = GTK_SEARCH_ENTRY(user_data);
     db_manager_t *db = g_object_get_data(G_OBJECT(se), "db");
     if (!db) return;
@@ -2924,7 +5414,15 @@ static void on_filter_add_clicked(GtkButton *b, gpointer user_data) {
             db->filters[db->filter_count].exts = xstrdup(ex);
             db->filter_count++;
             char err_buf[256] = "";
-            if (db_save(db, err_buf, sizeof(err_buf)) != 0) {
+            int history_before = db->history_count;
+            if (db_history_mark(db, "filter_added", nm, &history_before,
+                    err_buf, sizeof(err_buf)) != 0) {
+                db->filter_count--;
+                secure_free_string(&db->filters[db->filter_count].name);
+                secure_free_string(&db->filters[db->filter_count].exts);
+                show_save_error(err_buf);
+            } else if (db_save(db, err_buf, sizeof(err_buf)) != 0) {
+                db_history_restore_count(db, history_before);
                 db->filter_count--;
                 secure_free_string(&db->filters[db->filter_count].name);
                 secure_free_string(&db->filters[db->filter_count].exts);
@@ -2939,6 +5437,7 @@ static void on_filter_add_clicked(GtkButton *b, gpointer user_data) {
 }
 
 static void on_find_file_clicked(GtkButton *btn, gpointer user_data) {
+    if (app_has_open_database() && g_app.db->legacy_read_only) return;
     (void)btn; (void)user_data;
     if (!g_app.db) return;
 
@@ -3014,7 +5513,7 @@ static void on_lang_changed_welcome(GtkComboBoxText *combo, gpointer user_data) 
         if (g_app.lang_combo_welcome && GTK_WIDGET(combo) != g_app.lang_combo_welcome)
             gtk_combo_box_set_active_id(GTK_COMBO_BOX(g_app.lang_combo_welcome), g_lang);
         update_ui_text();
-        save_config();
+        if (!save_config()) g_warning("DiskPass: configuration could not be saved");
     }
 }
 
@@ -3036,6 +5535,9 @@ static void build_welcome(void) {
     g_app.btn_open = gtk_button_new_with_label(i18n("open_db"));
     g_signal_connect(g_app.btn_open, "clicked", G_CALLBACK(on_open_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(btn_box), g_app.btn_open, FALSE, FALSE, 0);
+    g_app.btn_open_stego = gtk_button_new_with_label(i18n("carrier_open_hidden_short"));
+    g_signal_connect(g_app.btn_open_stego, "clicked", G_CALLBACK(on_open_stego_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(btn_box), g_app.btn_open_stego, FALSE, FALSE, 0);
     g_app.btn_create = gtk_button_new_with_label(i18n("create_db"));
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_create), "suggested-action");
     g_signal_connect(g_app.btn_create, "clicked", G_CALLBACK(on_create_clicked), NULL);
@@ -3142,6 +5644,9 @@ static void build_unlock(void) {
     gtk_box_pack_start(GTK_BOX(unlock_key_row), g_app.btn_create_key_unlock, FALSE, FALSE, 0);
     gtk_grid_attach(grid, unlock_key_row, 1, 1, 1, 1);
     gtk_box_pack_start(GTK_BOX(box), GTK_WIDGET(grid), FALSE, TRUE, 0);
+    g_app.unlock_status = gtk_label_new("");
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.unlock_status), "dim-label");
+    gtk_box_pack_start(GTK_BOX(box), g_app.unlock_status, FALSE, FALSE, 0);
     g_app.unlock_err = gtk_label_new("");
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.unlock_err), "error");
     gtk_box_pack_start(GTK_BOX(box), g_app.unlock_err, FALSE, FALSE, 0);
@@ -3189,7 +5694,7 @@ static gboolean plugin_status_hide_cb(gpointer user_data) {
 }
 
 char *diskpass_ui_dup_selected_disk_label(void) {
-    if (!g_app.db || g_app.current_entry_idx < 0 ||
+    if (!app_has_open_database() || g_app.current_entry_idx < 0 ||
         g_app.current_entry_idx >= g_app.db->entry_count)
         return NULL;
     const char *label = g_app.db->entries[g_app.current_entry_idx].label;
@@ -3219,7 +5724,7 @@ static gboolean on_toast_clicked(GtkButton *b, gpointer u) {
     int idx = g_app.toast_entry_idx;
     if (g_app.toast_revealer)
         gtk_revealer_set_reveal_child(GTK_REVEALER(g_app.toast_revealer), FALSE);
-    if (idx >= 0 && g_app.db && idx < g_app.db->entry_count) {
+    if (idx >= 0 && app_has_open_database() && idx < g_app.db->entry_count) {
         GtkListBoxRow *row = gtk_list_box_get_row_at_index(g_app.listbox, idx);
         if (row) {
             gtk_list_box_select_row(g_app.listbox, row);
@@ -3229,11 +5734,15 @@ static gboolean on_toast_clicked(GtkButton *b, gpointer u) {
     return TRUE;
 }
 
-static void check_new_disks(void) {
-    if (!g_app.db) return;
-    int n = 0;
-    disk_info_t *disks = list_disks(&n);
-    if (!disks) return;
+typedef struct {
+    disk_info_t *disks;
+    int count;
+} connection_scan_result_t;
+
+static gboolean g_connection_check_running = FALSE;
+
+static void process_new_disks(disk_info_t *disks, int n) {
+    if (!app_has_open_database() || !disks) return;
 
     if (!g_known_uuids)
         g_known_uuids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
@@ -3258,13 +5767,60 @@ static void check_new_disks(void) {
             }
         }
     }
-    free_disk_list(disks, n);
     g_uuids_initialized = TRUE;
+}
+
+static void check_new_disks(void) {
+    if (!app_has_open_database()) return;
+    int n = 0;
+    disk_info_t *disks = list_disks(&n);
+    if (!disks) return;
+    process_new_disks(disks, n);
+    free_disk_list(disks, n);
+}
+
+static void connection_scan_result_free(gpointer data) {
+    connection_scan_result_t *r = data;
+    if (!r) return;
+    free_disk_list(r->disks, r->count);
+    g_free(r);
+}
+
+static void connection_scan_worker(GTask *task, gpointer source_object,
+    gpointer task_data, GCancellable *cancellable)
+{
+    (void)source_object; (void)task_data;
+    if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Connection scan cancelled");
+        return;
+    }
+    connection_scan_result_t *r = g_new0(connection_scan_result_t, 1);
+    r->disks = list_disks(&r->count);
+    g_task_return_pointer(task, r, connection_scan_result_free);
+}
+
+static void connection_scan_done(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)source_object; (void)user_data;
+    GTask *task = G_TASK(res);
+    GError *err = NULL;
+    connection_scan_result_t *r = g_task_propagate_pointer(task, &err);
+    g_connection_check_running = FALSE;
+    if (err) {
+        g_error_free(err);
+        return;
+    }
+    if (r && app_has_open_database() && r->disks)
+        process_new_disks(r->disks, r->count);
+    connection_scan_result_free(r);
 }
 
 static gboolean connection_check_cb(gpointer user_data) {
     (void)user_data;
-    check_new_disks();
+    if (!app_has_open_database() || g_connection_check_running) return G_SOURCE_CONTINUE;
+    g_connection_check_running = TRUE;
+    GTask *task = g_task_new(NULL, NULL, connection_scan_done, NULL);
+    g_task_run_in_thread(task, connection_scan_worker);
+    g_object_unref(task);
     return G_SOURCE_CONTINUE;
 }
 
@@ -3349,6 +5905,12 @@ static void build_main(void) {
     g_signal_connect(g_app.btn_create_key_main, "clicked", G_CALLBACK(on_create_gpg_key_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(toolbar), g_app.btn_create_key_main, FALSE, FALSE, 0);
 
+    g_app.btn_carrier = gtk_button_new_from_icon_name("mail-attachment-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_carrier), "flat-btn");
+    gtk_widget_set_tooltip_text(g_app.btn_carrier, i18n("carrier_tools"));
+    g_signal_connect(g_app.btn_carrier, "clicked", G_CALLBACK(on_carrier_tools_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(toolbar), g_app.btn_carrier, FALSE, FALSE, 0);
+
     g_app.btn_plugins = diskpass_plugins_create_button();
     if (g_app.btn_plugins) {
         gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_plugins), "flat-btn");
@@ -3371,6 +5933,34 @@ static void build_main(void) {
     gtk_box_pack_start(GTK_BOX(toolbar), g_app.plugin_status, TRUE, TRUE, 8);
 
     gtk_box_pack_start(GTK_BOX(toolbar), gtk_label_new(""), TRUE, TRUE, 0);
+
+    g_app.btn_settings = gtk_button_new_from_icon_name("preferences-system-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_settings), "flat-btn");
+    gtk_widget_set_tooltip_text(g_app.btn_settings, i18n("security_settings"));
+    g_signal_connect(g_app.btn_settings, "clicked", G_CALLBACK(on_security_settings_clicked), NULL);
+    gtk_box_pack_end(GTK_BOX(toolbar), g_app.btn_settings, FALSE, FALSE, 0);
+    g_app.btn_about = gtk_button_new();
+    GIcon *about_icon = NULL;
+    char *about_path = find_icon_path();
+    if (about_path) {
+        GFile *file = g_file_new_for_path(about_path);
+        about_icon = g_file_icon_new(file);
+        g_object_unref(file);
+        g_free(about_path);
+    }
+    GtkWidget *about_image = about_icon
+        ? gtk_image_new_from_gicon(about_icon, GTK_ICON_SIZE_BUTTON)
+        : gtk_image_new_from_icon_name("diskpass", GTK_ICON_SIZE_BUTTON);
+    gtk_image_set_pixel_size(GTK_IMAGE(about_image), 28);
+    gtk_widget_set_halign(about_image, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(about_image, GTK_ALIGN_CENTER);
+    gtk_button_set_image(GTK_BUTTON(g_app.btn_about), about_image);
+    if (about_icon) g_object_unref(about_icon);
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_about), "flat-btn");
+    gtk_widget_set_tooltip_text(g_app.btn_about, i18n("about_diskpass"));
+    g_signal_connect(g_app.btn_about, "clicked", G_CALLBACK(on_about_diskpass), NULL);
+    gtk_box_pack_end(GTK_BOX(toolbar), g_app.btn_about, FALSE, FALSE, 0);
+
 
     g_app.btn_sch = gtk_button_new_from_icon_name("dialog-information-symbolic", GTK_ICON_SIZE_BUTTON);
     gtk_style_context_add_class(gtk_widget_get_style_context(g_app.btn_sch), "flat-btn");
@@ -3497,7 +6087,7 @@ static void build_main(void) {
     g_signal_connect(g_app.tree_filter, "search-changed", G_CALLBACK(on_tree_filter_changed), NULL);
     gtk_box_pack_start(GTK_BOX(g_app.detail_box), g_app.tree_filter, FALSE, FALSE, 0);
 
-    g_app.tree_store = gtk_tree_store_new(3, G_TYPE_STRING, G_TYPE_BOOLEAN, G_TYPE_STRING);
+    g_app.tree_store = gtk_tree_store_new(4, G_TYPE_STRING, G_TYPE_BOOLEAN, G_TYPE_STRING, G_TYPE_BOOLEAN);
     GtkTreeModel *filter_model = gtk_tree_model_filter_new(GTK_TREE_MODEL(g_app.tree_store), NULL);
     gtk_tree_model_filter_set_visible_func(GTK_TREE_MODEL_FILTER(filter_model),
         tree_filter_func, NULL, NULL);
@@ -3633,6 +6223,25 @@ static void load_css(void) {
     static const char css2[] =
         "  border-color: #3a3a3a; }"
         ".suggested-action:hover { background-color: #353535; color: #ffffff; }"
+        ".carrier-current-db { color: #8f8f8f; font-size: 11px; }"
+        ".carrier-dialog-title { font-size: 14px; font-weight: 600; color: #f2f2f2; }"
+        ".carrier-dialog-subtitle { font-size: 10px; color: #8f8f8f; }"
+        ".carrier-db-badge { font-size: 9px; color: #a8d8cf; background-color: #17221f; border: 1px solid #29463f; border-radius: 7px; padding: 2px 7px; }"
+        ".carrier-choice {"
+        "  background-color: #1e1e1e; border: 1px solid #333333; border-radius: 4px;"
+        "  padding: 5px 8px; min-height: 24px; }"
+        ".carrier-choice:hover { background-color: #222222; border-color: #444444; }"
+        ".carrier-choice-primary { border-color: #31564d; background-color: #19211f; }"
+        ".carrier-choice-primary:hover { border-color: #4a7f72; background-color: #1d2926; }"
+        ".carrier-choice:active { background-color: #272727; }"
+        ".carrier-choice-icon { color: #cfcfcf; min-width: 22px; }"
+        ".carrier-choice-title { font-size: 12px; font-weight: 500; color: #e8e8e8; }"
+        ".carrier-choice-desc { font-size: 10px; color: #8a8a8a; }"
+        ".carrier-choice-arrow { color: #777777; }"
+        ".carrier-expander { color: #b8b8b8; padding: 1px 0; font-size: 11px; }"
+        ".carrier-format-name { font-size: 10px; font-weight: 600; color: #bdbdbd; }"
+        ".carrier-format-value { font-size: 10px; color: #858585; }"
+        ".carrier-note { font-size: 9px; color: #707070; }"
         ".flat-btn {"
         "  border: none; background: transparent;"
         "  padding: 3px 6px;"
@@ -3640,6 +6249,36 @@ static void load_css(void) {
         "  font-size: 11px; }"
         ".flat-btn:hover { background-color: #262626; color: #ffffff; }"
         ".flat-btn:disabled { color: #4a4a4a; }"
+        ".main-toolbar .flat-btn {"
+        "  color: #8d8d8d;"
+        "  border-radius: 6px;"
+        "  padding: 4px 7px; }"
+        ".main-toolbar .flat-btn:hover {"
+        "  background-color: #1b2422;"
+        "  color: #4ec9b0; }"
+        ".main-toolbar .flat-btn:hover image { color: #4ec9b0; }"
+        ".main-toolbar .flat-btn:active, .main-toolbar .flat-btn:checked {"
+        "  background-color: #21302c;"
+        "  color: #65d8c2; }"
+        ".main-toolbar .flat-btn:active image, .main-toolbar .flat-btn:checked image { color: #65d8c2; }"
+        ".main-toolbar .flat-btn:disabled {"
+        "  background-color: transparent;"
+        "  color: #464646; }"
+        ".main-toolbar .flat-btn:disabled image { color: #464646; }"
+        ".privacy-shield { background-color: rgba(13,13,13,0.985); }"
+        ".privacy-shield-title { color: #eeeeee; font-size: 17px; font-weight: 600; }"
+        ".privacy-shield-desc { color: #8e8e8e; font-size: 11px; }"
+        ".privacy-shield-icon { color: #4ec9b0; }";
+    static const char css2b[] =
+        ".settings-head-icon { color: #4ec9b0; }"
+        ".settings-title { color: #eeeeee; font-size: 16px; font-weight: 600; }"
+        ".settings-row-title { color: #e8e8e8; font-size: 12px; font-weight: 500; }"
+        ".settings-row-desc { color: #8a8a8a; font-size: 10px; }"
+        ".settings-note { color: #707070; font-size: 10px; }"
+        ".settings-always-on { color: #4ec9b0; font-size: 10px; font-weight: 600; }"
+        ".integrity-ok { color: #4ec9b0; font-size: 15px; font-weight: 700; }"
+        ".integrity-warn { color: #d7aa58; font-size: 15px; font-weight: 700; }"
+        ".integrity-bad { color: #ff7b72; font-size: 15px; font-weight: 700; }"
         "entry, combobox, combobox button, spinbutton {"
         "  border-radius: 4px;"
         "  border: 1px solid #333333;"
@@ -3755,10 +6394,11 @@ static void load_css(void) {
         ".toast:hover { background-color: #262626; }"
         ".also-on { font-size: 10px; color: #4ec9b0; padding-top: 1px; }";
 
-    GString *css = g_string_sized_new(sizeof(css1) + sizeof(css2) + sizeof(css3));
+    GString *css = g_string_sized_new(sizeof(css1) + sizeof(css2) + sizeof(css2b) + sizeof(css3));
     if (!css) return;
     g_string_append(css, css1);
     g_string_append(css, css2);
+    g_string_append(css, css2b);
     g_string_append(css, css3);
     GtkCssProvider *provider = gtk_css_provider_new();
     GError *error = NULL;
@@ -3783,6 +6423,8 @@ static gboolean graceful_shutdown(gpointer user_data) {
     gtk_clipboard_set_text(cb, "", 0);
     GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
     gtk_clipboard_set_text(primary, "", 0);
+    if (g_app.privacy_shield_timer_id) { g_source_remove(g_app.privacy_shield_timer_id); g_app.privacy_shield_timer_id = 0; }
+    if (g_app.focus_lock_timer_id) { g_source_remove(g_app.focus_lock_timer_id); g_app.focus_lock_timer_id = 0; }
 
     if (g_app.window)
         gtk_window_close(g_app.window);
@@ -3802,6 +6444,8 @@ static void setup_accelerators(GtkWidget *win) {
         GDK_KEY_l, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
     gtk_widget_add_accelerator(g_app.btn_sch, "clicked", accel,
         GDK_KEY_s, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+    gtk_widget_add_accelerator(g_app.btn_settings, "clicked", accel,
+        GDK_KEY_comma, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
     gtk_widget_add_accelerator(g_app.btn_copy_label, "clicked", accel,
         GDK_KEY_c, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
     gtk_widget_add_accelerator(g_app.btn_copy_pass, "clicked", accel,
@@ -3817,3 +6461,85 @@ static void setup_accelerators(GtkWidget *win) {
     g_object_unref(accel);
 }
 
+static gboolean about_binary_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+    (void)data;
+    int w = gtk_widget_get_allocated_width(widget);
+    int h = gtk_widget_get_allocated_height(widget);
+    cairo_set_source_rgb(cr, 0.055, 0.065, 0.065);
+    cairo_paint(cr);
+    PangoLayout *layout = gtk_widget_create_pango_layout(widget, NULL);
+    PangoFontDescription *font = pango_font_description_from_string("Monospace 10");
+    pango_layout_set_font_description(layout, font);
+    pango_font_description_free(font);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.065);
+    for (int y = 10; y < h; y += 24) {
+        pango_layout_set_text(layout, (y / 24) % 2
+            ? "01001001 00110010 10100101 01011010 00101101 10100110 01010101 00110011"
+            : "10110010 01001101 00110101 10100110 11010010 01011001 10101010 11001100", -1);
+        cairo_move_to(cr, 12, y);
+        pango_cairo_show_layout(cr, layout);
+    }
+    (void)w;
+    g_object_unref(layout);
+    return FALSE;
+}
+
+static GtkWidget *about_text(const char *text, gboolean heading) {
+    GtkWidget *label = gtk_label_new(text);
+    gtk_label_set_selectable(GTK_LABEL(label), FALSE);
+    gtk_widget_set_can_focus(label, FALSE);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.5);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 48);
+    gtk_label_set_justify(GTK_LABEL(label), GTK_JUSTIFY_CENTER);
+    if (heading) {
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        pango_attr_list_insert(attrs, pango_attr_foreground_new(0xffff, 0xffff, 0xffff));
+        gtk_label_set_attributes(GTK_LABEL(label), attrs);
+        pango_attr_list_unref(attrs);
+    }
+    return label;
+}
+
+static void on_about_diskpass(GtkButton *item, gpointer data) {
+    (void)item; (void)data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(i18n("about_diskpass"), g_app.window,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        i18n("close_window"), GTK_RESPONSE_CLOSE, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 500, 400);
+    GtkWidget *overlay = gtk_overlay_new();
+    GtkWidget *background = gtk_drawing_area_new();
+    g_signal_connect(background, "draw", G_CALLBACK(about_binary_draw), NULL);
+    gtk_container_add(GTK_CONTAINER(overlay), background);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 24);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), box);
+    int scale = gtk_widget_get_scale_factor(GTK_WIDGET(g_app.window));
+    GdkPixbuf *logo = load_icon(96 * MAX(scale, 1));
+    if (logo) {
+        cairo_surface_t *surface = gdk_cairo_surface_create_from_pixbuf(logo, MAX(scale, 1), NULL);
+        GtkWidget *image = gtk_image_new_from_surface(surface);
+        gtk_box_pack_start(GTK_BOX(box), image, FALSE, FALSE, 0);
+        cairo_surface_destroy(surface);
+        gtk_window_set_icon(GTK_WINDOW(dialog), logo);
+        g_object_unref(logo);
+    }
+    GtkWidget *title = about_text("DiskPass", TRUE);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.5);
+    PangoAttrList *attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_scale_new(1.85));
+    pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    gtk_label_set_attributes(GTK_LABEL(title), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), about_text(i18n("about_short_description"), FALSE), FALSE, FALSE, 0);
+    GtkWidget *link = gtk_link_button_new_with_label("https://github.com/Sergei768/Diskpass", "GitHub · DiskPass");
+    gtk_widget_set_halign(link, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(box), link, FALSE, FALSE, 8);
+    gtk_box_pack_start(GTK_BOX(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), overlay, TRUE, TRUE, 0);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}

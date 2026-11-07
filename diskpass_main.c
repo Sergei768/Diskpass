@@ -1,8 +1,11 @@
 #define DISKPASS_HOST_BUILD 1
 #include "diskpass.h"
+#include "calculator/diskpass_calculator.h"
+#include "calculator/diskpass_icon.h"
 
 #include "diskpass_i18n.c"
 #include "diskpass_core.c"
+#include "diskpass_stego_lossy.c"
 #include "diskpass_crypto_tags.c"
 
 typedef struct {
@@ -138,17 +141,18 @@ static void loaded_plugin_free(DiskPassLoadedPlugin *p) {
 
 static char *diskpass_plugin_directory(void) {
     const char *home = g_get_home_dir();
-    if (!home || !home[0]) return NULL;
-
-    char *base = g_build_filename(home, ".diskpass", NULL);
+    const char *override = g_getenv("DISKPASS_PRIVATE_DIR");
+    if ((!home || !home[0]) && !(override && override[0] == '/')) return NULL;
+    char *base = (override && override[0] == '/') ? g_strdup(override) :
+        g_build_filename(home, ".diskpass", NULL);
     if (!base) return NULL;
     if (g_mkdir_with_parents(base, 0700) != 0) {
         g_free(base);
         return NULL;
     }
     struct stat st;
-    if (g_lstat(base, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
-        chmod(base, 0700) != 0) {
+    if (g_lstat(base, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 077) != 0 || chmod(base, 0700) != 0) {
         g_free(base);
         return NULL;
     }
@@ -163,13 +167,19 @@ static char *diskpass_plugin_directory(void) {
     return dir;
 }
 
-static gboolean plugin_file_is_safe(const char *path) {
+
+static int plugin_open_locked_fd(const char *path) {
+    if (!path) return -1;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
     struct stat st;
-    if (!path || g_lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) return FALSE;
-    if (st.st_uid != getuid()) return FALSE;
-    if (st.st_mode & (S_IWGRP | S_IWOTH)) return FALSE;
-    if (st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) return FALSE;
-    return TRUE;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)) || st.st_nlink != 1 ||
+        st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) {
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 static char *plugin_id_from_path(const char *path) {
@@ -194,15 +204,43 @@ static void rollback_plugin_actions(guint start_index) {
 }
 
 static void diskpass_plugin_load_one(const char *path) {
-    if (!plugin_file_is_safe(path)) {
+
+
+    int locked_fd = plugin_open_locked_fd(path);
+    if (locked_fd < 0) {
         fprintf(stderr, "DiskPass: refusing unsafe plugin file: %s\n", path ? path : "(null)");
         return;
     }
 
-    GModule *module = g_module_open(path, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
+    struct stat locked_st;
+    gboolean have_locked_st = (fstat(locked_fd, &locked_st) == 0);
+
+
+    GModule *module = NULL;
+#ifdef __linux__
+    char fd_path[64];
+    int pn = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", locked_fd);
+    if (pn > 0 && (size_t)pn < sizeof(fd_path)) {
+        module = g_module_open(fd_path, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
+    }
+#endif
+    /* Never reopen by pathname: that would discard the inode validation above
+     * and reintroduce a replacement race. */
+    close(locked_fd);
     if (!module) {
         fprintf(stderr, "DiskPass: cannot load plugin %s: %s\n", path, g_module_error());
         return;
+    }
+
+
+    if (have_locked_st) {
+        struct stat after_st;
+        if (lstat(path, &after_st) == 0 && S_ISREG(after_st.st_mode) &&
+            (after_st.st_dev != locked_st.st_dev || after_st.st_ino != locked_st.st_ino)) {
+            fprintf(stderr, "DiskPass: plugin %s was replaced during load; refusing to use it\n", path);
+            g_module_close(module);
+            return;
+        }
     }
 
     gpointer init_symbol = NULL;
@@ -288,10 +326,12 @@ void diskpass_plugins_load_all(void) {
         fprintf(stderr, "DiskPass: GModule is not supported on this platform\n");
         return;
     }
-    if (g_getenv("DISKPASS_DISABLE_PLUGINS")) {
-        fprintf(stderr, "DiskPass: plugins disabled by DISKPASS_DISABLE_PLUGINS\n");
-        return;
-    }
+
+    /* Environment flags are inherited by child processes and are not a safe
+     * trust boundary for enabling native code. Keep plugins opt-in disabled
+     * until an explicit authenticated UI flow is implemented. */
+    fprintf(stderr, "DiskPass: native plugins are disabled; no authenticated enable flow is available\n");
+    return;
 
     char *dir = diskpass_plugin_directory();
     if (!dir) return;
@@ -401,10 +441,38 @@ void diskpass_plugins_shutdown(void) {
 #include "diskpass_ui.c"
 
 int main(int argc, char **argv) {
+
+    if (geteuid() != getuid() || getegid() != getgid()) {
+        fprintf(stderr, "FATAL: DiskPass refuses to run setuid/setgid. Reinstall without setuid bit.\n");
+        return 1;
+    }
+
     struct rlimit no_core = { 0, 0 };
     (void)setrlimit(RLIMIT_CORE, &no_core);
 #ifdef __linux__
     (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+
+
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
+
+#ifdef PROC_TRACE_CTL
+    { int trace_mode = PROC_TRACE_CTL_DISABLE; (void)procctl(P_PID, getpid(), PROC_TRACE_CTL, &trace_mode); }
+#endif
+#elif defined(__APPLE__) && defined(PT_DENY_ATTACH)
+
+    (void)ptrace(PT_DENY_ATTACH, 0, 0, 0);
+#endif
+#ifdef __OpenBSD__
+
+
+    (void)pledge("stdio rpath wpath cpath flock fattr unix dns inet tty proc exec unveil", NULL);
+
+    (void)unveil(g_get_home_dir(), "rwc");
+    (void)unveil("/usr", "rx");
+    (void)unveil("/etc", "r");
+    (void)unveil("/tmp", "rwc");
+    (void)unveil("/dev/null", "rw");
+    (void)unveil(NULL, NULL);
 #endif
     umask(0077);
     setlocale(LC_ALL, "");
@@ -413,34 +481,130 @@ int main(int argc, char **argv) {
         g_setenv("LC_ALL", "C.UTF-8", TRUE);
     }
     if (sodium_init() < 0) { fprintf(stderr, "FATAL: libsodium init failed\n"); return 1; }
+
+
+#ifdef MCL_CURRENT
+    if (g_strcmp0(g_getenv("DISKPASS_DISABLE_MLOCK"), "1") != 0) {
+        struct rlimit ml;
+        if (getrlimit(RLIMIT_MEMLOCK, &ml) == 0) {
+            rlim_t want = 256ULL * 1024ULL * 1024ULL;
+            if (ml.rlim_max != RLIM_INFINITY && want > ml.rlim_max) want = ml.rlim_max;
+            if (ml.rlim_cur < want) {
+                struct rlimit new_ml = { .rlim_cur = want, .rlim_max = ml.rlim_max };
+                (void)setrlimit(RLIMIT_MEMLOCK, &new_ml);
+            }
+        }
+
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            int full_err = errno;
+            if (mlockall(MCL_CURRENT) != 0) {
+                fprintf(stderr,
+                    "DiskPass: memory locking is unavailable (%s); continuing with protected allocations where the OS permits them.\n",
+                    strerror(errno));
+            } else {
+                fprintf(stderr,
+                    "DiskPass: MCL_FUTURE is unavailable (%s); current pages are locked, future allocations use per-allocation protection where available.\n",
+                    strerror(full_err));
+            }
+        }
+    } else {
+        fprintf(stderr,
+            "DiskPass: memory locking disabled by DISKPASS_DISABLE_MLOCK=1.\n");
+    }
+#endif
+    db_install_secure_cjson_hooks();
+
+
+    stego_secret_init_mutex();
     if (!gpgme_check_version("1.24.1")) { fprintf(stderr, "FATAL: GPGME >= 1.24.1 with Kyber support required\n"); return 1; }
     gpgme_set_locale(NULL, LC_CTYPE, setlocale(LC_CTYPE, NULL));
     g_unix_signal_add(SIGINT, graceful_shutdown, NULL);
     g_unix_signal_add(SIGTERM, graceful_shutdown, NULL);
     gtk_init(&argc, &argv);
+    i18n_select_system_language();
     i18n_init();
     diskpass_plugins_init();
-    load_config();
-    load_css();
     memset(&g_app, 0, sizeof(g_app));
+    g_app.autolock_seconds = 300;
+    g_app.clipboard_clear_seconds = 30;
     g_app.current_entry_idx = -1;
     g_app.toast_entry_idx = -1;
+    if (!load_config()) {
+        fprintf(stderr, "DiskPass: cannot read or validate configuration.\n");
+        diskpass_plugins_shutdown();
+        i18n_shutdown();
+        return 1;
+    }
+    if (g_app.camouflage_enabled) {
+        g_set_prgname("gnome-calculator");
+        g_set_application_name("GNOME Calculator");
+        if (!g_app.camouflage_hash[0]) {
+            fprintf(stderr, "DiskPass: camouflage enabled but access-code hash is missing.\n");
+            diskpass_plugins_shutdown();
+            i18n_shutdown();
+            return 1;
+        }
+        gboolean calculator_unlocked = diskpass_calculator_run(g_app.camouflage_hash,
+                                     g_app.camouflage_salt,
+                                     g_app.camouflage_config_key);
+        if (!calculator_unlocked) {
+            sodium_memzero(g_app.camouflage_hash, sizeof(g_app.camouflage_hash));
+            diskpass_plugins_shutdown();
+            i18n_shutdown();
+            return 0;
+        }
+        g_app.camouflage_key_valid = TRUE;
+        if (g_app.camouflage_legacy_config) {
+            /* Upgrade old plaintext v5 preferences only after authentication. */
+            if (!save_config()) {
+                fprintf(stderr, "DiskPass: could not upgrade protected configuration.\n");
+                sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+                diskpass_plugins_shutdown();
+                i18n_shutdown();
+                return 1;
+            }
+            g_app.camouflage_legacy_config = FALSE;
+        } else if (!load_config()) {
+            fprintf(stderr, "DiskPass: protected configuration authentication failed.\n");
+            sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+            diskpass_plugins_shutdown();
+            i18n_shutdown();
+            return 1;
+        }
+        /* Keep the camouflage process identity for the entire session. */
+    }
+    if (!g_app.camouflage_enabled && !diskpass_sync_launcher_icon(FALSE))
+        g_warning("DiskPass: could not update user launcher icon");
+    load_css();
     char *icon_path = find_icon_path();
     if (icon_path) {
         icon_pb = gdk_pixbuf_new_from_file_at_size(icon_path, 256, 256, NULL);
         g_free(icon_path);
     }
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), "DiskPass");
+    gtk_window_set_title(GTK_WINDOW(win), g_app.camouflage_enabled ? "Calculator" : "DiskPass");
+    if (g_app.camouflage_enabled) {
+        g_set_prgname("calculator");
+        g_set_application_name("Calculator");
+    } else {
+        g_set_prgname("diskpass");
+        g_set_application_name("DiskPass");
+    }
     gtk_window_set_default_size(GTK_WINDOW(win), 1000, 660);
     gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
-    if (icon_pb) gtk_window_set_icon(GTK_WINDOW(win), icon_pb);
+    gtk_window_set_default_icon_name(g_app.camouflage_enabled ?
+        diskpass_calculator_icon_name() : "diskpass");
+    gtk_window_set_icon_name(GTK_WINDOW(win), g_app.camouflage_enabled ?
+        diskpass_calculator_icon_name() : "diskpass");
+    if (!gtk_icon_theme_has_icon(gtk_icon_theme_get_default(),
+            g_app.camouflage_enabled ? diskpass_calculator_icon_name() : "diskpass") && icon_pb)
+        gtk_window_set_icon(GTK_WINDOW(win), icon_pb);
 
     GtkWidget *hb = gtk_header_bar_new();
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(hb), FALSE);
     gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(hb), FALSE);
 
-    GtkWidget *title_lbl = gtk_label_new("DiskPass");
+    GtkWidget *title_lbl = gtk_label_new(g_app.camouflage_enabled ? "Calculator" : "DiskPass");
     gtk_widget_set_size_request(title_lbl, 160, -1);
     gtk_style_context_add_class(gtk_widget_get_style_context(title_lbl), "title");
     gtk_header_bar_set_custom_title(GTK_HEADER_BAR(hb), title_lbl);
@@ -471,9 +635,32 @@ int main(int argc, char **argv) {
     g_app.window = GTK_WINDOW(win);
     diskpass_plugins_set_parent(g_app.window);
     diskpass_plugins_load_all();
+    GtkWidget *root_overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(win), root_overlay);
     g_app.stack = GTK_STACK(gtk_stack_new());
     gtk_stack_set_transition_type(g_app.stack, GTK_STACK_TRANSITION_TYPE_CROSSFADE);
-    gtk_container_add(GTK_CONTAINER(win), GTK_WIDGET(g_app.stack));
+    gtk_container_add(GTK_CONTAINER(root_overlay), GTK_WIDGET(g_app.stack));
+
+    g_app.privacy_shield = gtk_event_box_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.privacy_shield), "privacy-shield");
+    gtk_widget_set_hexpand(g_app.privacy_shield, TRUE);
+    gtk_widget_set_vexpand(g_app.privacy_shield, TRUE);
+    GtkWidget *shield_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_halign(shield_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(shield_box, GTK_ALIGN_CENTER);
+    GtkWidget *shield_icon = gtk_image_new_from_icon_name("changes-prevent-symbolic", GTK_ICON_SIZE_DIALOG);
+    gtk_style_context_add_class(gtk_widget_get_style_context(shield_icon), "privacy-shield-icon");
+    g_app.privacy_shield_title = gtk_label_new(i18n("privacy_screen_title"));
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.privacy_shield_title), "privacy-shield-title");
+    g_app.privacy_shield_desc = gtk_label_new(i18n("privacy_screen_desc"));
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_app.privacy_shield_desc), "privacy-shield-desc");
+    gtk_box_pack_start(GTK_BOX(shield_box), shield_icon, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(shield_box), g_app.privacy_shield_title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(shield_box), g_app.privacy_shield_desc, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(g_app.privacy_shield), shield_box);
+    gtk_overlay_add_overlay(GTK_OVERLAY(root_overlay), g_app.privacy_shield);
+    gtk_widget_set_no_show_all(g_app.privacy_shield, TRUE);
+    gtk_widget_hide(g_app.privacy_shield);
     build_welcome();
     build_setup();
     build_unlock();
@@ -483,8 +670,11 @@ int main(int argc, char **argv) {
     gtk_stack_set_visible_child_name(g_app.stack, "welcome");
     gtk_widget_add_events(win,
         GDK_KEY_PRESS_MASK | GDK_POINTER_MOTION_MASK |
-        GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK);
+        GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK | GDK_FOCUS_CHANGE_MASK);
+    g_signal_connect(win, "key-press-event", G_CALLBACK(on_security_key_press), NULL);
     g_signal_connect(win, "key-press-event", G_CALLBACK(on_user_activity), NULL);
+    g_signal_connect(win, "focus-out-event", G_CALLBACK(on_security_focus_out), NULL);
+    g_signal_connect(win, "focus-in-event", G_CALLBACK(on_security_focus_in), NULL);
     g_signal_connect(win, "motion-notify-event", G_CALLBACK(on_user_activity), NULL);
     g_signal_connect(win, "button-press-event", G_CALLBACK(on_user_activity), NULL);
     g_signal_connect(win, "scroll-event", G_CALLBACK(on_user_activity), NULL);
@@ -493,17 +683,23 @@ int main(int argc, char **argv) {
     set_tree_visible(FALSE);
     set_notes_visible(FALSE);
     gtk_revealer_set_reveal_child(GTK_REVEALER(g_app.toast_revealer), FALSE);
-    g_app.connection_timer_id = g_timeout_add_seconds(5, connection_check_cb, NULL);
+    g_app.connection_timer_id = g_timeout_add_seconds(30, connection_check_cb, NULL);
     gtk_main();
+    tree_fill_cancel();
     cleanup_system_lock_monitor();
     if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
     if (g_app.autolock_timer_id) g_source_remove(g_app.autolock_timer_id);
+    if (g_app.privacy_shield_timer_id) g_source_remove(g_app.privacy_shield_timer_id);
+    if (g_app.focus_lock_timer_id) g_source_remove(g_app.focus_lock_timer_id);
     if (g_app.connection_timer_id) g_source_remove(g_app.connection_timer_id);
     if (g_toast_timer_id) g_source_remove(g_toast_timer_id);
     if (g_plugin_status_timer_id) g_source_remove(g_plugin_status_timer_id);
     if (g_known_uuids) g_hash_table_destroy(g_known_uuids);
+    g_db_external_commit_hook = NULL;
     if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
+    carrier_unmount_cleanup();
     free(g_app.current_file);
+    g_free(g_app.config_last_db);
     free(g_app.expected_fp);
     free(g_tree_filter_needle);
     g_tree_filter_needle = NULL;
@@ -514,6 +710,9 @@ int main(int argc, char **argv) {
     GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
     gtk_clipboard_set_text(primary, "", 0);
     diskpass_plugins_shutdown();
+    sodium_memzero(g_app.camouflage_hash, sizeof(g_app.camouflage_hash));
+    sodium_memzero(g_app.camouflage_salt, sizeof(g_app.camouflage_salt));
+    sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
     i18n_shutdown();
     return 0;
 }

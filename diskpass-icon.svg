@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">DiskPass</title>
+  <desc id="desc">A stack of graphite disks with a centered turquoise padlock.</desc>
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="#1c1c1c"/>
+  <rect x="17" y="17" width="222" height="222" rx="47" stroke="#3a3a3a" stroke-width="2"/>
+  <g stroke="#a0a0a0" stroke-width="4" stroke-linejoin="round">
+    <path d="M44 160v28c0 18 38 32 84 32s84-14 84-32v-28Z" fill="#262626"/>
+    <ellipse cx="128" cy="160" rx="84" ry="32" fill="#303030"/>
+    <path d="M44 120v28c0 18 38 32 84 32s84-14 84-32v-28Z" fill="#262626"/>
+    <ellipse cx="128" cy="120" rx="84" ry="32" fill="#303030"/>
+    <path d="M44 80v28c0 18 38 32 84 32s84-14 84-32V80Z" fill="#262626"/>
+    <ellipse cx="128" cy="80" rx="84" ry="32" fill="#303030" stroke="#e0e0e0"/>
+  </g>
+  <ellipse cx="128" cy="80" rx="60" ry="20" stroke="#555555" stroke-width="2"/>
+  <ellipse cx="128" cy="80" rx="15" ry="6" fill="#1c1c1c" stroke="#a0a0a0" stroke-width="3"/>
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <path d="M105 145v-20a23 23 0 0 1 46 0v20" stroke="#1c1c1c" stroke-width="17"/>
+    <rect x="89" y="140" width="78" height="64" rx="15" fill="#1c1c1c" stroke="#1c1c1c" stroke-width="8"/>
+    <path d="M105 145v-20a23 23 0 0 1 46 0v20" stroke="#4ec9b0" stroke-width="9"/>
+    <rect x="95" y="145" width="66" height="55" rx="12" fill="#17221f" stroke="#4ec9b0" stroke-width="5"/>
+    <circle cx="128" cy="167" r="7" fill="#4ec9b0"/>
+    <path d="M128 171v11" stroke="#4ec9b0" stroke-width="6"/>
+  </g>
+</svg>

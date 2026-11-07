@@ -1,0 +1,27 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * GTK3 adaptation of GNOME Calculator (libadwaita dark look).
+ * Scoped to .embedded-calculator; no global screen provider. */
+.embedded-calculator { background-color: #222226; }
+.embedded-calculator button {
+  font-size: 1.1em; padding: 2px 4px; min-height: 0; min-width: 0;
+  border-radius: 8px; border: none; box-shadow: none; outline: none;
+  background-image: none; background-color: #38383c; color: #ffffff;
+  text-shadow: none; -gtk-icon-shadow: none;
+}
+.embedded-calculator button:hover { background-color: #424247; }
+.embedded-calculator button:active,
+.embedded-calculator button:checked { background-color: #4e4e53; }
+.embedded-calculator button.clear-button,
+.embedded-calculator button.number-button { font-size: 1.2em; font-weight: bold; }
+.embedded-calculator button.number-button { background-color: #4e4e51; }
+.embedded-calculator button.number-button:hover { background-color: #58585b; }
+.embedded-calculator button.number-button:active { background-color: #666669; }
+.embedded-calculator button.operator-button,
+.embedded-calculator button.suggested-action { font-size: 1.6em; }
+.embedded-calculator button.suggested-action { background-color: #3a944a; color: #ffffff; }
+.embedded-calculator button.suggested-action:hover { background-color: #43a053; }
+.embedded-calculator button.suggested-action:active { background-color: #338542; }
+.embedded-calculator button:disabled { color: rgba(255,255,255,.35); background-color: #38383c; }
+.embedded-calculator button.inverse-button { background-color: #2d3631; color: #83d48d; font-size: 1.1em; }
+.embedded-calculator button.inverse-button:hover { background-color: #34403a; }
+.embedded-calculator button.inverse-button:checked { background-color: #3d5c46; color: #a8f0b2; }
