@@ -2360,9 +2360,18 @@ static void unlock_job_done(GObject *source, GAsyncResult *result, gpointer user
                      
                     opened->legacy_read_only = was_read_only;
                     char fail_buf[640];
-                    snprintf(fail_buf, sizeof(fail_buf),
-                        i18n("migrate_failed"),
-                        migrate_err[0] ? migrate_err : "internal error");
+                    const char *migrate_format = i18n("migrate_failed");
+                    const char *migrate_detail = migrate_err[0] ? migrate_err : "internal error";
+                    const char *migrate_placeholder = strstr(migrate_format, "%s");
+                    if (migrate_placeholder) {
+                        size_t migrate_prefix_len = (size_t)(migrate_placeholder - migrate_format);
+                        snprintf(fail_buf, sizeof(fail_buf), "%.*s%s%s",
+                            (int)migrate_prefix_len, migrate_format,
+                            migrate_detail, migrate_placeholder + 2);
+                    } else {
+                        snprintf(fail_buf, sizeof(fail_buf), "%s: %s",
+                            migrate_format, migrate_detail);
+                    }
                     GtkWidget *fail_dlg = gtk_message_dialog_new(g_app.window,
                         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
                         GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", fail_buf);
