@@ -47,3 +47,10 @@ Settings path:
 ```
 
 Only trusted native plugins should be installed because `.so` plugins run inside the DiskPass process.
+
+
+### Explicit plugin loading
+
+Open and unlock a database, then select Plugins → Загрузить доверенные плагины… and confirm trust. Installation alone does not load the plugin. The action appears immediately after loading. Native plugins are not sandboxed and remain loaded until exit. Restart before loading an updated binary.
+
+The installer works from any directory and requires Python 3. It uses the absolute DISKPASS_PRIVATE_DIR override, otherwise ~/.diskpass; both the base and plugins directories must be owned by the current user with private permissions (0700).

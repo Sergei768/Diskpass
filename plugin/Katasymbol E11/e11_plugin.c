@@ -6,6 +6,7 @@
 #include <glib/gstdio.h>
 #include <pango/pangocairo.h>
 #include <lzma.h>
+#include <sodium.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -104,6 +105,18 @@ typedef struct {
     int density;
     int speed;
     gboolean auto_detect;
+     
+
+
+
+    gboolean auto_detect_confirmed;
+    char pinned_mac[24];
+     
+
+
+
+    unsigned char binding_key[32];
+    gboolean have_binding_key;
     GCancellable *cancel;
 } E11PrintParams;
 
@@ -1066,56 +1079,76 @@ static gboolean bluez_connect(E11Bluez *bz, const char *mac, GCancellable *cance
     g_main_context_push_thread_default(bz->context);
 
     bz->bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, bz->cancel, error);
-    if (!bz->bus) return FALSE;
+    if (!bz->bus) goto fail;
 
-    if (!bluez_discover_device(bz, mac, &bz->device_path, error)) return FALSE;
+    if (!bluez_discover_device(bz, mac, &bz->device_path, error)) goto fail;
 
-    GError *conn_err = NULL;
-    GVariant *r = g_dbus_connection_call_sync(bz->bus, "org.bluez", bz->device_path,
-        "org.bluez.Device1", "Connect", NULL, NULL,
-        G_DBUS_CALL_FLAGS_NONE, E11_CONNECT_MS, bz->cancel, &conn_err);
-    if (r) {
-        g_variant_unref(r);
-    } else if (remote_error_is(conn_err, "org.bluez.Error.AlreadyConnected") ||
-               remote_error_is(conn_err, "org.bluez.Error.InProgress")) {
-        g_clear_error(&conn_err);
-    } else {
-        g_propagate_prefixed_error(error, conn_err, "BlueZ Connect: ");
-        return FALSE;
-    }
-
-    char *char_path = NULL;
-    const gint64 deadline = g_get_monotonic_time() + (gint64)E11_SERVICES_MS * 1000;
-    while (g_get_monotonic_time() < deadline) {
-        if (cancelled(bz->cancel, error)) return FALSE;
-        GError *find_err = NULL;
-        char_path = bluez_find_characteristic(bz->bus, bz->device_path, bz->cancel, &find_err);
-        if (char_path) { g_clear_error(&find_err); break; }
-        if (find_err) {
-            g_propagate_prefixed_error(error, find_err, "BlueZ services: ");
-            return FALSE;
+    {
+        GError *conn_err = NULL;
+        GVariant *r = g_dbus_connection_call_sync(bz->bus, "org.bluez", bz->device_path,
+            "org.bluez.Device1", "Connect", NULL, NULL,
+            G_DBUS_CALL_FLAGS_NONE, E11_CONNECT_MS, bz->cancel, &conn_err);
+        if (r) {
+            g_variant_unref(r);
+        } else if (remote_error_is(conn_err, "org.bluez.Error.AlreadyConnected") ||
+                   remote_error_is(conn_err, "org.bluez.Error.InProgress")) {
+            g_clear_error(&conn_err);
+        } else {
+            g_propagate_prefixed_error(error, conn_err, "BlueZ Connect: ");
+            goto fail;
         }
-        g_usleep(200 * 1000);
-    }
-    if (!char_path) {
-        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
-                    "E11 GATT characteristic %s was not found", E11_CHAR_UUID);
-        return FALSE;
     }
 
-    bz->characteristic = g_dbus_proxy_new_sync(bz->bus, G_DBUS_PROXY_FLAGS_NONE, NULL,
-        "org.bluez", char_path, "org.bluez.GattCharacteristic1", bz->cancel, error);
-    g_free(char_path);
-    if (!bz->characteristic) return FALSE;
-    g_signal_connect(bz->characteristic, "g-properties-changed",
-                     G_CALLBACK(on_characteristic_properties), bz);
+    {
+        char *char_path = NULL;
+        const gint64 deadline = g_get_monotonic_time() + (gint64)E11_SERVICES_MS * 1000;
+        while (g_get_monotonic_time() < deadline) {
+            if (cancelled(bz->cancel, error)) goto fail;
+            GError *find_err = NULL;
+            char_path = bluez_find_characteristic(bz->bus, bz->device_path, bz->cancel, &find_err);
+            if (char_path) { g_clear_error(&find_err); break; }
+            if (find_err) {
+                g_propagate_prefixed_error(error, find_err, "BlueZ services: ");
+                goto fail;
+            }
+            g_usleep(200 * 1000);
+        }
+        if (!char_path) {
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                        "E11 GATT characteristic %s was not found", E11_CHAR_UUID);
+            goto fail;
+        }
 
-    r = g_dbus_proxy_call_sync(bz->characteristic, "StartNotify", NULL,
-        G_DBUS_CALL_FLAGS_NONE, 5000, bz->cancel, error);
-    if (!r) return FALSE;
-    g_variant_unref(r);
+        bz->characteristic = g_dbus_proxy_new_sync(bz->bus, G_DBUS_PROXY_FLAGS_NONE, NULL,
+            "org.bluez", char_path, "org.bluez.GattCharacteristic1", bz->cancel, error);
+        g_free(char_path);
+        if (!bz->characteristic) goto fail;
+        g_signal_connect(bz->characteristic, "g-properties-changed",
+                         G_CALLBACK(on_characteristic_properties), bz);
+    }
+
+    {
+        GVariant *r = g_dbus_proxy_call_sync(bz->characteristic, "StartNotify", NULL,
+            G_DBUS_CALL_FLAGS_NONE, 5000, bz->cancel, error);
+        if (!r) goto fail;
+        g_variant_unref(r);
+    }
     bz->notify_started = TRUE;
     return TRUE;
+
+fail:
+     
+
+
+
+    if (bz->characteristic) { g_object_unref(bz->characteristic); bz->characteristic = NULL; }
+    if (bz->device_path) { g_free(bz->device_path); bz->device_path = NULL; }
+    if (bz->bus) { g_object_unref(bz->bus); bz->bus = NULL; }
+    g_main_context_pop_thread_default(bz->context);
+    g_main_context_unref(bz->context); bz->context = NULL;
+    g_async_queue_unref(bz->notifications); bz->notifications = NULL;
+    g_object_unref(bz->cancel); bz->cancel = NULL;
+    return FALSE;
 }
 
 static void bluez_cleanup(E11Bluez *bz)
@@ -1323,7 +1356,10 @@ static void build_frame(const guint8 *chunk, gsize chunk_len, guint8 index,
 }
 
 static gboolean printer_print(E11Bluez *bz, const GByteArray *comp,
-                              guint16 raw_len, guint16 speed, GError **error)
+                              guint16 raw_len, guint16 speed,
+                              const unsigned char *binding_key,
+                              gboolean have_binding_key,
+                              GError **error)
 {
     GBytes *r = printer_cmd(bz, CMD_CHECK_DEVICE, 0, 0, TRUE, error);
     if (!r) return FALSE;
@@ -1358,6 +1394,17 @@ static gboolean printer_print(E11Bluez *bz, const GByteArray *comp,
         const gsize n = MIN((gsize)PAYLOAD, comp->len - off);
         guint8 frame[512];
         build_frame(comp->data + off, n, (guint8)i, total, frame);
+         
+
+
+
+
+
+        if (have_binding_key && binding_key) {
+            unsigned char mic[16];
+            crypto_generichash(mic, sizeof mic, frame, 496, binding_key, 32);
+            memcpy(frame + 496, mic, sizeof mic);
+        }
         if (!send_frame(bz, frame, sizeof(frame), i + 1u != total, error)) return FALSE;
     }
 
@@ -1374,6 +1421,9 @@ static void print_params_free(E11PrintParams *p)
     g_clear_pointer(&p->address, g_free);
     g_clear_pointer(&p->text, g_free);
     if (p->cancel) g_object_unref(p->cancel);
+    sodium_memzero(p->binding_key, sizeof p->binding_key);
+    p->have_binding_key = FALSE;
+    sodium_memzero(p->pinned_mac, sizeof p->pinned_mac);
     g_free(p);
 }
 
@@ -1451,10 +1501,23 @@ static gpointer e11_worker(gpointer user_data)
         }
     }
 
-    if (!connected && p->auto_detect) {
+    if (!connected && p->auto_detect && p->auto_detect_confirmed && p->pinned_mac[0]) {
+         
+
+
+
+
+
         post_status(tr("e11_searching", "E11: searching for printer…"), 0);
         char *detected = bluez_auto_detect_e11(p->cancel, &error);
         if (!detected) goto done;
+        if (g_ascii_strcasecmp(detected, p->pinned_mac) != 0) {
+            g_set_error(&error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                "Auto-detected device %s does not match the pinned MAC %s",
+                detected, p->pinned_mac);
+            g_free(detected);
+            goto done;
+        }
         g_free(p->address);
         p->address = detected;
         if (!bluez_connect(&bz, p->address, p->cancel, &error)) goto done;
@@ -1471,7 +1534,9 @@ static gpointer e11_worker(gpointer user_data)
         goto done;
     }
     post_status(tr("e11_printing", "E11: printing…"), 0);
-    if (!printer_print(&bz, comp, raw_len, (guint16)p->speed, &error)) goto done;
+    if (!printer_print(&bz, comp, raw_len, (guint16)p->speed,
+            p->have_binding_key ? p->binding_key : NULL,
+            p->have_binding_key, &error)) goto done;
     result->success = TRUE;
     result->device_address = g_strdup(p->address);
 
@@ -1522,6 +1587,56 @@ static gboolean start_print_job(const char *address, const char *text,
     p->density = density;
     p->speed = speed;
     p->auto_detect = auto_detect;
+     
+
+
+
+    p->auto_detect_confirmed = FALSE;
+    if (address && address[0]) {
+        g_strlcpy(p->pinned_mac, address, sizeof(p->pinned_mac));
+        p->auto_detect_confirmed = TRUE;  
+    }
+     
+
+
+
+
+
+    {
+        const char *home = g_get_home_dir();
+        char *dk_path = g_build_filename(home, ".diskpass", "device.key", NULL);
+        char *dk_parent = dk_path ? g_path_get_dirname(dk_path) : NULL;
+        gboolean parent_safe = FALSE;
+        if (dk_parent) {
+            struct stat pst;
+            parent_safe = lstat(dk_parent, &pst) == 0 && S_ISDIR(pst.st_mode) &&
+                !S_ISLNK(pst.st_mode) && pst.st_uid == geteuid() && (pst.st_mode & 022) == 0;
+            g_free(dk_parent);
+        }
+        int dk = (parent_safe && dk_path) ?
+            open(dk_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        g_free(dk_path);
+        if (dk >= 0) {
+            struct stat dst;
+            gboolean safe = fstat(dk, &dst) == 0 && S_ISREG(dst.st_mode) &&
+                dst.st_uid == geteuid() && (dst.st_mode & 077) == 0 &&
+                dst.st_size == 32;
+            if (safe) {
+                unsigned char devkey[32];
+                ssize_t got = read(dk, devkey, sizeof devkey);
+                close(dk);
+                if (got == 32 && address && address[0]) {
+                    crypto_generichash(p->binding_key, sizeof p->binding_key,
+                        (const unsigned char *)address, strlen(address),
+                        devkey, sizeof devkey);
+                    p->have_binding_key = TRUE;
+                    sodium_memzero(devkey, sizeof devkey);
+                }
+            } else {
+                close(dk);
+            }
+        }
+    }
     g_job.cancel = g_cancellable_new();
     p->cancel = g_object_ref(g_job.cancel);
     g_job.thread = g_thread_new("diskpass-e11", e11_worker, p);

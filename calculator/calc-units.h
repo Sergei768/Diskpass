@@ -7,7 +7,7 @@ guint calc_units_n_categories(void);
 const char *calc_units_category_name(guint cat);
 guint calc_units_n(guint cat);
 const char *calc_units_name(guint cat, guint unit);
-/* Перевод value из единицы from в единицу to внутри категории cat. */
+ 
 double calc_units_convert(guint cat, guint from, guint to, double value);
 G_END_DECLS
 #endif

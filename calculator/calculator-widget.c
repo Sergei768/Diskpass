@@ -31,7 +31,7 @@ typedef struct {
 #define FUNCI(l, t, tip, c, r, al, at) KEYN(l, "cal.insert-function", t, "function-button", tip, c, r, 1, 1, 0, K_NORMAL, al, NULL, at)
 #define INV KEYN("⇧<sup>−1</sup>", "cal.set-inverse", "", "inverse-button", "Inverse functions", 0, 0, 1, 1, 0, K_INVERSE, NULL, NULL, NULL)
 
-/* ---- правый блок (общий для всех режимов с цифрами); колонки со смещением ---- */
+ 
 static const Key rb_top[] = {
     PLAIN("C", "cal.clear", "", "clear-button", "Clear", 0, 0),
     KEYN("↑n", "cal.set-number-mode", "superscript", "function-button", "Superscript mode", 1, 0, 1, 1, 0, K_SUP, NULL, NULL, NULL),
@@ -58,14 +58,14 @@ static const Key rb_bottom[] = {
     KEYN("x", "cal.show-variables", "", "function-button", "Variables and constants", 2, 4, 1, 1, 0, K_MENU, NULL, NULL, NULL),
     KEYN("f(x)", "cal.show-functions", "", "function-button", "Additional functions", 3, 4, 1, 1, 0, K_MENU, NULL, NULL, NULL),
 };
-/* программирование: узкие цифры во вложенной сетке 5×3 */
+ 
 static const Key prog_digits[] = {
     DIG("B", 0, 0, 1), DIG("C", 1, 0, 1), DIG("D", 2, 0, 1), DIG("E", 3, 0, 1), DIG("F", 4, 0, 1),
     DIG("6", 0, 1, 1), DIG("7", 1, 1, 1), DIG("8", 2, 1, 1), DIG("9", 3, 1, 1), DIG("A", 4, 1, 1),
     DIG("1", 0, 2, 1), DIG("2", 1, 2, 1), DIG("3", 2, 2, 1), DIG("4", 3, 2, 1), DIG("5", 4, 2, 1),
 };
 
-/* ---- левые блоки ---- */
+ 
 #define X2 "<i>x</i><sup>2</sup>"
 #define XY "<i>x</i><sup><i>y</i></sup>"
 static const Key adv_left[] = {
@@ -100,7 +100,7 @@ static const Key fin_top[] = {
     FUNCI("log", "log(", "Logarithm", 3, 0, "10<sup><i>x</i></sup>", "10^"),
     FUNCI("ln", "ln(", "Natural logarithm", 4, 0, "e<sup><i>x</i></sup>", "exp("),
 };
-/* финансовые функции: вложенная сетка 3×4 */
+ 
 #define FIN(l, t, tip, c, r) KEYN(l, "cal.insert-function", t, "function-button", tip, c, r, 1, 1, 1, K_NORMAL, NULL, NULL, NULL)
 static const Key fin_funcs[] = {
     FIN("Ctrm", "ctrm(", "Compounding term", 0, 0), FIN("Ddb", "ddb(", "Double declining depreciation", 1, 0), FIN("Fv", "fv(", "Future value", 2, 0),
@@ -131,7 +131,7 @@ static const Key prog_left[] = {
     KEYN("64-бита", "cal.show-bits", "", "function-button", "Word size", 2, 4, 2, 1, 0, K_MENU, NULL, NULL, NULL),
     PLAIN("á", "cal.insert-character", "", "function-button", "Insert character", 4, 4),
 };
-/* конвертер: 3 колонки */
+ 
 static const Key conv_keys[] = {
     PLAIN("C", "cal.clear", "", "clear-button", "Clear", 0, 0),
     PLAIN("⇅", "cal.swap-units", "", "function-button", "Swap units", 1, 0),
@@ -144,10 +144,10 @@ static const Key conv_keys[] = {
     PLAIN("°′″", "cal.insert-degrees", "", "function-button", "Degrees, minutes, seconds", 2, 4),
 };
 
-/* ---- построение ---- */
+ 
 static void set_label_text(GtkWidget *label, const gchar *text)
 {
-    if (!GTK_IS_LABEL(label) || !text) return;
+    if (!text) text = "";
     if (strchr(text, '<')) gtk_label_set_markup(GTK_LABEL(label), text);
     else gtk_label_set_text(GTK_LABEL(label), text);
 }
@@ -184,8 +184,16 @@ static void clicked(GtkButton *button, CalculatorWidget *self)
     g_signal_emit(self, action_signal, 0, action, target);
 }
 
+static void calculator_widget_finalize(GObject *object)
+{
+    CalculatorWidget *self = CALCULATOR_WIDGET(object);
+    g_clear_pointer(&self->buttons, g_list_free);
+    G_OBJECT_CLASS(calculator_widget_parent_class)->finalize(object);
+}
+
 static void calculator_widget_class_init(CalculatorWidgetClass *klass)
 {
+    G_OBJECT_CLASS(klass)->finalize = calculator_widget_finalize;
     action_signal = g_signal_new("action", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
         0, NULL, NULL, NULL, G_TYPE_NONE, 2, G_TYPE_STRING, G_TYPE_STRING);
 }
@@ -223,7 +231,7 @@ static void add_keys(CalculatorWidget *self, GtkWidget **grids, GtkCssProvider *
         gtk_widget_set_focus_on_click(b, FALSE);
         gtk_widget_set_tooltip_text(b, key->tip);
         gtk_style_context_add_class(gtk_widget_get_style_context(b), key->style);
-        /* Provider belongs only to these buttons, never to the host screen. */
+         
         gtk_style_context_add_provider(gtk_widget_get_style_context(b), GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
         g_object_set_data(G_OBJECT(b), "calculator-key", (gpointer)key);
         if (label) g_object_set_data(G_OBJECT(b), "key-label", label);

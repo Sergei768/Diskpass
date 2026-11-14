@@ -4,12 +4,18 @@
 
 #include <gtk/gtk.h>
 
-/* Uses GTK's currently selected icon theme and inherits its fallback chain. */
+ 
 const char *diskpass_calculator_icon_name(void);
 
-/* Updates Icon= and NoDisplay= in a per-user launcher, restoring both
- * when calculator mode is disabled. The executable and files remain visible
- * to OS inventory and filesystem searches. Never changes system files. */
+ 
+void diskpass_set_default_icon(gboolean calculator_mode);
+void diskpass_set_window_icon(GtkWindow *window, gboolean calculator_mode);
+ 
+void diskpass_bind_window_launcher(GtkWindow *window);
+
+ 
+
+
 gboolean diskpass_sync_launcher_icon(gboolean calculator_mode);
 
 #endif

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="485" viewBox="0 0 1600 485" role="img">
+<title>Diskpass — encrypted DPENV5 database / шифрование базы</title>
+<rect x="0" y="0" width="1600" height="485" fill="#000000"/>
+<defs><marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 1 1 L 11 6 L 1 11 Z" fill="#F3F4F7"/></marker></defs>
+<text x="800" y="59" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="43" font-weight="bold">Database Encryption</text>
+<rect x="42" y="203" width="270" height="115" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<g fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" text-anchor="middle" font-size="22" font-weight="bold">
+<text x="177" y="231">Records and</text>
+<text x="177" y="257">passwords</text>
+</g>
+<text x="177" y="282" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" font-weight="normal">JSON / plaintext</text>
+<path d="M 312 260 H 393" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="398" y="200" width="300" height="121" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="548" y="237" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="23" font-weight="bold">AEAD Encryption</text>
+<text x="548" y="276" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" font-weight="normal">XChaCha20-Poly1305</text>
+<text x="548" y="301" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">K, nonce, AAD</text>
+<path d="M 698 260 H 788" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="793" y="200" width="295" height="121" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="941" y="240" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="23" font-weight="bold">DPENV5 Container</text>
+<text x="941" y="278" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" font-weight="normal">envelope + ciphertext</text>
+<path d="M 1088 260 H 1195" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1200" y="200" width="351" height="121" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="1375" y="247" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Encrypted database</text>
+<text x="1375" y="294" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="26" font-weight="normal">*.dpdb</text>
+<rect x="793" y="85" width="295" height="79" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="940" y="117" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">OpenPGP / GPGME</text>
+<text x="940" y="145" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">Key envelope and signature</text>
+<path d="M 941 164 V 198" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="793" y="364" width="295" height="79" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="940" y="396" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">BLAKE2b-256</text>
+<text x="940" y="424" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">Padded plaintext digest</text>
+<path d="M 941 364 V 323" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+</svg>

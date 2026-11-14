@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "calc-units.h"
-#include <math.h>
 
-/* factor: сколько базовых единиц в одной единице (кроме температуры) */
+ 
 typedef struct { const char *name; double factor; } Unit;
 typedef struct { const char *name; const Unit *units; guint n; gboolean temperature; } Category;
 
@@ -43,19 +42,15 @@ static const Category cats[] = {
 };
 
 guint calc_units_n_categories(void) { return G_N_ELEMENTS(cats); }
-const char *calc_units_category_name(guint c) { return c < G_N_ELEMENTS(cats) ? cats[c].name : NULL; }
-guint calc_units_n(guint c) { return c < G_N_ELEMENTS(cats) ? cats[c].n : 0; }
-const char *calc_units_name(guint c, guint u) {
-    return c < G_N_ELEMENTS(cats) && u < cats[c].n ? cats[c].units[u].name : NULL;
-}
+const char *calc_units_category_name(guint c) { return cats[c].name; }
+guint calc_units_n(guint c) { return cats[c].n; }
+const char *calc_units_name(guint c, guint u) { return cats[c].units[u].name; }
 
 static double to_celsius(guint u, double v) { return u == 0 ? v : u == 1 ? (v - 32) * 5 / 9 : v - 273.15; }
 static double from_celsius(guint u, double v) { return u == 0 ? v : u == 1 ? v * 9 / 5 + 32 : v + 273.15; }
 
 double calc_units_convert(guint c, guint from, guint to, double value)
 {
-    if (c >= G_N_ELEMENTS(cats) || from >= cats[c].n || to >= cats[c].n || !isfinite(value))
-        return NAN;
     if (cats[c].temperature) return from_celsius(to, to_celsius(from, value));
     return value * cats[c].units[from].factor / cats[c].units[to].factor;
 }

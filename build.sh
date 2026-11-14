@@ -97,6 +97,10 @@ if [[ "$missing" -ne 0 ]]; then
     echo "  sudo apt install build-essential pkg-config libgtk-3-dev libglib2.0-dev libgpgme-dev libsodium-dev libcjson-dev libjpeg-dev libwebp-dev libpango1.0-dev liblzma-dev imagemagick bluez fonts-dejavu-core"
     exit 1
 fi
+if ! pkg-config --atleast-version=1.24.1 gpgme; then
+    echo "ERROR: gpgme >= 1.24.1 is required (ML-KEM/Kyber support); found $(pkg-config --modversion gpgme)" >&2
+    exit 1
+fi
 ok "All dependencies are in place"
 
 if ! cmp -s "$APP_SRC_DIR/diskpass.h" "$PLUGIN_SRC_DIR/diskpass.h"; then
@@ -110,13 +114,21 @@ ok "Plugin ABI header matches"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+HARDENING_FLAGS=()
+for flag in -fcf-protection=full -fstack-clash-protection; do
+    if gcc -Werror "$flag" -x c -c /dev/null -o "$BUILD_DIR/flag-probe.o" >/dev/null 2>&1; then
+        HARDENING_FLAGS+=("$flag")
+    fi
+done
+rm -f "$BUILD_DIR/flag-probe.o"
+
 log "Compiling DiskPass..."
 
 
-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security -Werror=format \
+gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -Wformat=2 -Wformat-security -Werror=format \
     -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     -fPIE -fvisibility=hidden \
-    -fcf-protection=full -fstack-clash-protection \
+    "${HARDENING_FLAGS[@]}" \
     -Werror=implicit-function-declaration \
     -Werror=incompatible-pointer-types \
     $(pkg-config --cflags gtk+-3.0 gio-2.0 gmodule-2.0 gpgme libsodium libcjson libjpeg libwebp) \
@@ -134,9 +146,9 @@ ok "DiskPass build completed"
 
 log "Compiling Katasymbol E11 plugin..."
 
-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security -Werror=format \
+gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -Wformat=2 -Wformat-security -Werror=format \
     -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-    -fvisibility=hidden -fcf-protection=full -fstack-clash-protection \
+    -fvisibility=hidden "${HARDENING_FLAGS[@]}" \
     -Werror=implicit-function-declaration \
     -Werror=incompatible-pointer-types \
     -I"$APP_SRC_DIR" \
@@ -147,6 +159,20 @@ gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security -Werror=f
     -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 ok "E11 plugin build completed"
 
+
+for dir in "$DOT_DIR" "$PLUGIN_DIR" "$LANG_DIR" "$CACHE_DIR"; do
+    if [[ -L "$dir" || ( -e "$dir" && ( ! -d "$dir" || ! -O "$dir" ) ) ]]; then
+        err "Private path must be a real directory owned by you: $dir"
+        exit 1
+    fi
+done
+for file in "$DOT_DIR/diskpass-icon.svg" "$PLUGIN_DIR/e11_printer.so"; do
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "Unsafe existing private file: $file"
+        exit 1
+    fi
+done
+
 log "Creating user directories..."
 install -d -m 0700 "$DOT_DIR" "$PLUGIN_DIR" "$LANG_DIR" "$CACHE_DIR"
 install -d -m 0755 "$BIN_DIR" "$DESKTOP_DIR"
@@ -154,31 +180,49 @@ install -d -m 0755 "$BIN_DIR" "$DESKTOP_DIR"
 log "Installing DiskPass..."
 install -m 0755 "$BUILD_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
 
-log "Installing E11 plugin..."
-install -m 0755 "$BUILD_DIR/e11_printer.so" "$PLUGIN_DIR/e11_printer.so"
+log "E11 plugin is compiled but NOT installed:"
+log "the host loader is disabled (diskpass_main.c: native plugins"
+log "are disabled). Install manually only after an authenticated"
+log "enable flow exists in the app."
 
-plugin_uid="$(stat -c '%u' "$PLUGIN_DIR/e11_printer.so")"
-if [[ "$plugin_uid" != "$(id -u)" ]]; then
-    err "Installed plugin has the wrong owner."
-    exit 1
+plugin_uid="$(id -u)"
+if [[ -e "$PLUGIN_DIR/e11_printer.so" || -L "$PLUGIN_DIR/e11_printer.so" ]]; then
+    plugin_uid="$(stat -c '%u' "$PLUGIN_DIR/e11_printer.so")"
+    if [[ "$plugin_uid" != "$(id -u)" ]]; then
+        err "Existing plugin has the wrong owner."
+        exit 1
+    fi
+    if [[ -L "$PLUGIN_DIR/e11_printer.so" ]]; then
+        err "Existing plugin unexpectedly became a symlink."
+        exit 1
+    fi
+    ok "Existing plugin ownership and file type are safe"
 fi
-if [[ -L "$PLUGIN_DIR/e11_printer.so" ]]; then
-    err "Installed plugin unexpectedly became a symlink."
-    exit 1
-fi
-ok "Plugin ownership and file type are safe"
 
 log "Installing scalable application icon..."
 install -d -m 0755 "$ICON_THEME_DIR/scalable/apps"
 install -m 0644 "$ICON_FILE" "$ICON_THEME_DIR/scalable/apps/$APP_NAME.svg"
 install -m 0644 "$ICON_FILE" "$DOT_DIR/diskpass-icon.svg"
 
+desktop_exec_path(){
+    local value="$1"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || { err "Newlines are not supported in the executable path"; return 1; }
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\$/\\\$}"
+    value="${value//\`/\\\`}"
+    value="${value//%/%%}"
+
+    value="${value//\\/\\\\}"
+    printf '"%s"' "$value"
+}
+DESKTOP_EXEC="$(desktop_exec_path "$BIN_DIR/$APP_NAME")"
 log "Registering desktop application..."
 cat > "$DESKTOP_DIR/$APP_NAME.desktop" <<EOF_DESKTOP
 [Desktop Entry]
 Name=DiskPass
 Comment=Secure disk password and label manager
-Exec=$BIN_DIR/$APP_NAME
+Exec=$DESKTOP_EXEC
 Icon=$APP_NAME
 Type=Application
 Terminal=false

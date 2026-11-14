@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="500" viewBox="0 0 1600 500" role="img">
+<title>Diskpass — physical tag generation / формирование тега</title>
+<rect x="0" y="0" width="1600" height="500" fill="#000000"/>
+<defs><marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 1 1 L 11 6 L 1 11 Z" fill="#F3F4F7"/></marker></defs>
+<text x="800" y="59" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="43" font-weight="bold">Physical Tag Generation</text>
+<rect x="34" y="95" width="260" height="60" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="164" y="122" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Media type</text>
+<text x="164" y="145" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">type</text>
+<path d="M 294 125 H 344" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="34" y="170" width="260" height="60" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="164" y="197" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Capacity</text>
+<text x="164" y="220" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">size</text>
+<path d="M 294 200 H 344" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="34" y="245" width="260" height="60" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="164" y="272" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Content label</text>
+<text x="164" y="295" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">content</text>
+<path d="M 294 275 H 344" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="34" y="320" width="260" height="60" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="164" y="347" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Encryption method</text>
+<text x="164" y="370" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">cipher</text>
+<path d="M 294 350 H 344" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="34" y="395" width="260" height="60" rx="14" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="164" y="422" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Disk salt</text>
+<text x="164" y="445" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">dsalt</text>
+<path d="M 294 425 H 344" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 344 125 V 425" fill="none" stroke="#F3F4F7" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 344 275 H 418" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="422" y="223" width="225" height="110" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="535" y="264" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Encoding</text>
+<text x="535" y="304" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" font-weight="normal">cᵢ = code(xᵢ)</text>
+<path d="M 647 278 H 716" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="720" y="223" width="250" height="110" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<g fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" text-anchor="middle" font-size="22" font-weight="bold">
+<text x="845" y="257">Check</text>
+<text x="845" y="284">character</text>
+</g>
+<text x="845" y="309" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" font-weight="normal">BLAKE2b</text>
+<path d="M 970 278 H 1027" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1031" y="223" width="210" height="110" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="1136" y="262" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="bold">Permutation</text>
+<text x="1136" y="303" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" font-weight="normal">π ∈ S₅</text>
+<path d="M 1241 278 H 1292" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1296" y="216" width="279" height="124" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="1436" y="259" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="23" font-weight="bold">Physical tag</text>
+<text x="1436" y="305" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="20" font-weight="normal">HK-T1R-BAM-LK-XYQ</text>
+<text x="845" y="369" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="18" font-weight="normal">noise_key + salt → BLAKE2b</text>
+<text x="1136" y="369" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="16" font-weight="normal">Fixed per database</text>
+</svg>

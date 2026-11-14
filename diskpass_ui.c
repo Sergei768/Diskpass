@@ -38,7 +38,7 @@ typedef struct {
     int        toast_entry_idx;
     db_manager_t *db;
     char *current_file;
-    char *config_last_db; /* preserved across v5 -> protected-format migration */
+    char *config_last_db;  
     char *expected_fp;
 
     char *mounted_carrier_path;
@@ -60,9 +60,11 @@ typedef struct {
     gboolean screenshot_guard;
     gboolean lock_on_focus_loss;
     gboolean camouflage_enabled;
+    gboolean camouflage_locked;
+    GtkWidget *window_title_label;
     char camouflage_hash[crypto_pwhash_STRBYTES];
-    /* A password-derived key only available after the numeric code is entered.
-     * Never persist this key (or the code) to a file. */
+     
+
     unsigned char camouflage_salt[crypto_pwhash_SALTBYTES];
     unsigned char camouflage_config_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
     gboolean camouflage_key_valid;
@@ -106,17 +108,32 @@ static void privacy_shield_set(gboolean visible);
 static char *diskpass_private_dir(void) {
     const char *home = g_get_home_dir();
     if (!home || !home[0]) return NULL;
-    /* Override is for an explicit user-selected neutral directory. It must be
-     * absolute; do not silently use an environment-relative path. */
+     
+
     const char *override = g_getenv("DISKPASS_PRIVATE_DIR");
-    char *dir = (override && override[0] == '/') ? g_strdup(override) :
-        g_build_filename(home, ".diskpass", NULL);
+    const gboolean is_override = override && override[0] == '/';
+    char *dir = is_override ? g_strdup(override) : g_build_filename(home, ".diskpass", NULL);
     if (!dir) return NULL;
-    if (g_mkdir_with_parents(dir, 0700) != 0) { g_free(dir); return NULL; }
-    struct stat st;
-    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) ||
-        st.st_uid != getuid() || (st.st_mode & 077) != 0 || chmod(dir, 0700) != 0) {
+    if (g_mkdir_with_parents(dir, 0700) != 0) {
+        fprintf(stderr, "DiskPass: cannot create private directory %s: %s\n", dir, g_strerror(errno));
         g_free(dir); return NULL;
+    }
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != getuid()) {
+        fprintf(stderr, "DiskPass: %s must be a real directory owned by you (not a symlink)\n", dir);
+        g_free(dir); return NULL;
+    }
+    if ((st.st_mode & 077) != 0) {
+         
+
+        if (is_override) {
+            fprintf(stderr, "DiskPass: DISKPASS_PRIVATE_DIR %s must have mode 0700 (chmod 700 '%s')\n", dir, dir);
+            g_free(dir); return NULL;
+        }
+        if (chmod(dir, 0700) != 0) {
+            fprintf(stderr, "DiskPass: cannot restrict %s to mode 0700: %s\n", dir, g_strerror(errno));
+            g_free(dir); return NULL;
+        }
     }
     return dir;
 }
@@ -170,10 +187,10 @@ static char *config_path(void) {
     return path;
 }
 
-/* Only the mode flag, Argon2id verifier and random KDF salt remain in the
- * clear. User preferences (including last database path) are encrypted and
- * authenticated using a separate key derived from the calculator code.
- * This protects content, not the file name or the existence of DiskPass. */
+ 
+
+
+
 #define CAMOUFLAGE_CONFIG_AD "DiskPass protected configuration v1"
 #define CAMOUFLAGE_CONFIG_LIMIT (1024U * 1024U)
 
@@ -186,7 +203,8 @@ static void apply_user_settings(GKeyFile *kf) {
     if (!err && n >= 0 && n <= 86400) g_app.autolock_seconds = (guint)n;
     g_clear_error(&err);
     n = g_key_file_get_integer(kf, "security", "clipboard_clear_seconds", &err);
-    if (!err && n >= 5 && n <= 600) g_app.clipboard_clear_seconds = (guint)n;
+    if (!err && n >= 5 && n <= 60) g_app.clipboard_clear_seconds = (guint)n;
+    else if (!err && (n < 5 || n > 60)) g_app.clipboard_clear_seconds = 15;
     g_clear_error(&err);
     gboolean b = g_key_file_get_boolean(kf, "security", "screenshot_guard", &err);
     if (!err) g_app.screenshot_guard = b;
@@ -194,8 +212,8 @@ static void apply_user_settings(GKeyFile *kf) {
     b = g_key_file_get_boolean(kf, "security", "lock_on_focus_loss", &err);
     if (!err) g_app.lock_on_focus_loss = b;
     g_clear_error(&err);
-    /* Preserve this setting during the v5 -> encrypted-format migration,
-     * even though the program does not automatically reopen the database. */
+     
+
     char *last_db = g_key_file_get_string(kf, "main", "last_db", NULL);
     g_free(g_app.config_last_db);
     g_app.config_last_db = last_db;
@@ -276,7 +294,7 @@ static gboolean save_config(void) {
     gboolean ok = TRUE;
     if (g_app.camouflage_enabled) {
         if (!g_app.camouflage_key_valid || !g_app.camouflage_hash[0]) {
-            ok = FALSE; /* Never downgrade encrypted settings to plaintext. */
+            ok = FALSE;  
         } else {
             gsize inner_len = 0;
             char *inner = g_key_file_to_data(prefs, &inner_len, NULL);
@@ -359,10 +377,10 @@ static gboolean load_config(void) {
     char *path = config_path();
     if (!path) return FALSE;
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0) { g_free(path); return errno == ENOENT; }
+    if (fd < 0) { int open_errno = errno; g_free(path); return open_errno == ENOENT && !g_app.camouflage_key_valid; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
-        (st.st_mode & (S_IWGRP | S_IWOTH)) || st.st_size < 0 || st.st_size > CAMOUFLAGE_CONFIG_LIMIT) {
+        (st.st_mode & 077) || st.st_nlink != 1 || st.st_size < 0 || st.st_size > CAMOUFLAGE_CONFIG_LIMIT) {
         close(fd); g_free(path); return FALSE;
     }
     gsize len = (gsize)st.st_size;
@@ -385,6 +403,8 @@ static gboolean load_config(void) {
         GError *err = NULL;
         gboolean enabled = g_key_file_get_boolean(kf, "camouflage", "enabled", &err);
         if (err) { enabled = FALSE; g_clear_error(&err); }
+        if (g_app.camouflage_key_valid && !enabled) ok = FALSE;
+        if (!ok) { g_key_file_unref(kf); sodium_memzero(data, len + 1); g_free(data); g_free(path); return FALSE; }
         g_app.camouflage_enabled = enabled;
         if (enabled) {
             char *hash = g_key_file_get_string(kf, "camouflage", "password_hash", NULL);
@@ -394,22 +414,23 @@ static gboolean load_config(void) {
             if (hash) { sodium_memzero(hash, strlen(hash)); g_free(hash); }
             if (ok) {
                 if (g_key_file_has_key(kf, "camouflage", "payload", NULL)) {
-                    /* In protected format, settings are not parsed until the
-                     * user has authenticated and the code-derived key exists. */
+                     
+
                     ok = camouflage_read_salt(kf);
                     if (ok && g_app.camouflage_key_valid)
                         ok = camouflage_decrypt_settings(kf);
                     g_app.camouflage_legacy_config = FALSE;
-                } else if (!g_key_file_has_key(kf, "camouflage", "config_salt", NULL)) {
-                    /* One-time upgrade from v5's plain preferences. Keep its
-                     * settings in memory until successful PIN unlock, then
-                     * atomically replace this file with encrypted content. */
+                } else if (!g_app.camouflage_key_valid &&
+                           !g_key_file_has_key(kf, "camouflage", "config_salt", NULL)) {
+                     
+
+
                     if (!g_app.camouflage_legacy_config)
                         randombytes_buf(g_app.camouflage_salt, sizeof(g_app.camouflage_salt));
                     apply_user_settings(kf);
                     g_app.camouflage_legacy_config = TRUE;
                 } else {
-                    ok = FALSE; /* Broken/incomplete protected configuration. */
+                    ok = FALSE;  
                 }
             }
         } else {
@@ -438,7 +459,7 @@ static char *find_icon_path(void) {
     char *svg_dirs[] = {
         diskpass_private_dir(),
         g_build_filename(g_get_user_data_dir(), "diskpass", NULL),
-        g_strdup("/usr/local/share/diskpass"), g_strdup("/usr/share/diskpass"), g_strdup(".")
+        g_strdup("/usr/local/share/diskpass"), g_strdup("/usr/share/diskpass")
     };
     char *svg_found = NULL;
     for (size_t i = 0; i < ARRAY_SIZE(svg_dirs); i++) {
@@ -486,6 +507,116 @@ static gboolean clipboard_clear_timer(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
+ 
+
+
+
+
+
+typedef struct {
+    GtkEntryBuffer parent;
+    gchar *text;
+    gsize bytes;
+    guint chars;
+} DiskpassSecretBuffer;
+
+typedef struct { GtkEntryBufferClass parent; } DiskpassSecretBufferClass;
+G_DEFINE_TYPE(DiskpassSecretBuffer, diskpass_secret_buffer, GTK_TYPE_ENTRY_BUFFER)
+#define DISKPASS_SECRET_BUFFER_BYTES 65536U
+
+static const gchar *diskpass_secret_buffer_get_text(GtkEntryBuffer *buffer, gsize *bytes) {
+    DiskpassSecretBuffer *self = (DiskpassSecretBuffer *)buffer;
+    if (bytes) *bytes = self->bytes;
+    return self->text;
+}
+
+static guint diskpass_secret_buffer_get_length(GtkEntryBuffer *buffer) {
+    return ((DiskpassSecretBuffer *)buffer)->chars;
+}
+
+static guint diskpass_secret_buffer_insert(GtkEntryBuffer *buffer, guint position,
+    const gchar *chars, guint n_chars)
+{
+    DiskpassSecretBuffer *self = (DiskpassSecretBuffer *)buffer;
+    if (!chars || !n_chars) return 0;
+    position = MIN(position, self->chars);
+    const gchar *end = g_utf8_offset_to_pointer(chars, n_chars);
+    gsize available = DISKPASS_SECRET_BUFFER_BYTES - 1 - self->bytes;
+    while ((gsize)(end - chars) > available && n_chars) {
+        end = g_utf8_find_prev_char(chars, end);
+        n_chars--;
+    }
+    gsize inserted = (gsize)(end - chars);
+    if (!inserted) return 0;
+    gchar *copy = sodium_malloc(inserted);
+    if (!copy) return 0;
+    memcpy(copy, chars, inserted);
+    gsize offset = (gsize)(g_utf8_offset_to_pointer(self->text, position) - self->text);
+    memmove(self->text + offset + inserted, self->text + offset, self->bytes - offset + 1);
+    memcpy(self->text + offset, copy, inserted);
+    sodium_memzero(copy, inserted);
+    sodium_free(copy);
+    self->bytes += inserted;
+    self->chars += n_chars;
+    gtk_entry_buffer_emit_inserted_text(buffer, position, self->text + offset, n_chars);
+    return n_chars;
+}
+
+static guint diskpass_secret_buffer_delete(GtkEntryBuffer *buffer, guint position, guint n_chars) {
+    DiskpassSecretBuffer *self = (DiskpassSecretBuffer *)buffer;
+    position = MIN(position, self->chars);
+    n_chars = MIN(n_chars, self->chars - position);
+    if (!n_chars) return 0;
+    gsize begin = (gsize)(g_utf8_offset_to_pointer(self->text, position) - self->text);
+    gsize end = (gsize)(g_utf8_offset_to_pointer(self->text + begin, n_chars) - self->text);
+    gsize removed = end - begin;
+    memmove(self->text + begin, self->text + end, self->bytes - end + 1);
+    self->bytes -= removed;
+    self->chars -= n_chars;
+    sodium_memzero(self->text + self->bytes + 1, removed);
+    gtk_entry_buffer_emit_deleted_text(buffer, position, n_chars);
+    return n_chars;
+}
+
+static void diskpass_secret_buffer_finalize(GObject *object) {
+    DiskpassSecretBuffer *self = (DiskpassSecretBuffer *)object;
+    if (self->text) {
+        sodium_memzero(self->text, DISKPASS_SECRET_BUFFER_BYTES);
+        sodium_free(self->text);
+    }
+    G_OBJECT_CLASS(diskpass_secret_buffer_parent_class)->finalize(object);
+}
+
+static void diskpass_secret_buffer_class_init(DiskpassSecretBufferClass *klass) {
+    G_OBJECT_CLASS(klass)->finalize = diskpass_secret_buffer_finalize;
+    GtkEntryBufferClass *buffer = GTK_ENTRY_BUFFER_CLASS(klass);
+    buffer->get_text = diskpass_secret_buffer_get_text;
+    buffer->get_length = diskpass_secret_buffer_get_length;
+    buffer->insert_text = diskpass_secret_buffer_insert;
+    buffer->delete_text = diskpass_secret_buffer_delete;
+}
+
+static void diskpass_secret_buffer_init(DiskpassSecretBuffer *self) {
+    self->text = sodium_malloc(DISKPASS_SECRET_BUFFER_BYTES);
+    if (!self->text) g_error("Cannot allocate protected input buffer");
+    memset(self->text, 0, DISKPASS_SECRET_BUFFER_BYTES);
+}
+
+static void diskpass_secret_entry_destroy(GtkWidget *widget, gpointer user_data) {
+    (void)user_data;
+    gtk_entry_buffer_set_text(gtk_entry_get_buffer(GTK_ENTRY(widget)), "", 0);
+}
+
+static void diskpass_attach_wipe_buffer(GtkEntry *entry) {
+    if (!entry) return;
+    GtkEntryBuffer *buffer = g_object_new(diskpass_secret_buffer_get_type(), NULL);
+    gtk_entry_set_buffer(entry, buffer);
+    g_object_unref(buffer);
+    gtk_entry_set_input_purpose(entry, GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_input_hints(entry, GTK_INPUT_HINT_NO_SPELLCHECK | GTK_INPUT_HINT_NO_EMOJI);
+    g_signal_connect(entry, "destroy", G_CALLBACK(diskpass_secret_entry_destroy), NULL);
+}
+
 static void clipboard_copy_secure(const char *text) {
     if (!text) return;
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
@@ -493,7 +624,10 @@ static void clipboard_copy_secure(const char *text) {
     GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
     gtk_clipboard_set_text(primary, "", 0);
     if (g_app.clipboard_timer_id) g_source_remove(g_app.clipboard_timer_id);
-    g_app.clipboard_timer_id = g_timeout_add_seconds(g_app.clipboard_clear_seconds ? g_app.clipboard_clear_seconds : 30, clipboard_clear_timer, NULL);
+    guint secs = g_app.clipboard_clear_seconds ? g_app.clipboard_clear_seconds : 15;
+    if (secs < 5) secs = 5;
+    if (secs > 60) secs = 60;
+    g_app.clipboard_timer_id = g_timeout_add_seconds(secs, clipboard_clear_timer, NULL);
 }
 
 static void on_gen_password(GtkButton *b, gpointer d) {
@@ -505,7 +639,7 @@ static void on_gen_password(GtkButton *b, gpointer d) {
 
 static void on_back_to_welcome(GtkButton *b, gpointer d) {
     (void)b; (void)d;
-    if (g_unlock_running) return;
+    if (g_unlock_running || g_carrier_running || g_batch_running) return;
 
 
     g_db_external_commit_hook = NULL;
@@ -573,6 +707,21 @@ static void install_dialog_title(GtkWindow *win, const char *text) {
     gtk_widget_set_size_request(lbl, 420, -1);
     gtk_header_bar_set_custom_title(GTK_HEADER_BAR(hb), lbl);
     gtk_widget_show_all(hb);
+}
+
+ 
+
+static GtkWidget *compact_dialog_card(GtkDialog *dialog, const char *title) {
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 330);
+    install_dialog_title(GTK_WINDOW(dialog), title);
+    GtkWidget *content = gtk_dialog_get_content_area(dialog);
+    gtk_container_set_border_width(GTK_CONTAINER(content), 18);
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+
+    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_style_context_add_class(gtk_widget_get_style_context(card), "key-card");
+    gtk_box_pack_start(GTK_BOX(content), card, TRUE, TRUE, 0);
+    return card;
 }
 
 static void update_security_badge(void);
@@ -1428,6 +1577,23 @@ static void on_lock_clicked(GtkButton *btn, gpointer user_data) {
     gtk_stack_set_visible_child_name(g_app.stack, "welcome");
 }
 
+static void cancel_security_dialogs(void) {
+    GList *windows = gtk_window_list_toplevels();
+    for (GList *l = windows; l; l = l->next) g_object_ref(l->data);
+    for (GList *l = windows; l; l = l->next) {
+        if (GTK_IS_DIALOG(l->data) && gtk_widget_get_visible(l->data) &&
+            gtk_window_get_modal(GTK_WINDOW(l->data))) {
+            GtkDialog *dialog = GTK_DIALOG(l->data);
+            GtkWidget *cancel = gtk_dialog_get_widget_for_response(dialog, GTK_RESPONSE_CANCEL);
+            GtkWidget *close = gtk_dialog_get_widget_for_response(dialog, GTK_RESPONSE_CLOSE);
+            if ((cancel && gtk_widget_get_sensitive(cancel)) || (close && gtk_widget_get_sensitive(close)))
+                gtk_dialog_response(dialog, cancel ? GTK_RESPONSE_CANCEL : GTK_RESPONSE_CLOSE);
+        }
+        g_object_unref(l->data);
+    }
+    g_list_free(windows);
+}
+
 static gboolean autolock_cb(gpointer user_data) {
     (void)user_data;
     g_app.autolock_timer_id = 0;
@@ -1435,6 +1601,7 @@ static gboolean autolock_cb(gpointer user_data) {
 
     if (g_batch_running || g_carrier_running || has_visible_modal_window()) {
         g_autolock_pending = TRUE;
+        cancel_security_dialogs();
         g_app.autolock_timer_id = g_timeout_add_seconds(1, autolock_cb, NULL);
         return G_SOURCE_REMOVE;
     }
@@ -1444,6 +1611,7 @@ static gboolean autolock_cb(gpointer user_data) {
 }
 
 static void reset_autolock(void) {
+    if (g_autolock_pending) return;
     if (g_app.autolock_timer_id) g_source_remove(g_app.autolock_timer_id);
     g_app.autolock_timer_id = 0;
     if (app_has_open_database() && g_app.autolock_seconds > 0)
@@ -1462,8 +1630,9 @@ static void request_system_security_lock(void) {
 
     if (g_batch_running || g_carrier_running || has_visible_modal_window()) {
         g_autolock_pending = TRUE;
-        if (!g_app.autolock_timer_id)
-            g_app.autolock_timer_id = g_timeout_add_seconds(1, autolock_cb, NULL);
+        cancel_security_dialogs();
+        if (g_app.autolock_timer_id) g_source_remove(g_app.autolock_timer_id);
+        g_app.autolock_timer_id = g_timeout_add_seconds(1, autolock_cb, NULL);
         return;
     }
     on_lock_clicked(NULL, NULL);
@@ -1617,16 +1786,8 @@ static void on_create_gpg_key_clicked(GtkButton *btn, gpointer user_data) {
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
         i18n("cancel"), GTK_RESPONSE_CANCEL,
         i18n("create"), GTK_RESPONSE_OK, NULL);
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 520, 330);
-    install_dialog_title(GTK_WINDOW(dlg), i18n("create_key_title"));
-
+    GtkWidget *card = compact_dialog_card(GTK_DIALOG(dlg), i18n("create_key_title"));
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 18);
-    gtk_box_set_spacing(GTK_BOX(content), 12);
-
-    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_style_context_add_class(gtk_widget_get_style_context(card), "key-card");
-    gtk_box_pack_start(GTK_BOX(content), card, TRUE, TRUE, 0);
 
     GtkGrid *grid = GTK_GRID(gtk_grid_new());
     gtk_grid_set_column_spacing(grid, 12);
@@ -1737,8 +1898,7 @@ static void on_create_gpg_key_clicked(GtkButton *btn, gpointer user_data) {
             &out_text, &err_text, &spawn_err);
         gboolean ok = communicated && g_subprocess_get_successful(proc);
         if (!ok) {
-            const char *detail = (err_text && err_text[0]) ? err_text :
-                (spawn_err ? spawn_err->message : "GnuPG returned an error");
+            const char *detail = "GnuPG could not create the key; check engine support and pinentry configuration";
             char *msg = g_strdup_printf("%s: %.700s", i18n("key_create_failed"), detail);
             gtk_label_set_text(GTK_LABEL(err_lbl), msg);
             g_free(msg);
@@ -1973,6 +2133,8 @@ static void on_create_clicked(GtkButton *btn, gpointer user_data) {
     gtk_file_filter_set_name(f, "DiskPass (*.dpdb)");
     gtk_file_filter_add_pattern(f, "*.dpdb");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "database.dpdb");
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
         carrier_unmount_cleanup();
         free(g_app.current_file);
@@ -2151,6 +2313,85 @@ static void unlock_job_done(GObject *source, GAsyncResult *result, gpointer user
     }
     opened->defer_chainless_consent = FALSE;
 
+     
+
+
+
+
+
+
+
+    if (opened->needs_resave) {
+        unlock_set_busy(TRUE);
+        GtkWidget *migrate_dlg = gtk_message_dialog_new(g_app.window,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, "%s",
+            i18n(opened->is_signed ? "migrate_consent" : "migrate_unbound_payload"));
+        if (!migrate_dlg) {
+             
+
+            opened->legacy_read_only = TRUE;
+            g_warning("DiskPass: cannot allocate migration dialog; opening read-only");
+            unlock_set_busy(FALSE);
+        } else {
+            gtk_window_set_title(GTK_WINDOW(migrate_dlg), i18n("migrate_title"));
+            gtk_dialog_add_buttons(GTK_DIALOG(migrate_dlg),
+                i18n("migrate_later"), GTK_RESPONSE_NO,
+                i18n("migrate_convert_now"), GTK_RESPONSE_YES, NULL);
+            gtk_dialog_set_default_response(GTK_DIALOG(migrate_dlg),
+                GTK_RESPONSE_NO);
+            int migrate_choice = gtk_dialog_run(GTK_DIALOG(migrate_dlg));
+            gtk_widget_destroy(migrate_dlg);
+            if (migrate_choice == GTK_RESPONSE_YES) {
+                g_db_external_commit_hook = job->mounted_carrier
+                    ? carrier_mounted_commit_hook : NULL;
+                 
+
+
+
+
+
+
+                gboolean was_read_only = opened->legacy_read_only;
+                opened->legacy_read_only = FALSE;
+                char migrate_err[512] = "";
+                int migrate_rc = db_save(opened, migrate_err, sizeof(migrate_err));
+                if (migrate_rc != 0 || !opened->rollback_state_verified) {
+                     
+                    opened->legacy_read_only = was_read_only;
+                    char fail_buf[640];
+                    snprintf(fail_buf, sizeof(fail_buf),
+                        i18n("migrate_failed"),
+                        migrate_err[0] ? migrate_err : "internal error");
+                    GtkWidget *fail_dlg = gtk_message_dialog_new(g_app.window,
+                        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                        GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", fail_buf);
+                    if (fail_dlg) {
+                        gtk_dialog_run(GTK_DIALOG(fail_dlg));
+                        gtk_widget_destroy(fail_dlg);
+                    }
+                    g_db_external_commit_hook = NULL;
+                    unlock_manager_free(opened);
+                    unlock_set_busy(FALSE);
+                    return;
+                }
+                opened->needs_resave = FALSE;
+                GtkWidget *ok_dlg = gtk_message_dialog_new(g_app.window,
+                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s",
+                    i18n("migrate_done"));
+                if (ok_dlg) {
+                    gtk_dialog_run(GTK_DIALOG(ok_dlg));
+                    gtk_widget_destroy(ok_dlg);
+                }
+            } else {
+                opened->legacy_read_only = TRUE;
+            }
+            g_db_external_commit_hook = NULL;
+            unlock_set_busy(FALSE);
+        }
+    }
+
     if (g_app.db) { db_manager_clear(g_app.db); free(g_app.db); }
     g_app.db = opened;
     if (g_app.mounted_carrier_path)
@@ -2266,6 +2507,7 @@ static void on_toggle_password_visibility(GtkEntry *entry, GtkEntryIconPosition 
 static GtkWidget *make_password_field(GtkWidget **out_entry) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *entry = gtk_entry_new();
+    diskpass_attach_wipe_buffer(GTK_ENTRY(entry));
     gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
     gtk_entry_set_invisible_char(GTK_ENTRY(entry), '*');
     gtk_entry_set_icon_from_icon_name(GTK_ENTRY(entry),
@@ -2580,13 +2822,18 @@ static char *carrier_make_private_temp_db(char *err_msg, size_t err_msg_sz) {
     }
     char *dir = g_build_filename(base, "diskpass", "stego-open", NULL);
     if (!dir) { snprintf(err_msg, err_msg_sz, "Out of memory for runtime path"); return NULL; }
-    if (g_mkdir_with_parents(dir, 0700) != 0 || chmod(dir, 0700) != 0) {
+    if (g_mkdir_with_parents(dir, 0700) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot create private stego runtime directory: %s", strerror(errno));
         g_free(dir); return NULL;
     }
+     
+
+    int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     struct stat st;
-    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
-        (st.st_mode & (S_IRWXG | S_IRWXO))) {
+    gboolean safe = dirfd >= 0 && fstat(dirfd, &st) == 0 && S_ISDIR(st.st_mode) &&
+        st.st_uid == getuid() && (st.st_mode & 077) == 0;
+    if (dirfd >= 0) close(dirfd);
+    if (!safe) {
         snprintf(err_msg, err_msg_sz, "Stego runtime directory is not private");
         g_free(dir); return NULL;
     }
@@ -2803,15 +3050,15 @@ static GtkWidget *carrier_choice_button(GtkDialog *dlg, const char *icon_name,
     gtk_widget_set_halign(button, GTK_ALIGN_FILL);
     gtk_style_context_add_class(gtk_widget_get_style_context(button), "carrier-choice");
 
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_container_set_border_width(GTK_CONTAINER(row), 1);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(row), 0);
 
     GtkWidget *icon = gtk_image_new_from_icon_name(icon_name, GTK_ICON_SIZE_BUTTON);
     gtk_widget_set_valign(icon, GTK_ALIGN_CENTER);
     gtk_style_context_add_class(gtk_widget_get_style_context(icon), "carrier-choice-icon");
     gtk_box_pack_start(GTK_BOX(row), icon, FALSE, FALSE, 0);
 
-    GtkWidget *texts = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *texts = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_widget_set_hexpand(texts, TRUE);
     GtkWidget *title_lbl = gtk_label_new(title);
     gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0f);
@@ -2821,7 +3068,8 @@ static GtkWidget *carrier_choice_button(GtkDialog *dlg, const char *icon_name,
     GtkWidget *desc_lbl = gtk_label_new(description);
     gtk_label_set_xalign(GTK_LABEL(desc_lbl), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(desc_lbl), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(desc_lbl), 42);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(desc_lbl), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(desc_lbl), 38);
     gtk_style_context_add_class(gtk_widget_get_style_context(desc_lbl), "carrier-choice-desc");
     gtk_box_pack_start(GTK_BOX(texts), desc_lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(row), texts, TRUE, TRUE, 0);
@@ -2840,6 +3088,8 @@ static GtkWidget *carrier_choice_button(GtkDialog *dlg, const char *icon_name,
 static GtkWidget *carrier_format_row(const char *title, const char *value) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget *name = gtk_label_new(title);
+    gtk_label_set_line_wrap(GTK_LABEL(name), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(name), 12);
     gtk_widget_set_size_request(name, 105, -1);
     gtk_label_set_xalign(GTK_LABEL(name), 0.0f);
     gtk_style_context_add_class(gtk_widget_get_style_context(name), "carrier-format-name");
@@ -2848,23 +3098,19 @@ static GtkWidget *carrier_format_row(const char *title, const char *value) {
     GtkWidget *desc = gtk_label_new(value);
     gtk_label_set_xalign(GTK_LABEL(desc), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(desc), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(desc), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(desc), 34);
     gtk_widget_set_hexpand(desc, TRUE);
     gtk_style_context_add_class(gtk_widget_get_style_context(desc), "carrier-format-value");
     gtk_box_pack_start(GTK_BOX(row), desc, TRUE, TRUE, 0);
     return row;
 }
 
-static gint carrier_run_action_dialog(void) {
+static GtkWidget *carrier_create_action_dialog(void) {
     GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("carrier_tools"), g_app.window,
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
         i18n("cancel"), GTK_RESPONSE_CANCEL, NULL);
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 520, -1);
-    gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
-    install_dialog_title(GTK_WINDOW(dlg), i18n("carrier_tools"));
-
-    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 15);
-    gtk_box_set_spacing(GTK_BOX(content), 12);
+    GtkWidget *card = compact_dialog_card(GTK_DIALOG(dlg), i18n("carrier_tools"));
 
     const char *badge_path = g_app.mounted_carrier_path ? g_app.mounted_carrier_path :
         (g_app.db && g_app.db->file_path ? g_app.db->file_path : "database.dpdb");
@@ -2873,21 +3119,23 @@ static gint carrier_run_action_dialog(void) {
     GtkWidget *db_badge = gtk_label_new(db_text);
     gtk_label_set_xalign(GTK_LABEL(db_badge), 0.0f);
     gtk_label_set_ellipsize(GTK_LABEL(db_badge), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_label_set_max_width_chars(GTK_LABEL(db_badge), 42);
+    gtk_label_set_max_width_chars(GTK_LABEL(db_badge), 38);
+    gtk_widget_set_tooltip_text(db_badge, db_text);
     gtk_style_context_add_class(gtk_widget_get_style_context(db_badge), "carrier-current-db");
-    gtk_box_pack_start(GTK_BOX(content), db_badge, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), db_badge, FALSE, FALSE, 0);
     g_free(db_text);
     g_free(db_name);
 
     GtkWidget *attach = carrier_choice_button(GTK_DIALOG(dlg), "mail-attachment-symbolic",
         i18n("carrier_attach_short"), i18n("carrier_attach_desc"), 1);
-    gtk_box_pack_start(GTK_BOX(content), attach, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), attach, FALSE, FALSE, 0);
 
     GtkWidget *extract = carrier_choice_button(GTK_DIALOG(dlg), "document-save-symbolic",
         i18n("carrier_extract_short"), i18n("carrier_extract_desc"), 2);
-    gtk_box_pack_start(GTK_BOX(content), extract, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), extract, FALSE, FALSE, 0);
 
     GtkWidget *expander = gtk_expander_new(i18n("carrier_formats_title"));
+    gtk_expander_set_resize_toplevel(GTK_EXPANDER(expander), TRUE);
     gtk_style_context_add_class(gtk_widget_get_style_context(expander), "carrier-expander");
     GtkWidget *formats = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_set_border_width(GTK_CONTAINER(formats), 7);
@@ -2898,14 +3146,22 @@ static gint carrier_run_action_dialog(void) {
     gtk_box_pack_start(GTK_BOX(formats), carrier_format_row(
         i18n("carrier_formats_sources"), i18n("carrier_formats_sources_list")), FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(expander), formats);
-    gtk_box_pack_start(GTK_BOX(content), expander, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), expander, FALSE, FALSE, 0);
 
     GtkWidget *note = gtk_label_new(i18n("carrier_safe_note"));
     gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(note), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(note), 48);
     gtk_style_context_add_class(gtk_widget_get_style_context(note), "carrier-note");
-    gtk_box_pack_start(GTK_BOX(content), note, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(formats), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(formats), note, FALSE, FALSE, 0);
 
+    return dlg;
+}
+
+static gint carrier_run_action_dialog(void) {
+    GtkWidget *dlg = carrier_create_action_dialog();
     gtk_widget_show_all(dlg);
     gint response = gtk_dialog_run(GTK_DIALOG(dlg));
     gtk_widget_destroy(dlg);
@@ -3347,8 +3603,8 @@ static GtkWidget *settings_row_new(const char *title, const char *desc, GtkWidge
     gtk_widget_set_hexpand(text, TRUE);
     GtkWidget *ttl = gtk_label_new(title);
     gtk_label_set_xalign(GTK_LABEL(ttl), 0.0f);
-    /* Let the text column shrink instead of pushing switches and buttons
-     * outside the right edge of the security dialog on narrow screens. */
+     
+
     gtk_label_set_ellipsize(GTK_LABEL(ttl), PANGO_ELLIPSIZE_END);
     gtk_label_set_width_chars(GTK_LABEL(ttl), 1);
     gtk_style_context_add_class(gtk_widget_get_style_context(ttl), "settings-row-title");
@@ -3748,57 +4004,67 @@ static void on_history_clicked(GtkButton *btn, gpointer user_data) {
     gtk_widget_destroy(dlg);
 }
 
-/* Switching windows must not start a nested gtk_main() from an idle
- * handler: that can leave the main application apparently unresponsive. */
+ 
+
+static void camouflage_update_presentation(gboolean locked) {
+    g_app.camouflage_locked = locked;
+    diskpass_set_default_icon(locked);
+    if (!diskpass_sync_launcher_icon(locked))
+        g_warning("DiskPass: could not update user launcher icon");
+    if (!g_app.window) return;
+    gtk_window_set_title(g_app.window, locked ? "Калькулятор" : "DiskPass");
+    if (g_app.window_title_label)
+        gtk_label_set_text(GTK_LABEL(g_app.window_title_label), locked ? "Калькулятор" : "DiskPass");
+    diskpass_set_window_icon(g_app.window, locked);
+    if (!locked && !gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "diskpass") && icon_pb)
+        gtk_window_set_icon(g_app.window, icon_pb);
+}
+
 static void camouflage_calculator_finished(gboolean unlocked, gpointer user_data) {
     (void)user_data;
     if (!unlocked) {
+        sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+        g_app.camouflage_key_valid = FALSE;
         gtk_main_quit();
         return;
     }
     g_app.camouflage_key_valid = TRUE;
-    if (!load_config()) {
+    if (!load_config() || !g_app.camouflage_enabled) {
         g_warning("DiskPass: protected configuration failed authentication");
         sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
         g_app.camouflage_key_valid = FALSE;
         gtk_main_quit();
         return;
     }
-    /* The real DiskPass window and launcher are visible again only while the
-     * DiskPass interface is on screen. Calculator mode remains configured for
-     * the next application start. */
-    if (!diskpass_sync_launcher_icon(FALSE))
-        g_warning("DiskPass: could not restore launcher icon");
-    gtk_window_set_icon_name(g_app.window, "diskpass");
-    gtk_window_set_title(g_app.window, "DiskPass");
-    if (!gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "diskpass") && icon_pb)
-        gtk_window_set_icon(g_app.window, icon_pb);
+    camouflage_update_presentation(FALSE);
     gtk_widget_show(GTK_WIDGET(g_app.window));
     gtk_window_present(g_app.window);
 }
 
-/* Run only after the settings dialog has been destroyed. The database is
- * locked and both clipboards are cleared before the first calculator frame. */
+ 
+
 static gboolean camouflage_activate_idle(gpointer user_data) {
     (void)user_data;
-    if (!g_app.camouflage_enabled || !g_app.window) return G_SOURCE_REMOVE;
+    if (!g_app.camouflage_enabled || !g_app.window || g_app.camouflage_locked)
+        return G_SOURCE_REMOVE;
     on_lock_clicked(NULL, NULL);
+    camouflage_update_presentation(TRUE);
     gtk_widget_hide(GTK_WIDGET(g_app.window));
+    sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
+    g_app.camouflage_key_valid = FALSE;
     if (!diskpass_calculator_show_async(g_app.camouflage_hash,
             g_app.camouflage_salt, g_app.camouflage_config_key,
             camouflage_calculator_finished, NULL)) {
-        /* If the calculator cannot be shown, do not leave DiskPass hidden. */
         g_warning("DiskPass: calculator window could not be opened");
-        gtk_widget_show(GTK_WIDGET(g_app.window));
-        gtk_window_present(g_app.window);
-        (void)diskpass_sync_launcher_icon(FALSE);
+        gtk_main_quit();
     }
     return G_SOURCE_REMOVE;
 }
 
+#define CAMOUFLAGE_PIN_MIN 10
 static gboolean camouflage_valid_pin(const char *pin) {
     gsize len = pin ? strlen(pin) : 0;
-    if (len < 8 || len > 32) return FALSE;
+    if (len < CAMOUFLAGE_PIN_MIN || len > 32) return FALSE;
     for (gsize i = 0; i < len; i++)
         if (!g_ascii_isdigit(pin[i])) return FALSE;
     return TRUE;
@@ -3812,8 +4078,8 @@ static void camouflage_show_error(GtkWindow *parent, const char *message) {
     gtk_widget_destroy(alert);
 }
 
-/* The access code is collected only when the calculator switch is turned on.
- * Keep its hash temporary until the parent Settings dialog is saved. */
+ 
+
 typedef struct {
     GtkWindow *settings_window;
     char pending_hash[crypto_pwhash_STRBYTES];
@@ -3840,7 +4106,7 @@ static gboolean camouflage_ask_new_pin(GtkWindow *parent,
     gtk_box_pack_start(GTK_BOX(content), fields, TRUE, TRUE, 0);
 
     GtkWidget *explanation = gtk_label_new(
-        "Задайте отдельный код из 8–32 цифр. В калькуляторе введите его и нажмите =, чтобы открыть DiskPass.");
+        "Задайте отдельный код из 10–32 цифр. Для входа переключитесь в Базовый режим калькулятора, введите код и нажмите = один раз.");
     gtk_label_set_xalign(GTK_LABEL(explanation), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(explanation), TRUE);
     gtk_label_set_max_width_chars(GTK_LABEL(explanation), 45);
@@ -3850,16 +4116,18 @@ static gboolean camouflage_ask_new_pin(GtkWindow *parent,
     gtk_label_set_xalign(GTK_LABEL(pin_label), 0.0f);
     gtk_box_pack_start(GTK_BOX(fields), pin_label, FALSE, FALSE, 0);
     GtkWidget *pin = gtk_entry_new();
+    diskpass_attach_wipe_buffer(GTK_ENTRY(pin));
     gtk_entry_set_visibility(GTK_ENTRY(pin), FALSE);
     gtk_entry_set_input_purpose(GTK_ENTRY(pin), GTK_INPUT_PURPOSE_PIN);
     gtk_entry_set_max_length(GTK_ENTRY(pin), 32);
-    gtk_entry_set_placeholder_text(GTK_ENTRY(pin), "8–32 цифры");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pin), "10–32 цифры");
     gtk_box_pack_start(GTK_BOX(fields), pin, FALSE, FALSE, 0);
 
     GtkWidget *confirm_label = gtk_label_new("Подтвердите код");
     gtk_label_set_xalign(GTK_LABEL(confirm_label), 0.0f);
     gtk_box_pack_start(GTK_BOX(fields), confirm_label, FALSE, FALSE, 0);
     GtkWidget *confirm = gtk_entry_new();
+    diskpass_attach_wipe_buffer(GTK_ENTRY(confirm));
     gtk_entry_set_visibility(GTK_ENTRY(confirm), FALSE);
     gtk_entry_set_input_purpose(GTK_ENTRY(confirm), GTK_INPUT_PURPOSE_PIN);
     gtk_entry_set_max_length(GTK_ENTRY(confirm), 32);
@@ -3876,7 +4144,7 @@ static gboolean camouflage_ask_new_pin(GtkWindow *parent,
         if (!camouflage_valid_pin(first) || len != strlen(second) ||
             sodium_memcmp(first, second, len) != 0) {
             camouflage_show_error(GTK_WINDOW(dlg),
-                "Коды должны совпадать и содержать от 8 до 32 цифр.");
+                "Коды должны совпадать и содержать от 10 до 32 цифр.");
             gtk_widget_grab_focus(pin);
             continue;
         }
@@ -3905,7 +4173,7 @@ static gboolean camouflage_ask_new_pin(GtkWindow *parent,
         succeeded = TRUE;
         break;
     }
-    /* Clear both GTK buffers before destroying the transient dialog. */
+     
     gtk_entry_set_text(GTK_ENTRY(pin), "");
     gtk_entry_set_text(GTK_ENTRY(confirm), "");
     gtk_widget_destroy(dlg);
@@ -3934,7 +4202,7 @@ static void camouflage_switch_changed(GObject *object, GParamSpec *pspec,
                                           ctx->pending_salt, ctx->pending_key);
     ctx->asking = FALSE;
     if (!ok) {
-        /* Cancelling the code dialog must not enable calculator mode. */
+         
         sodium_memzero(ctx->pending_hash, sizeof(ctx->pending_hash));
         sodium_memzero(ctx->pending_salt, sizeof(ctx->pending_salt));
         sodium_memzero(ctx->pending_key, sizeof(ctx->pending_key));
@@ -3944,6 +4212,7 @@ static void camouflage_switch_changed(GObject *object, GParamSpec *pspec,
 
 static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn; (void)user_data;
+    if (g_app.camouflage_locked || g_unlock_running || g_batch_running || g_carrier_running) return;
     GtkWidget *dlg = gtk_dialog_new_with_buttons(i18n("security_settings"), g_app.window,
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
         i18n("cancel"), GTK_RESPONSE_CANCEL,
@@ -3974,13 +4243,13 @@ static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
 
     GtkWidget *camouflage_sw = gtk_switch_new();
     camouflage_switch_ctx_t camouflage_ctx = { .settings_window = GTK_WINDOW(dlg) };
-    /* Set the initial value before connecting so reopening Settings does not
-     * trigger a password prompt. Each later OFF -> ON change does. */
+     
+
     gtk_switch_set_active(GTK_SWITCH(camouflage_sw), g_app.camouflage_enabled);
     g_signal_connect(camouflage_sw, "notify::active",
         G_CALLBACK(camouflage_switch_changed), &camouflage_ctx);
     gtk_box_pack_start(GTK_BOX(box), settings_row_new("Режим калькулятора",
-        "При включении задаётся код. Настройки шифруются этим кодом; ярлык скрывается только из меню GNOME.",
+        "Код из 10–32 цифр шифрует настройки. Для входа: Базовый режим, код и одно нажатие =. Ярлык остаётся доступным со значком калькулятора.",
         camouflage_sw), FALSE, FALSE, 0);
 
     GtkWidget *autolock = gtk_combo_box_text_new();
@@ -4046,9 +4315,13 @@ static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
                 "Для включения режима калькулятора необходимо задать код доступа.");
             continue;
         }
-        /* Keep previous state so a failed write never enables an unusable mode. */
+         
         gboolean old_enabled = g_app.camouflage_enabled;
         gboolean old_key_valid = g_app.camouflage_key_valid;
+        gboolean old_screen_guard = g_app.screenshot_guard;
+        gboolean old_focus_lock = g_app.lock_on_focus_loss;
+        guint old_autolock_seconds = g_app.autolock_seconds;
+        guint old_clipboard_seconds = g_app.clipboard_clear_seconds;
         char old_hash[crypto_pwhash_STRBYTES];
         unsigned char old_salt[crypto_pwhash_SALTBYTES];
         unsigned char old_key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
@@ -4075,6 +4348,10 @@ static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
             memcpy(g_app.camouflage_salt, old_salt, sizeof(old_salt));
             memcpy(g_app.camouflage_config_key, old_key, sizeof(old_key));
             g_app.camouflage_key_valid = old_key_valid;
+            g_app.screenshot_guard = old_screen_guard;
+            g_app.lock_on_focus_loss = old_focus_lock;
+            g_app.autolock_seconds = old_autolock_seconds;
+            g_app.clipboard_clear_seconds = old_clipboard_seconds;
             camouflage_show_error(GTK_WINDOW(dlg),
                 "Не удалось безопасно сохранить настройки. Режим не изменён.");
             sodium_memzero(old_hash, sizeof(old_hash));
@@ -4093,8 +4370,7 @@ static void on_security_settings_clicked(GtkButton *btn, gpointer user_data) {
         }
         if (!g_app.screenshot_guard) privacy_shield_set(FALSE);
         reset_autolock();
-        if (!diskpass_sync_launcher_icon(g_app.camouflage_enabled))
-            g_warning("DiskPass: could not update user launcher icon");
+        if (!enable_camouflage) camouflage_update_presentation(FALSE);
         accepted = TRUE;
         break;
     }
@@ -6223,25 +6499,25 @@ static void load_css(void) {
     static const char css2[] =
         "  border-color: #3a3a3a; }"
         ".suggested-action:hover { background-color: #353535; color: #ffffff; }"
-        ".carrier-current-db { color: #8f8f8f; font-size: 11px; }"
+        ".carrier-current-db { color: #888888; }"
         ".carrier-dialog-title { font-size: 14px; font-weight: 600; color: #f2f2f2; }"
         ".carrier-dialog-subtitle { font-size: 10px; color: #8f8f8f; }"
         ".carrier-db-badge { font-size: 9px; color: #a8d8cf; background-color: #17221f; border: 1px solid #29463f; border-radius: 7px; padding: 2px 7px; }"
         ".carrier-choice {"
-        "  background-color: #1e1e1e; border: 1px solid #333333; border-radius: 4px;"
-        "  padding: 5px 8px; min-height: 24px; }"
+        "  background-color: #1e1e1e; border: 1px solid #333333; border-radius: 7px;"
+        "  padding: 10px 12px; min-height: 24px; }"
         ".carrier-choice:hover { background-color: #222222; border-color: #444444; }"
         ".carrier-choice-primary { border-color: #31564d; background-color: #19211f; }"
         ".carrier-choice-primary:hover { border-color: #4a7f72; background-color: #1d2926; }"
         ".carrier-choice:active { background-color: #272727; }"
         ".carrier-choice-icon { color: #cfcfcf; min-width: 22px; }"
-        ".carrier-choice-title { font-size: 12px; font-weight: 500; color: #e8e8e8; }"
-        ".carrier-choice-desc { font-size: 10px; color: #8a8a8a; }"
+        ".carrier-choice-title { font-weight: 500; color: #e8e8e8; }"
+        ".carrier-choice-desc { color: #888888; }"
         ".carrier-choice-arrow { color: #777777; }"
-        ".carrier-expander { color: #b8b8b8; padding: 1px 0; font-size: 11px; }"
-        ".carrier-format-name { font-size: 10px; font-weight: 600; color: #bdbdbd; }"
-        ".carrier-format-value { font-size: 10px; color: #858585; }"
-        ".carrier-note { font-size: 9px; color: #707070; }"
+        ".carrier-expander { color: #b8b8b8; padding: 1px 0; }"
+        ".carrier-format-name { font-weight: 500; color: #bdbdbd; }"
+        ".carrier-format-value { color: #888888; }"
+        ".carrier-note { color: #888888; }"
         ".flat-btn {"
         "  border: none; background: transparent;"
         "  padding: 3px 6px;"

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="490" viewBox="0 0 1600 490" role="img">
+<title>Diskpass — steganographic storage / стеганография</title>
+<rect x="0" y="0" width="1600" height="490" fill="#000000"/>
+<defs><marker id="arrow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 1 1 L 11 6 L 1 11 Z" fill="#F3F4F7"/></marker></defs>
+<text x="800" y="59" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="43" font-weight="bold">Steganography Algorithm</text>
+<rect x="42" y="131" width="265" height="99" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="175" y="174" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Media carrier</text>
+<text x="175" y="205" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" font-weight="normal">PNG, JPEG, WAV, ...</text>
+<rect x="42" y="302" width="265" height="98" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<g fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" text-anchor="middle" font-size="21" font-weight="bold">
+<text x="175" y="328">Encrypted</text>
+<text x="175" y="353">database</text>
+</g>
+<text x="175" y="376" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" font-weight="normal">.dpdb</text>
+<path d="M 307 180 H 358 V 254 H 407" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 307 352 H 358 V 286 H 407" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="412" y="230" width="264" height="116" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="544" y="275" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Embedding</text>
+<text x="544" y="314" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" font-weight="normal">Embed(F, DPDB)</text>
+<path d="M 676 286 H 738" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="743" y="230" width="256" height="116" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="871" y="278" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Stego file</text>
+<text x="871" y="314" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="23" font-weight="normal">F′</text>
+<path d="M 999 286 H 1066" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1071" y="230" width="240" height="116" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="1191" y="277" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="24" font-weight="bold">Extraction</text>
+<text x="1191" y="314" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="19" font-weight="normal">Extract(F′)</text>
+<path d="M 1311 286 H 1367" fill="none" stroke="#F3F4F7" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1372" y="230" width="190" height="116" rx="18" fill="#000000" stroke="#F3F4F7" stroke-width="3"/>
+<text x="1467" y="275" text-anchor="middle" fill="#F3F4F7" font-family="DejaVu Sans,Arial,sans-serif" font-size="23" font-weight="bold">Database</text>
+<text x="1467" y="312" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="22" font-weight="normal">.dpdb</text>
+<text x="800" y="426" text-anchor="middle" fill="#B9BDC6" font-family="DejaVu Sans,Arial,sans-serif" font-size="21" font-weight="normal">Bootstrap seed is derived from stable carrier data</text>
+</svg>

@@ -5,11 +5,15 @@
 #include <string.h>
 
 typedef double complex cd;
-typedef struct { const char *p; gboolean ok; cd ans; const CalcSettings *c; guint recursion_depth; } P;
+
+#define CALC_MAX_DEPTH 96
+#define CALC_MAX_STEPS 8192
+#define CALC_MAX_INPUT 512
+
+typedef struct { const char *p; gboolean ok; cd ans; const CalcSettings *c; int depth; size_t steps; } P;
 
 static cd or_(P *s);
 static cd unary(P *s);
-static cd primary(P *s);
 
 static void skip(P *s) { while (*s->p == ' ') s->p++; }
 static gboolean eat(P *s, const char *t)
@@ -19,22 +23,35 @@ static gboolean eat(P *s, const char *t)
     if (!strncmp(s->p, t, n)) { s->p += n; return TRUE; }
     return FALSE;
 }
+ 
+
 static cd clean(cd v)
+{
+    double r = creal(v), i = cimag(v), m = fmax(fabs(r), fabs(i));
+    if (m > 0) {
+        if (fabs(r) < 1e-12 * m) r = 0;
+        if (fabs(i) < 1e-12 * m) i = 0;
+    }
+    if (r == 0) r = 0.0;    
+    if (i == 0) i = 0.0;
+    return CMPLX(r, i);
+}
+ 
+
+static cd snap(cd v)
 {
     double r = creal(v), i = cimag(v), m = fmax(1.0, fmax(fabs(r), fabs(i)));
     if (fabs(r) < 1e-12 * m) r = 0;
     if (fabs(i) < 1e-12 * m) i = 0;
-    if (r == 0) r = 0.0;   /* убрать «-0» */
-    if (i == 0) i = 0.0;
-    return CMPLX(r, i);
+    return clean(CMPLX(r, i));
 }
 static gboolean is_real(cd v) { return cimag(v) == 0; }
 
-/* ---- углы ---- */
+ 
 static double to_rad(const CalcSettings *c, double x) { return c->angle == 1 ? x : c->angle == 2 ? x * G_PI / 200 : x * G_PI / 180; }
 static double from_rad(const CalcSettings *c, double x) { return c->angle == 1 ? x : c->angle == 2 ? x * 200 / G_PI : x * 180 / G_PI; }
 
-/* ---- целые операции ---- */
+ 
 static guint64 bit_mask(const CalcSettings *c) { return c->bits >= 64 ? ~(guint64)0 : (((guint64)1 << c->bits) - 1); }
 static gboolean to_i64(cd v, int64_t *out)
 {
@@ -50,7 +67,7 @@ guint64 calc_to_bits(const CalcSettings *cfg, cd v)
     return (guint64)x & bit_mask(cfg);
 }
 
-/* ---- функции ---- */
+ 
 typedef enum {
     F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN, F_SINH, F_COSH, F_TANH, F_ASINH, F_ACOSH, F_ATANH,
     F_LN, F_LOG, F_LOG2, F_EXP, F_SQRT, F_ABS, F_FLOOR, F_CEIL, F_ROUND, F_INT, F_FRAC,
@@ -78,9 +95,9 @@ static cd trig(const CalcSettings *c, FnId id, cd x)
     gboolean real = is_real(x);
     cd a = real ? to_rad(c, creal(x)) : x;
     switch (id) {
-    case F_SIN: return csin(a);
-    case F_COS: return ccos(a);
-    case F_TAN: return ctan(a);
+    case F_SIN: return snap(csin(a));
+    case F_COS: return snap(ccos(a));
+    case F_TAN: return snap(ctan(a));
     default: return 0;
     }
 }
@@ -137,16 +154,16 @@ static cd applyn(P *s, FnId id, const cd *a)
     case F_ROOT: if (a[1] == 0) { s->ok = FALSE; return 0; } return cpow(a[0], 1.0 / a[1]);
     case F_SLN: if (z == 0) { s->ok = FALSE; return 0; } return (x - y) / z;
     case F_GPM: if (y >= 100) { s->ok = FALSE; return 0; } return x / (1 - y / 100);
-    /* pint — процентная ставка за период в долях (0,05 = 5 %) */
+     
     case F_CTRM: if (x <= -1 || y <= 0 || z <= 0) { s->ok = FALSE; return 0; } return log(y / z) / log(1 + x);
     case F_FV: if (y == 0) return x * z; return x * (pow(1 + y, z) - 1) / y;
     case F_PMT: if (y == 0) { if (z == 0) { s->ok = FALSE; return 0; } return x / z; } return x * y / (1 - pow(1 + y, -z));
     case F_PV: if (y == 0) return x * z; return x * (1 - pow(1 + y, -z)) / y;
     case F_RATE: if (y == 0 || z == 0) { s->ok = FALSE; return 0; } return pow(x / y, 1 / z) - 1;
     case F_TERM: if (x == 0 || z <= -1) { s->ok = FALSE; return 0; } return log(1 + y * z / x) / log(1 + z);
-    case F_DDB: { /* cost; salvage; life; period */
-        if (!isfinite(z) || !isfinite(w) || z <= 0 || w < 1 || w > z ||
-            w > 1000000 || w != floor(w)) { s->ok = FALSE; return 0; }
+    case F_DDB: {  
+        if (z <= 0 || w < 1 || w > z) { s->ok = FALSE; return 0; }    
+        if (w > 1e6) { s->ok = FALSE; return 0; }                     
         double value = x, dep = 0;
         for (int i = 1; i <= (int)w; i++) { dep = fmin(value * 2 / z, fmax(0, value - y)); value -= dep; }
         return dep;
@@ -156,7 +173,7 @@ static cd applyn(P *s, FnId id, const cd *a)
     }
 }
 
-/* ---- числа ---- */
+ 
 static int digit_val(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
 static cd number(P *s)
@@ -164,22 +181,38 @@ static cd number(P *s)
     int base = s->c->base;
     if (base == 10) {
         char buf[64]; size_t i = 0;
-        while (i < 63 && (g_ascii_isdigit(*s->p) || *s->p == ',')) { buf[i++] = *s->p == ',' ? '.' : *s->p; s->p++; }
+        gboolean seen_sep = FALSE, seen_digit = FALSE;
+        while (i < 63 && (g_ascii_isdigit(*s->p) || (*s->p == ',' && !seen_sep))) {
+            if (*s->p == ',') seen_sep = TRUE; else seen_digit = TRUE;
+            buf[i++] = *s->p == ',' ? '.' : *s->p; s->p++;
+        }
         buf[i] = 0;
+        if (!seen_digit || *s->p == ',') { s->ok = FALSE; return 0; }    
         return g_ascii_strtod(buf, NULL);
     }
     double v = 0;
-    while (digit_val(*s->p) >= 0 && digit_val(*s->p) < base) { v = v * base + digit_val(*s->p); s->p++; }
+    while (digit_val(*s->p) >= 0 && digit_val(*s->p) < base) {
+        v = v * base + digit_val(*s->p); s->p++;
+        if (v >= 9007199254740992.0) { s->ok = FALSE; return 0; }    
+    }
     return v;
 }
 
 static cd primary(P *s)
 {
-    if (s->recursion_depth >= 256) { s->ok = FALSE; return 0; }
-    s->recursion_depth++;
+    if (++s->steps > CALC_MAX_STEPS) { s->ok = FALSE; return 0; }
     skip(s);
-    if (eat(s, "(")) { cd v = or_(s); eat(s, ")"); return v; }
-    if (eat(s, "√")) { cd v = clean(primary(s)); return csqrt(v); }
+    if (eat(s, "(")) {
+        if (++s->depth > CALC_MAX_DEPTH) { s->ok = FALSE; return 0; }
+        cd v = or_(s);
+        s->depth--;
+        eat(s, ")");
+        return v;
+    }
+    if (eat(s, "√")) {
+        if (++s->depth > CALC_MAX_DEPTH) { s->ok = FALSE; return 0; }
+        cd v = clean(primary(s)); s->depth--; return csqrt(v);
+    }
     if (eat(s, "Ans")) return s->ans;
     int d = digit_val(*s->p);
     if ((d >= 0 && d < s->c->base) || (s->c->base == 10 && *s->p == ',')) return number(s);
@@ -190,11 +223,8 @@ static cd primary(P *s)
             cd args[4] = { 0, 0, 0, 0 };
             int cnt = 0;
             args[cnt++] = or_(s);
-            while (s->ok && eat(s, ";")) {
-                if (cnt >= (int)G_N_ELEMENTS(args)) { s->ok = FALSE; return 0; }
-                args[cnt++] = or_(s);
-            }
-            if (!eat(s, ")")) { s->ok = FALSE; return 0; }
+            while (s->ok && eat(s, ";") && cnt < 4) args[cnt++] = or_(s);
+            eat(s, ")");
             if (!s->ok) return 0;
             if (cnt != fns[i].nargs) { s->ok = FALSE; return 0; }
             cd r = fns[i].nargs == 1 ? apply1(s, fns[i].id, args[0]) : applyn(s, fns[i].id, args);
@@ -237,9 +267,15 @@ static cd power(P *s)
 }
 static cd unary(P *s)
 {
-    if (eat(s, "−")) return clean(-unary(s));
+    if (++s->steps > CALC_MAX_STEPS) { s->ok = FALSE; return 0; }
+    if (eat(s, "−")) {
+        if (++s->depth > CALC_MAX_DEPTH) { s->ok = FALSE; return 0; }
+        cd v = clean(-unary(s)); s->depth--; return v;
+    }
     if (eat(s, "¬")) {
+        if (++s->depth > CALC_MAX_DEPTH) { s->ok = FALSE; return 0; }
         cd v = unary(s); int64_t x;
+        s->depth--;
         if (!to_i64(v, &x)) { s->ok = FALSE; return 0; }
         return (double)(~x);
     }
@@ -272,8 +308,8 @@ static cd add_(P *s)
     cd v = term(s);
     for (;;) {
         if (!s->ok) return v;
-        if (eat(s, "+")) v += term(s);
-        else if (eat(s, "−")) v -= term(s);
+        if (eat(s, "+")) v = snap(v + term(s));
+        else if (eat(s, "−")) v = snap(v - term(s));
         else return v;
     }
 }
@@ -316,12 +352,11 @@ static cd or_(P *s)
 
 gboolean calc_eval_full(const CalcSettings *cfg, const char *text, cd ans, cd *out)
 {
-    if (!cfg || !text || !out || strlen(text) > 65536 ||
-        (cfg->base != 2 && cfg->base != 8 && cfg->base != 10 && cfg->base != 16) ||
+    if (!cfg || !text || strlen(text) > CALC_MAX_INPUT) return FALSE;
+    if ((cfg->base != 2 && cfg->base != 8 && cfg->base != 10 && cfg->base != 16) ||
         (cfg->bits != 8 && cfg->bits != 16 && cfg->bits != 32 && cfg->bits != 64) ||
-        cfg->angle < 0 || cfg->angle > 2 || !isfinite(creal(ans)) || !isfinite(cimag(ans)))
-        return FALSE;
-    P s = { text, TRUE, ans, cfg, 0 };
+        cfg->angle < 0 || cfg->angle > 2) return FALSE;
+    P s = { text, TRUE, ans, cfg, 0, 0 };
     cd v = or_(&s);
     skip(&s);
     if (*s.p) s.ok = FALSE;
@@ -336,7 +371,7 @@ static char *fmt_real(double v)
     GString *o = g_string_new("");
     for (const char *c = t; *c; c++) {
         if (*c == '.') g_string_append_c(o, ',');
-        else if (*c == '-') g_string_append(o, "−");   /* U+2212, как на кнопке */
+        else if (*c == '-') g_string_append(o, "−");    
         else g_string_append_c(o, *c);
     }
     g_free(t);

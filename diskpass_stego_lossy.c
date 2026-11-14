@@ -10,15 +10,32 @@
 typedef struct {
     struct jpeg_error_mgr pub;
     jmp_buf jump;
-    char message[JMSG_LENGTH_MAX];
+    char volatile_message[JMSG_LENGTH_MAX];
 } dp_jpeg_error_t;
 
 static void dp_jpeg_error_exit(j_common_ptr cinfo) {
     dp_jpeg_error_t *err = (dp_jpeg_error_t *)cinfo->err;
-    if (err && err->pub.format_message)
-        (*err->pub.format_message)(cinfo, err->message);
+    if (!err) {
+        abort();
+    }
+    char msg[JMSG_LENGTH_MAX];
+    msg[0] = '\0';
+    if (err->pub.format_message)
+        (*err->pub.format_message)(cinfo, msg);
+    snprintf(err->volatile_message, sizeof(err->volatile_message), "%s", msg);
     longjmp(err->jump, 1);
 }
+
+static void dp_jpeg_emit_message(j_common_ptr cinfo, int level) {
+    if (level < 0) dp_jpeg_error_exit(cinfo);
+}
+
+ 
+
+
+#define STEGO_JPEG_VERSION 4U
+#define STEGO_JPEG_KEYED_VERSION 3U
+#define STEGO_JPEG_LEGACY_VERSION 2U
 
 static gboolean stego_path_is_jpeg(const char *path) {
     if (!path) return FALSE;
@@ -48,7 +65,7 @@ static int stego_pread_all(int fd, void *buf, size_t len, uint64_t offset) {
     size_t done = 0;
     while (done < len) {
         if (offset > (uint64_t)LLONG_MAX || done > (size_t)LLONG_MAX ||
-            offset + (uint64_t)done > (uint64_t)LLONG_MAX)
+            (uint64_t)done > (uint64_t)LLONG_MAX - offset)
             return -1;
         ssize_t n = pread(fd, p + done, len - done, (off_t)(offset + (uint64_t)done));
         if (n < 0 && errno == EINTR) continue;
@@ -151,7 +168,7 @@ static uint16_t stego_jpeg_canon_coef(JCOEF v, gboolean ac) {
 }
 
 static gboolean stego_jpeg_analyze_mode(j_decompress_ptr src, jvirt_barray_ptr *coef_arrays,
-    unsigned char seed[STEGO_SEED_BYTES], uint64_t *out_slots, gboolean keyed,
+    unsigned char seed[STEGO_SEED_BYTES], uint64_t *out_slots, unsigned version,
     char *err_msg, size_t err_msg_sz)
 {
     if (!src || !coef_arrays || !seed || !out_slots) return FALSE;
@@ -160,8 +177,11 @@ static gboolean stego_jpeg_analyze_mode(j_decompress_ptr src, jvirt_barray_ptr *
     const unsigned char *key = NULL;
     size_t key_len = 0;
     sodium_memzero(secret_snapshot, sizeof(secret_snapshot));
-    if (keyed) {
-        if (!stego_secret_snapshot(secret_snapshot)) return FALSE;
+    if (version == STEGO_JPEG_KEYED_VERSION) {
+        if (!stego_secret_snapshot(secret_snapshot)) {
+            snprintf(err_msg, err_msg_sz, "Legacy keyed JPEG requires the original open database for recovery");
+            return FALSE;
+        }
         key = secret_snapshot;
         key_len = sizeof(secret_snapshot);
     }
@@ -172,10 +192,16 @@ static gboolean stego_jpeg_analyze_mode(j_decompress_ptr src, jvirt_barray_ptr *
         snprintf(err_msg, err_msg_sz, "Cannot initialize JPEG steganography hash");
         return FALSE;
     }
-    static const unsigned char public_ctx[] = "DiskPass JPEG DCT bootstrap seed v3";
-    static const unsigned char legacy_ctx[] = "DiskPass JPEG DCT steganography seed v2";
-    const unsigned char *ctx = keyed ? legacy_ctx : public_ctx;
-    size_t ctx_len = keyed ? sizeof(legacy_ctx) - 1 : sizeof(public_ctx) - 1;
+    static const unsigned char current_ctx[] = "DiskPass JPEG DCT bootstrap seed v6";
+    static const unsigned char keyed_ctx[] = "DiskPass JPEG DCT steganography seed v5";
+    static const unsigned char legacy_ctx[] = "DiskPass JPEG DCT bootstrap seed v3";
+    const unsigned char *ctx = current_ctx;
+    size_t ctx_len = sizeof(current_ctx) - 1;
+    if (version == STEGO_JPEG_KEYED_VERSION) {
+        ctx = keyed_ctx; ctx_len = sizeof(keyed_ctx) - 1;
+    } else if (version == STEGO_JPEG_LEGACY_VERSION) {
+        ctx = legacy_ctx; ctx_len = sizeof(legacy_ctx) - 1;
+    }
     crypto_generichash_update(&st, ctx, ctx_len);
     unsigned char meta[24] = {0};
     db_store_u64le(meta, (uint64_t)src->image_width);
@@ -212,7 +238,10 @@ static gboolean stego_jpeg_analyze_mode(j_decompress_ptr src, jvirt_barray_ptr *
                 for (int k = 0; k < DCTSIZE2; k++) {
                     int x = (int)block[k];
                     unsigned a = (unsigned)(x < 0 ? -x : x);
-                    if (k != 0 && a >= 2U && a <= 0x7FFFU) slots++;
+                     
+
+                    if ((version != STEGO_JPEG_VERSION || ci == 0) &&
+                        k != 0 && a >= 2U && a <= 0x7FFFU) slots++;
                     uint16_t canon = stego_jpeg_canon_coef(block[k], k != 0);
                     buf[used++] = (unsigned char)canon;
                     buf[used++] = (unsigned char)(canon >> 8);
@@ -241,28 +270,42 @@ static gboolean stego_jpeg_analyze(j_decompress_ptr src, jvirt_barray_ptr *coef_
     unsigned char seed[STEGO_SEED_BYTES], uint64_t *out_slots,
     char *err_msg, size_t err_msg_sz)
 {
-    return stego_jpeg_analyze_mode(src, coef_arrays, seed, out_slots, FALSE,
+    return stego_jpeg_analyze_mode(src, coef_arrays, seed, out_slots, STEGO_JPEG_VERSION,
         err_msg, err_msg_sz);
 }
 
-static gboolean stego_jpeg_analyze_legacy(j_decompress_ptr src, jvirt_barray_ptr *coef_arrays,
-    unsigned char seed[STEGO_SEED_BYTES], uint64_t *out_slots,
-    char *err_msg, size_t err_msg_sz)
+ 
+
+
+static uint64_t stego_inverse_step(uint64_t step, uint64_t slots)
 {
-    return stego_jpeg_analyze_mode(src, coef_arrays, seed, out_slots, TRUE,
-        err_msg, err_msg_sz);
+    int64_t t = 0, next = 1;
+    uint64_t r = slots, nr = step;
+    while (nr) {
+        uint64_t q = r / nr, rem = r % nr;
+        int64_t nt = t - (int64_t)q * next;
+        t = next; next = nt; r = nr; nr = rem;
+    }
+    if (r != 1) return 0;
+    if (t < 0) t += (int64_t)slots;
+    return (uint64_t)t;
 }
 
 static void stego_jpeg_rw_range(j_decompress_ptr src, jvirt_barray_ptr *coef_arrays,
-    uint64_t slots, uint64_t start_slot, uint64_t first_bit,
-    unsigned char *data, size_t len, gboolean write_mode)
+    uint64_t slots, const unsigned char seed[STEGO_SEED_BYTES], unsigned version,
+    uint64_t first_bit, unsigned char *data, size_t len, gboolean write_mode)
 {
-
-
     if (!write_mode) memset(data, 0, len);
+    stego_iter_t it;
+    if (!slots || slots > UINT32_MAX || first_bit > slots ||
+        (uint64_t)len > (slots - first_bit) / 8U ||
+        !stego_iter_init(&it, slots, seed)) return;
     uint64_t last_bit = first_bit + (uint64_t)len * 8U;
+    uint64_t inverse = version == STEGO_JPEG_VERSION
+        ? stego_inverse_step(it.step, slots) : 1;
     uint64_t slot_index = 0;
     for (int ci = 0; ci < src->num_components; ci++) {
+        if (version == STEGO_JPEG_VERSION && ci != 0) continue;
         jpeg_component_info *comp = &src->comp_info[ci];
         for (JDIMENSION row = 0; row < comp->height_in_blocks; row++) {
             JBLOCKARRAY blocks = (*src->mem->access_virt_barray)((j_common_ptr)src,
@@ -273,9 +316,10 @@ static void stego_jpeg_rw_range(j_decompress_ptr src, jvirt_barray_ptr *coef_arr
                     int v = (int)block[k];
                     unsigned a = (unsigned)(v < 0 ? -v : v);
                     if (a < 2U || a > 0x7FFFU) continue;
-                    uint64_t logical = slot_index >= start_slot
-                        ? slot_index - start_slot
-                        : slots - start_slot + slot_index;
+                    if (slot_index >= slots) return;
+                    uint64_t delta = slot_index >= it.pos
+                        ? slot_index - it.pos : slots - it.pos + slot_index;
+                    uint64_t logical = (delta * inverse) % slots;
                     if (logical >= first_bit && logical < last_bit) {
                         uint64_t bidx = logical - first_bit;
                         size_t byte_i = (size_t)(bidx >> 3);
@@ -283,7 +327,7 @@ static void stego_jpeg_rw_range(j_decompress_ptr src, jvirt_barray_ptr *coef_arr
                         if (write_mode) {
                             unsigned wanted = (data[byte_i] >> bit_i) & 1U;
                             if ((a & 1U) != wanted) {
-                                if (a & 1U) a--; else a++;
+                                a ^= 1U;  
                                 block[k] = (JCOEF)(v < 0 ? -(int)a : (int)a);
                             }
                         } else {
@@ -303,9 +347,8 @@ static gboolean stego_jpeg_decode_header(j_decompress_ptr src, jvirt_barray_ptr 
 {
     unsigned char enc[STEGO_HEADER_BYTES], plain[STEGO_HEADER_BYTES], mask[STEGO_HEADER_BYTES];
     unsigned char check[STEGO_CHECK_BYTES];
-    uint64_t start = db_load_u64le(seed) % slots;
     memset(enc, 0, sizeof(enc));
-    stego_jpeg_rw_range(src, coef_arrays, slots, start, 0, enc, sizeof(enc), FALSE);
+    stego_jpeg_rw_range(src, coef_arrays, slots, seed, expected_version, 0, enc, sizeof(enc), FALSE);
     stego_header_mask(seed, mask);
     for (size_t i = 0; i < sizeof(plain); i++) plain[i] = (unsigned char)(enc[i] ^ mask[i]);
     stego_header_check(seed, plain, check);
@@ -326,17 +369,51 @@ static gboolean stego_jpeg_decode_header(j_decompress_ptr src, jvirt_barray_ptr 
     return ok;
 }
 
+static gboolean stego_jpeg_find_header(j_decompress_ptr src, jvirt_barray_ptr *arrays,
+    unsigned char seed[STEGO_SEED_BYTES], uint64_t *slots, unsigned *version,
+    uint64_t *len, unsigned char hash[STEGO_HASH_BYTES], char *err, size_t err_size)
+{
+    static const unsigned versions[] = {
+        STEGO_JPEG_VERSION, STEGO_JPEG_LEGACY_VERSION, STEGO_JPEG_KEYED_VERSION
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
+        unsigned candidate = versions[i];
+        if (!stego_jpeg_analyze_mode(src, arrays, seed, slots, candidate, err, err_size)) continue;
+        if (stego_jpeg_decode_header(src, arrays, *slots, seed, candidate, len, hash)) {
+            *version = candidate; return TRUE;
+        }
+        if (candidate != STEGO_JPEG_VERSION) {
+            uint64_t luma_slots = 0;
+            for (JDIMENSION row = 0; row < src->comp_info[0].height_in_blocks; row++) {
+                JBLOCKARRAY blocks = (*src->mem->access_virt_barray)((j_common_ptr)src,
+                    arrays[0], row, 1, FALSE);
+                for (JDIMENSION col = 0; col < src->comp_info[0].width_in_blocks; col++)
+                    for (int k = 1; k < DCTSIZE2; k++) {
+                        int v = blocks[0][col][k];
+                        unsigned a = (unsigned)(v < 0 ? -v : v);
+                        if (a >= 2U && a <= 0x7FFFU) luma_slots++;
+                    }
+            }
+            if (luma_slots >= STEGO_HEADER_BYTES * 8U &&
+                stego_jpeg_decode_header(src, arrays, luma_slots, seed, candidate, len, hash)) {
+                *slots = luma_slots; *version = candidate; return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 static int stego_jpeg_write_atomic(j_decompress_ptr src, jvirt_barray_ptr *coef_arrays,
     const char *output_path, char *err_msg, size_t err_msg_sz)
 {
     char *tmp = NULL;
     int fd = -1;
     FILE * volatile fp = NULL;
-    struct jpeg_compress_struct dst;
-    dp_jpeg_error_t jerr;
+    struct jpeg_compress_struct * volatile dst = NULL;
+    dp_jpeg_error_t * volatile jerr = NULL;
     volatile gboolean created = FALSE;
     volatile int rc = -1;
-    memset(&dst, 0, sizeof(dst)); memset(&jerr, 0, sizeof(jerr));
+
     if (carrier_create_temp(output_path, &tmp, &fd, err_msg, err_msg_sz) != 0) return -1;
     fp = fdopen(fd, "wb");
     if (!fp) {
@@ -344,23 +421,29 @@ static int stego_jpeg_write_atomic(j_decompress_ptr src, jvirt_barray_ptr *coef_
         close(fd); fd = -1; goto cleanup;
     }
     fd = -1;
-    dst.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = dp_jpeg_error_exit;
-    if (setjmp(jerr.jump)) {
+    dst = calloc(1, sizeof(*dst));
+    jerr = calloc(1, sizeof(*jerr));
+    if (!dst || !jerr) { snprintf(err_msg, err_msg_sz, "Out of memory for JPEG codec"); goto cleanup; }
+    dst->err = jpeg_std_error(&jerr->pub);
+    jerr->pub.error_exit = dp_jpeg_error_exit;
+    jerr->pub.emit_message = dp_jpeg_emit_message;
+    if (setjmp(jerr->jump)) {
         snprintf(err_msg, err_msg_sz, "Cannot encode stego JPEG: %s",
-            jerr.message[0] ? jerr.message : "libjpeg error");
+            jerr->volatile_message[0] ? jerr->volatile_message : "libjpeg error");
         goto cleanup;
     }
-    jpeg_create_compress(&dst); created = TRUE;
-    jpeg_stdio_dest(&dst, fp);
-    jpeg_copy_critical_parameters(src, &dst);
-    dst.write_JFIF_header = FALSE;
-    dst.write_Adobe_marker = FALSE;
-    jpeg_write_coefficients(&dst, coef_arrays);
+    created = TRUE; jpeg_create_compress(dst);
+    jpeg_stdio_dest(dst, fp);
+    jpeg_copy_critical_parameters(src, dst);
+    dst->restart_interval = src->restart_interval;
+    if (src->progressive_mode) jpeg_simple_progression(dst);
+    dst->write_JFIF_header = FALSE;
+    dst->write_Adobe_marker = FALSE;
+    jpeg_write_coefficients(dst, coef_arrays);
     for (jpeg_saved_marker_ptr m = src->marker_list; m; m = m->next)
-        jpeg_write_marker(&dst, m->marker, m->data, m->data_length);
-    jpeg_finish_compress(&dst);
-    jpeg_destroy_compress(&dst); created = FALSE;
+        jpeg_write_marker(dst, m->marker, m->data, m->data_length);
+    jpeg_finish_compress(dst);
+    jpeg_destroy_compress(dst); created = FALSE;
     if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot sync stego JPEG: %s", strerror(errno));
         goto cleanup;
@@ -374,26 +457,13 @@ static int stego_jpeg_write_atomic(j_decompress_ptr src, jvirt_barray_ptr *coef_
     carrier_fsync_parent(output_path);
     rc = 0;
 cleanup:
-    if (created) jpeg_destroy_compress(&dst);
+    if (created) jpeg_destroy_compress(dst);
     if (fp) fclose(fp);
     if (fd >= 0) close(fd);
     if (rc != 0 && tmp) unlink(tmp);
     free(tmp);
+    free(jerr); free(dst);
     return rc;
-}
-
-static void stego_jpeg_add_capacity_texture(GdkPixbuf *pb)
-{
-    if (!pb) return;
-    int w = gdk_pixbuf_get_width(pb);
-    int h = gdk_pixbuf_get_height(pb);
-    int channels = gdk_pixbuf_get_n_channels(pb);
-    /* Artificial pixel noise has a strong statistical signature and can make
-     * an enlarged image easier to classify as manipulated. Do not add it;
-     * this routine remains as a no-op for existing callers. */
-    (void)w;
-    (void)h;
-    (void)channels;
 }
 
 static int stego_jpeg_make_enlarged_cover(const char *carrier_path,
@@ -402,9 +472,10 @@ static int stego_jpeg_make_enlarged_cover(const char *carrier_path,
 {
     if (!carrier_path || !output_hint || !out_path) return -1;
     *out_path = NULL;
-    if (g_strcmp0(g_getenv("DISKPASS_STEGO_NO_UPSCALE"), "1") == 0) {
+    if (g_strcmp0(g_getenv("DISKPASS_STEGO_NO_UPSCALE"), "1") == 0 ||
+        g_strcmp0(g_getenv("DISKPASS_STEGO_ALLOW_UPSCALE"), "1") != 0) {
         snprintf(err_msg, err_msg_sz,
-            "JPEG is too small and automatic enlargement is disabled");
+            "JPEG capacity is insufficient; choose a larger cover (resizing requires DISKPASS_STEGO_ALLOW_UPSCALE=1)");
         return -1;
     }
 
@@ -465,7 +536,6 @@ static int stego_jpeg_make_enlarged_cover(const char *carrier_path,
         snprintf(err_msg, err_msg_sz, "Cannot enlarge JPEG carrier");
         return -1;
     }
-    stego_jpeg_add_capacity_texture(scaled);
 
     gchar *encoded = NULL;
     gsize encoded_len = 0;
@@ -511,15 +581,15 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
     int dfd = -1, cfd = -1;
     uint64_t db_size = 0, carrier_size = 0, slots = 0;
     FILE * volatile fp = NULL;
-    struct jpeg_decompress_struct src;
-    dp_jpeg_error_t jerr;
+    struct jpeg_decompress_struct * volatile src = NULL;
+    dp_jpeg_error_t * volatile jerr = NULL;
     jvirt_barray_ptr *coef_arrays = NULL;
     volatile gboolean created = FALSE;
     volatile int rc = -1;
     unsigned char seed[STEGO_SEED_BYTES], payload_hash[STEGO_HASH_BYTES];
     unsigned char header[STEGO_HEADER_BYTES], mask[STEGO_HEADER_BYTES], check[STEGO_CHECK_BYTES];
     unsigned char * volatile payload = NULL;
-    memset(&src, 0, sizeof(src)); memset(&jerr, 0, sizeof(jerr));
+
 
     if (!carrier_path || !db_path || !output_path ||
         !carrier_paths_distinct(carrier_path, output_path) ||
@@ -527,13 +597,16 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
         snprintf(err_msg, err_msg_sz, "Output JPEG must be different from the source JPEG and database");
         return -1;
     }
-    if (!(g_str_has_suffix(output_path, ".jpg") || g_str_has_suffix(output_path, ".JPG") ||
-          g_str_has_suffix(output_path, ".jpeg") || g_str_has_suffix(output_path, ".JPEG"))) {
+    if (!stego_output_is_ci(output_path, ".jpg") && !stego_output_is_ci(output_path, ".jpeg")) {
         snprintf(err_msg, err_msg_sz, "JPEG DCT steganography output must use .jpg or .jpeg");
         return -1;
     }
     if (carrier_open_regular(db_path, DB_MAX_FILE_BYTES, &dfd, &db_size, err_msg, err_msg_sz) != 0) goto cleanup;
-    if (!db_path_has_dpdb_extension(db_path) || !carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+    if (!carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+        snprintf(err_msg, err_msg_sz, "Input is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
+    if (!db_path_has_dpdb_extension(db_path) || db_size < 64) {
         snprintf(err_msg, err_msg_sz, "Only valid DiskPass .dpdb databases can be hidden"); goto cleanup;
     }
     if (carrier_open_regular(carrier_path, STEGO_JPEG_MAX_BYTES, &cfd, &carrier_size, err_msg, err_msg_sz) != 0) goto cleanup;
@@ -542,40 +615,39 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
     if (stream_fd < 0) { snprintf(err_msg, err_msg_sz, "Cannot duplicate JPEG descriptor: %s", strerror(errno)); goto cleanup; }
     fp = fdopen(stream_fd, "rb");
     if (!fp) { close(stream_fd); snprintf(err_msg, err_msg_sz, "Cannot open JPEG stream: %s", strerror(errno)); goto cleanup; }
-    src.err = jpeg_std_error(&jerr.pub); jerr.pub.error_exit = dp_jpeg_error_exit;
-    if (setjmp(jerr.jump)) {
-        snprintf(err_msg, err_msg_sz, "Cannot parse JPEG: %s", jerr.message[0] ? jerr.message : "libjpeg error");
+    src = calloc(1, sizeof(*src));
+    jerr = calloc(1, sizeof(*jerr));
+    if (!src || !jerr) { snprintf(err_msg, err_msg_sz, "Out of memory for JPEG codec"); goto cleanup; }
+    src->err = jpeg_std_error(&jerr->pub); jerr->pub.error_exit = dp_jpeg_error_exit;
+    jerr->pub.emit_message = dp_jpeg_emit_message;
+    if (setjmp(jerr->jump)) {
+        snprintf(err_msg, err_msg_sz, "Cannot parse JPEG: %s", jerr->volatile_message[0] ? jerr->volatile_message : "libjpeg error");
         goto cleanup;
     }
-    jpeg_create_decompress(&src); created = TRUE;
-    for (int m = 0; m < 16; m++) jpeg_save_markers(&src, JPEG_APP0 + m, 0xFFFF);
-    jpeg_save_markers(&src, JPEG_COM, 0xFFFF);
-    jpeg_stdio_src(&src, fp);
-    if (jpeg_read_header(&src, TRUE) != JPEG_HEADER_OK) { snprintf(err_msg, err_msg_sz, "Invalid JPEG header"); goto cleanup; }
-    if (src.image_width == 0 || src.image_height == 0 || src.num_components <= 0 ||
-        (uint64_t)src.image_width > UINT64_MAX / (uint64_t)src.image_height ||
-        (uint64_t)src.image_width * (uint64_t)src.image_height > STEGO_JPEG_MAX_PIXELS) {
+    created = TRUE; jpeg_create_decompress(src);
+    for (int m = 0; m < 16; m++) jpeg_save_markers(src, JPEG_APP0 + m, 0xFFFF);
+    jpeg_save_markers(src, JPEG_COM, 0xFFFF);
+    jpeg_stdio_src(src, fp);
+    if (jpeg_read_header(src, TRUE) != JPEG_HEADER_OK) { snprintf(err_msg, err_msg_sz, "Invalid JPEG header"); goto cleanup; }
+    if (src->image_width == 0 || src->image_height == 0 || src->num_components <= 0 ||
+        (uint64_t)src->image_width > UINT64_MAX / (uint64_t)src->image_height ||
+        (uint64_t)src->image_width * (uint64_t)src->image_height > STEGO_JPEG_MAX_PIXELS) {
         snprintf(err_msg, err_msg_sz, "JPEG decoded dimensions exceed the steganography safety limit");
         goto cleanup;
     }
-    coef_arrays = jpeg_read_coefficients(&src);
-    if (!coef_arrays || !stego_jpeg_analyze(&src, coef_arrays, seed, &slots, err_msg, err_msg_sz)) goto cleanup;
+    coef_arrays = jpeg_read_coefficients(src);
+    if (!coef_arrays || !stego_jpeg_analyze(src, coef_arrays, seed, &slots, err_msg, err_msg_sz)) goto cleanup;
 
 
     if (!g_atomic_int_get(&g_stego_replace_existing_payload)) {
-        gboolean has_payload = stego_jpeg_decode_header(&src, coef_arrays, slots, seed,
-            STEGO_VERSION, NULL, NULL);
-        if (!has_payload) {
-            unsigned char legacy_seed[STEGO_SEED_BYTES];
-            uint64_t legacy_slots = 0;
-            if (stego_jpeg_analyze_legacy(&src, coef_arrays, legacy_seed, &legacy_slots,
-                    err_msg, err_msg_sz) && legacy_slots == slots)
-                has_payload = stego_jpeg_decode_header(&src, coef_arrays, slots, legacy_seed,
-                    STEGO_LEGACY_VERSION, NULL, NULL);
-            sodium_memzero(legacy_seed, sizeof(legacy_seed));
-        }
+        unsigned char previous_seed[STEGO_SEED_BYTES];
+        uint64_t previous_slots = 0;
+        unsigned previous_version = 0;
+        gboolean has_payload = stego_jpeg_find_header(src, coef_arrays, previous_seed,
+            &previous_slots, &previous_version, NULL, NULL, err_msg, err_msg_sz);
+        sodium_memzero(previous_seed, sizeof(previous_seed));
         if (has_payload) {
-            snprintf(err_msg, err_msg_sz, "The selected JPEG already appears to contain a DiskPass stego payload");
+            snprintf(err_msg, err_msg_sz, "The selected JPEG already contains a DiskPass stego payload");
             goto cleanup;
         }
     }
@@ -585,11 +657,12 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
             char grow_err[384] = "";
             if (stego_jpeg_make_enlarged_cover(carrier_path, output_path, db_size, slots,
                     &grown, grow_err, sizeof(grow_err)) == 0 && grown) {
-                if (created) { jpeg_destroy_decompress(&src); created = FALSE; }
+                if (created) { jpeg_destroy_decompress(src); created = FALSE; }
                 if (fp) { fclose(fp); fp = NULL; }
                 if (cfd >= 0) { close(cfd); cfd = -1; }
                 if (dfd >= 0) { close(dfd); dfd = -1; }
                 sodium_memzero(seed, sizeof(seed));
+                free(jerr); free(src);
                 int retry = carrier_attach_dpdb_jpeg_impl(grown, db_path, output_path, FALSE,
                     err_msg, err_msg_sz);
                 unlink(grown); free(grown);
@@ -607,16 +680,10 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
             (double)usable / (1024.0 * 1024.0), (double)db_size / (1024.0 * 1024.0));
         goto cleanup;
     }
-    if (stego_hash_fd(dfd, db_size, payload_hash, err_msg, err_msg_sz) != 0) goto cleanup;
     if (db_size > SIZE_MAX - STEGO_HEADER_BYTES) { snprintf(err_msg, err_msg_sz, "Database is too large for JPEG embedding"); goto cleanup; }
     payload = sodium_malloc((size_t)db_size + STEGO_HEADER_BYTES);
     if (!payload) { snprintf(err_msg, err_msg_sz, "Out of secure memory for JPEG embedding"); goto cleanup; }
-    memset(header, 0, sizeof(header));
-    db_store_u64le(header, db_size); memcpy(header + 8, payload_hash, STEGO_HASH_BYTES);
-    header[40] = STEGO_VERSION; randombytes_buf(header + 41, 15);
-    stego_header_check(seed, header, check); memcpy(header + STEGO_HEADER_BYTES - STEGO_CHECK_BYTES, check, STEGO_CHECK_BYTES);
-    stego_header_mask(seed, mask); for (size_t i = 0; i < sizeof(header); i++) header[i] ^= mask[i];
-    memcpy((void *)payload, header, STEGO_HEADER_BYTES);
+    memset(payload, 0, (size_t)db_size + STEGO_HEADER_BYTES);
     uint64_t off = 0;
     while (off < db_size) {
         ssize_t n = pread(dfd, (unsigned char *)payload + STEGO_HEADER_BYTES + off, (size_t)(db_size - off), (off_t)off);
@@ -624,19 +691,28 @@ static int carrier_attach_dpdb_jpeg_impl(const char *carrier_path, const char *d
         if (n <= 0) { snprintf(err_msg, err_msg_sz, "Cannot read database for JPEG steganography"); goto cleanup; }
         off += (uint64_t)n;
     }
-    uint64_t start = db_load_u64le(seed) % slots;
-    stego_jpeg_rw_range(&src, coef_arrays, slots, start, 0, (unsigned char *)payload,
+    crypto_generichash(payload_hash, STEGO_HASH_BYTES,
+        (const unsigned char *)payload + STEGO_HEADER_BYTES, (unsigned long long)db_size,
+        NULL, 0);
+    memset(header, 0, sizeof(header));
+    db_store_u64le(header, db_size); memcpy(header + 8, payload_hash, STEGO_HASH_BYTES);
+    header[40] = STEGO_JPEG_VERSION; randombytes_buf(header + 41, 15);
+    stego_header_check(seed, header, check); memcpy(header + STEGO_HEADER_BYTES - STEGO_CHECK_BYTES, check, STEGO_CHECK_BYTES);
+    stego_header_mask(seed, mask); for (size_t i = 0; i < sizeof(header); i++) header[i] ^= mask[i];
+    memcpy((void *)payload, header, STEGO_HEADER_BYTES);
+    stego_jpeg_rw_range(src, coef_arrays, slots, seed, STEGO_JPEG_VERSION, 0, (unsigned char *)payload,
         (size_t)db_size + STEGO_HEADER_BYTES, TRUE);
-    if (stego_jpeg_write_atomic(&src, coef_arrays, output_path, err_msg, err_msg_sz) != 0) goto cleanup;
+    if (stego_jpeg_write_atomic(src, coef_arrays, output_path, err_msg, err_msg_sz) != 0) goto cleanup;
     rc = 0;
 cleanup:
-    if (payload) { sodium_memzero((void *)payload, (size_t)db_size + STEGO_HEADER_BYTES); sodium_free((void *)payload); }
-    if (created) jpeg_destroy_decompress(&src);
+    if (payload) sodium_free((void *)payload);
+    if (created) jpeg_destroy_decompress(src);
     if (fp) fclose(fp);
     if (cfd >= 0) close(cfd);
     if (dfd >= 0) close(dfd);
     sodium_memzero(seed, sizeof(seed)); sodium_memzero(payload_hash, sizeof(payload_hash));
     sodium_memzero(header, sizeof(header)); sodium_memzero(mask, sizeof(mask)); sodium_memzero(check, sizeof(check));
+    free(jerr); free(src);
     return rc;
 }
 
@@ -651,19 +727,18 @@ static int carrier_extract_dpdb_jpeg(const char *jpeg_path, const char *output_d
     char *err_msg, size_t err_msg_sz)
 {
     int cfd = -1, ofd = -1;
-    volatile int verify_fd = -1;
     uint64_t carrier_size = 0, slots = 0;
     volatile uint64_t payload_len = 0;
     FILE * volatile fp = NULL;
-    struct jpeg_decompress_struct src;
-    dp_jpeg_error_t jerr;
+    struct jpeg_decompress_struct * volatile src = NULL;
+    dp_jpeg_error_t * volatile jerr = NULL;
     jvirt_barray_ptr *coef_arrays = NULL;
     volatile gboolean created = FALSE;
     char *tmp = NULL;
     volatile int rc = -1;
     unsigned char seed[STEGO_SEED_BYTES], expected_hash[STEGO_HASH_BYTES], actual_hash[STEGO_HASH_BYTES];
     unsigned char * volatile payload = NULL;
-    memset(&src, 0, sizeof(src)); memset(&jerr, 0, sizeof(jerr));
+
     if (!jpeg_path || !output_db_path || !carrier_paths_distinct(jpeg_path, output_db_path) ||
         !db_path_has_dpdb_extension(output_db_path)) {
         snprintf(err_msg, err_msg_sz, "Extracted database must be a separate .dpdb file"); return -1;
@@ -674,32 +749,26 @@ static int carrier_extract_dpdb_jpeg(const char *jpeg_path, const char *output_d
     if (stream_fd < 0) { snprintf(err_msg, err_msg_sz, "Cannot duplicate JPEG descriptor: %s", strerror(errno)); goto cleanup; }
     fp = fdopen(stream_fd, "rb");
     if (!fp) { close(stream_fd); snprintf(err_msg, err_msg_sz, "Cannot open JPEG stream"); goto cleanup; }
-    src.err = jpeg_std_error(&jerr.pub); jerr.pub.error_exit = dp_jpeg_error_exit;
-    if (setjmp(jerr.jump)) { snprintf(err_msg, err_msg_sz, "Cannot parse JPEG: %s", jerr.message); goto cleanup; }
-    jpeg_create_decompress(&src); created = TRUE; jpeg_stdio_src(&src, fp);
-    if (jpeg_read_header(&src, TRUE) != JPEG_HEADER_OK) { snprintf(err_msg, err_msg_sz, "Invalid JPEG header"); goto cleanup; }
-    if (src.image_width == 0 || src.image_height == 0 || src.num_components <= 0 ||
-        (uint64_t)src.image_width > UINT64_MAX / (uint64_t)src.image_height ||
-        (uint64_t)src.image_width * (uint64_t)src.image_height > STEGO_JPEG_MAX_PIXELS) {
+    src = calloc(1, sizeof(*src));
+    jerr = calloc(1, sizeof(*jerr));
+    if (!src || !jerr) { snprintf(err_msg, err_msg_sz, "Out of memory for JPEG codec"); goto cleanup; }
+    src->err = jpeg_std_error(&jerr->pub); jerr->pub.error_exit = dp_jpeg_error_exit;
+    jerr->pub.emit_message = dp_jpeg_emit_message;
+    if (setjmp(jerr->jump)) { snprintf(err_msg, err_msg_sz, "Cannot parse JPEG: %s", jerr->volatile_message); goto cleanup; }
+    created = TRUE; jpeg_create_decompress(src); jpeg_stdio_src(src, fp);
+    if (jpeg_read_header(src, TRUE) != JPEG_HEADER_OK) { snprintf(err_msg, err_msg_sz, "Invalid JPEG header"); goto cleanup; }
+    if (src->image_width == 0 || src->image_height == 0 || src->num_components <= 0 ||
+        (uint64_t)src->image_width > UINT64_MAX / (uint64_t)src->image_height ||
+        (uint64_t)src->image_width * (uint64_t)src->image_height > STEGO_JPEG_MAX_PIXELS) {
         snprintf(err_msg, err_msg_sz, "JPEG decoded dimensions exceed the steganography safety limit");
         goto cleanup;
     }
-    coef_arrays = jpeg_read_coefficients(&src);
-    if (!coef_arrays || !stego_jpeg_analyze(&src, coef_arrays, seed, &slots, err_msg, err_msg_sz)) goto cleanup;
+    coef_arrays = jpeg_read_coefficients(src);
+    if (!coef_arrays) goto cleanup;
     uint64_t decoded_payload_len = 0;
-    gboolean found = stego_jpeg_decode_header(&src, coef_arrays, slots, seed,
-        STEGO_VERSION, &decoded_payload_len, expected_hash);
-    if (!found) {
-        unsigned char legacy_seed[STEGO_SEED_BYTES];
-        uint64_t legacy_slots = 0;
-        if (stego_jpeg_analyze_legacy(&src, coef_arrays, legacy_seed, &legacy_slots,
-                err_msg, err_msg_sz) && legacy_slots == slots) {
-            found = stego_jpeg_decode_header(&src, coef_arrays, slots, legacy_seed,
-                STEGO_LEGACY_VERSION, &decoded_payload_len, expected_hash);
-            if (found) memcpy(seed, legacy_seed, sizeof(seed));
-        }
-        sodium_memzero(legacy_seed, sizeof(legacy_seed));
-    }
+    unsigned decoded_version = 0;
+    gboolean found = stego_jpeg_find_header(src, coef_arrays, seed, &slots,
+        &decoded_version, &decoded_payload_len, expected_hash, err_msg, err_msg_sz);
     if (!found) {
         snprintf(err_msg, err_msg_sz, "No valid DiskPass DCT payload was found in this JPEG"); goto cleanup;
     }
@@ -707,8 +776,7 @@ static int carrier_extract_dpdb_jpeg(const char *jpeg_path, const char *output_d
     if (payload_len > SIZE_MAX) { snprintf(err_msg, err_msg_sz, "Hidden database is too large for this build"); goto cleanup; }
     payload = sodium_malloc((size_t)payload_len);
     if (!payload) { snprintf(err_msg, err_msg_sz, "Out of secure memory while extracting JPEG payload"); goto cleanup; }
-    uint64_t start = db_load_u64le(seed) % slots;
-    stego_jpeg_rw_range(&src, coef_arrays, slots, start, (uint64_t)STEGO_HEADER_BYTES * 8U,
+    stego_jpeg_rw_range(src, coef_arrays, slots, seed, decoded_version, (uint64_t)STEGO_HEADER_BYTES * 8U,
         (unsigned char *)payload, (size_t)payload_len, FALSE);
     crypto_generichash(actual_hash, STEGO_HASH_BYTES, (const unsigned char *)payload, (size_t)payload_len, NULL, 0);
     if (sodium_memcmp(actual_hash, expected_hash, STEGO_HASH_BYTES) != 0) {
@@ -718,28 +786,27 @@ static int carrier_extract_dpdb_jpeg(const char *jpeg_path, const char *output_d
     if (write_all_fd(ofd, (const void *)payload, (size_t)payload_len) != 0 || fsync(ofd) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot write extracted database: %s", strerror(errno)); goto cleanup;
     }
+    if (!carrier_dpdb_layout_at_fd(ofd, 0, payload_len)) {
+        snprintf(err_msg, err_msg_sz, "Extracted payload is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
     if (close(ofd) != 0) {
         ofd = -1;
         snprintf(err_msg, err_msg_sz, "Cannot close extracted database: %s", strerror(errno)); goto cleanup;
     }
     ofd = -1;
-    verify_fd = open(tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (verify_fd < 0 || !carrier_dpdb_layout_at_fd(verify_fd, 0, payload_len)) {
-        snprintf(err_msg, err_msg_sz, "Extracted JPEG payload is not a recognized DiskPass .dpdb container"); goto cleanup;
-    }
-    close(verify_fd); verify_fd = -1;
     if (rename(tmp, output_db_path) != 0) { snprintf(err_msg, err_msg_sz, "Cannot install extracted database: %s", strerror(errno)); goto cleanup; }
     carrier_fsync_parent(output_db_path); rc = 0;
 cleanup:
-    if (verify_fd >= 0) close(verify_fd);
     if (ofd >= 0) close(ofd);
     if (rc != 0 && tmp) unlink(tmp);
     free(tmp);
-    if (payload) { sodium_memzero((void *)payload, (size_t)payload_len); sodium_free((void *)payload); }
-    if (created) jpeg_destroy_decompress(&src);
+    if (payload) sodium_free((void *)payload);
+    if (created) jpeg_destroy_decompress(src);
     if (fp) fclose(fp);
     if (cfd >= 0) close(cfd);
     sodium_memzero(seed, sizeof(seed)); sodium_memzero(expected_hash, sizeof(expected_hash)); sodium_memzero(actual_hash, sizeof(actual_hash));
+    free(jerr); free(src);
     return rc;
 }
 
@@ -756,6 +823,10 @@ typedef struct {
     gboolean image_is_jpeg;
     gboolean image_is_png;
 } stego_mp3_apic_t;
+
+ 
+
+
 
 static gboolean id3_synchsafe_decode4(const unsigned char p[4], uint32_t *out) {
     if ((p[0] | p[1] | p[2] | p[3]) & 0x80U) return FALSE;
@@ -787,6 +858,9 @@ static gboolean stego_mp3_find_apic(const unsigned char *tag, size_t tag_total,
     if (!tag || tag_total < 10 || !out || memcmp(tag, "ID3", 3) != 0) return FALSE;
     unsigned ver = tag[3];
     if (ver != 3 && ver != 4) { snprintf(err_msg, err_msg_sz, "MP3 steganography supports ID3v2.3 and ID3v2.4 tags"); return FALSE; }
+    if (tag[4] == 0xFFU || (tag[5] & (ver == 3 ? 0x1FU : 0x0FU))) {
+        snprintf(err_msg, err_msg_sz, "ID3 tag has invalid version or reserved flags"); return FALSE;
+    }
     if (tag[5] & 0x80U) { snprintf(err_msg, err_msg_sz, "ID3 tag-wide unsynchronisation is not supported for safe APIC rewriting"); return FALSE; }
     if (tag[5] & 0x40U) { snprintf(err_msg, err_msg_sz, "ID3 extended headers are not supported for MP3 steganography"); return FALSE; }
     if (ver == 4 && (tag[5] & 0x10U)) { snprintf(err_msg, err_msg_sz, "ID3v2.4 footer tags are not supported for MP3 steganography"); return FALSE; }
@@ -798,7 +872,9 @@ static gboolean stego_mp3_find_apic(const unsigned char *tag, size_t tag_total,
     size_t pos = 10;
     while (pos + 10 <= limit) {
         if (tag[pos] == 0 && tag[pos+1] == 0 && tag[pos+2] == 0 && tag[pos+3] == 0) break;
-        if (!id3_frame_id_ok(tag + pos)) break;
+        if (!id3_frame_id_ok(tag + pos)) {
+            snprintf(err_msg, err_msg_sz, "Malformed ID3 frame identifier"); return FALSE;
+        }
         uint32_t frame_size = 0;
         if (ver == 4) {
             if (!id3_synchsafe_decode4(tag + pos + 4, &frame_size)) { snprintf(err_msg, err_msg_sz, "Malformed ID3v2.4 frame size"); return FALSE; }
@@ -806,7 +882,8 @@ static gboolean stego_mp3_find_apic(const unsigned char *tag, size_t tag_total,
         if ((uint64_t)pos + 10U + frame_size > limit) { snprintf(err_msg, err_msg_sz, "ID3 frame exceeds tag boundary"); return FALSE; }
         if (memcmp(tag + pos, "APIC", 4) == 0) {
             unsigned f2 = tag[pos + 9];
-            if ((ver == 3 && (f2 & 0xE0U)) || (ver == 4 && (f2 & 0x4FU))) {
+            if ((ver == 3 && (f2 != 0 || (tag[pos + 8] & 0x1FU))) ||
+                (ver == 4 && (f2 != 0 || (tag[pos + 8] & 0x8FU)))) {
                 snprintf(err_msg, err_msg_sz, "Compressed/encrypted/unsynchronised APIC frames are not supported"); return FALSE;
             }
             size_t d = pos + 10;
@@ -852,10 +929,14 @@ static GdkPixbuf *stego_pixbuf_from_memory(const unsigned char *data, size_t len
     GError *e = NULL;
     if (!gdk_pixbuf_loader_write(loader, data, len, &e) || !gdk_pixbuf_loader_close(loader, &e)) {
         snprintf(err_msg, err_msg_sz, "Cannot decode cover art: %s", e && e->message ? e->message : "decode error");
-        g_clear_error(&e); g_object_unref(loader); return NULL;
+        g_clear_error(&e);
+        (void)gdk_pixbuf_loader_close(loader, NULL);
+        g_object_unref(loader); return NULL;
     }
     GdkPixbuf *pb = gdk_pixbuf_loader_get_pixbuf(loader);
-    if (pb) g_object_ref(pb);
+    uint64_t decoded_slots = 0;
+    if (pb && stego_pixbuf_layout(pb, &decoded_slots, err_msg, err_msg_sz)) g_object_ref(pb);
+    else pb = NULL;
     g_object_unref(loader);
     if (!pb) snprintf(err_msg, err_msg_sz, "Cover art did not decode to pixels");
     return pb;
@@ -866,9 +947,23 @@ static GdkPixbuf *stego_pixbuf_scale_for_payload(GdkPixbuf *pb, uint64_t payload
 {
     uint64_t slots = 0;
     if (!stego_pixbuf_layout(pb, &slots, err_msg, err_msg_sz)) return NULL;
-    uint64_t need_bits = (payload_bytes + STEGO_HEADER_BYTES) * 8U;
+    unsigned percent = 0;
+    if (!stego_embedding_percent(&percent, err_msg, err_msg_sz) ||
+        payload_bytes > DB_MAX_FILE_BYTES) return NULL;
+    if (!g_atomic_int_get(&g_stego_replace_existing_payload)) {
+        unsigned char seed[STEGO_SEED_BYTES];
+        gboolean found = stego_seed_from_pixbuf(pb, seed, err_msg, err_msg_sz) &&
+            stego_decode_header(pb, slots, seed, STEGO_IMAGE_VERSION, NULL, NULL, NULL);
+        if (!found && stego_seed_from_pixbuf_legacy(pb, seed, err_msg, err_msg_sz))
+            found = stego_decode_header(pb, slots, seed, STEGO_IMAGE_LEGACY_VERSION, NULL, NULL, NULL);
+        sodium_memzero(seed, sizeof(seed));
+        if (found) { snprintf(err_msg, err_msg_sz, "Cover already contains a DiskPass payload"); return NULL; }
+    }
+    uint64_t bits = (payload_bytes + STEGO_HEADER_BYTES) * 8U;
+    uint64_t need_bits = (bits * 100U + percent - 1U) / percent;
     if (slots >= need_bits) return g_object_ref(pb);
-    if (g_strcmp0(g_getenv("DISKPASS_STEGO_NO_UPSCALE"), "1") == 0) {
+    if (g_strcmp0(g_getenv("DISKPASS_STEGO_NO_UPSCALE"), "1") == 0 ||
+        g_strcmp0(g_getenv("DISKPASS_STEGO_ALLOW_UPSCALE"), "1") != 0) {
         snprintf(err_msg, err_msg_sz, "Cover is too small and automatic enlargement is disabled");
         return NULL;
     }
@@ -886,61 +981,60 @@ static GdkPixbuf *stego_pixbuf_scale_for_payload(GdkPixbuf *pb, uint64_t payload
     return scaled;
 }
 
-static GdkPixbuf *stego_pixbuf_new_for_payload(uint64_t payload_bytes,
-    char *err_msg, size_t err_msg_sz)
+static int stego_jpeg_cover_codec(const unsigned char *image, size_t image_len,
+    int db_fd, uint64_t db_size, char **encoded, gsize *encoded_len,
+    const char *output_db, char *err_msg, size_t err_msg_sz)
 {
-    unsigned percent = 100;
-    if (!stego_embedding_percent(&percent, err_msg, err_msg_sz)) return NULL;
-    if (payload_bytes > UINT64_MAX - STEGO_HEADER_BYTES) {
-        snprintf(err_msg, err_msg_sz, "Database is too large for an MP3 cover");
-        return NULL;
+    GError *error = NULL;
+    char *dir = g_dir_make_tmp("diskpass-cover-XXXXXX", &error);
+    if (!dir) {
+        snprintf(err_msg, err_msg_sz, "Cannot create private JPEG workspace: %s",
+            error ? error->message : "out of memory");
+        g_clear_error(&error); return -1;
     }
-    uint64_t total_bytes = payload_bytes + STEGO_HEADER_BYTES;
-    if (total_bytes > UINT64_MAX / 8U) {
-        snprintf(err_msg, err_msg_sz, "Database is too large for an MP3 cover");
-        return NULL;
+    char *cover_path = g_build_filename(dir, "cover.jpg", NULL);
+    char *db_path = g_build_filename(dir, "payload.dpdb", NULL);
+    char *result_path = g_build_filename(dir, "result.jpg", NULL);
+    int fd = -1, rc = -1;
+    if (image_len > STEGO_MP3_MAX_COVER_BYTES ||
+        !g_file_set_contents(cover_path, (const char *)image, image_len, &error)) {
+        snprintf(err_msg, err_msg_sz, "Cannot stage JPEG cover: %s",
+            error ? error->message : "cover exceeds safety limit");
+        g_clear_error(&error); goto done;
     }
-    uint64_t need_bits = total_bytes * 8U;
-    long double slots_ld = ceill((long double)need_bits * 100.0L / (long double)percent);
-    if (slots_ld < 1.0L || slots_ld > (long double)UINT64_MAX) {
-        snprintf(err_msg, err_msg_sz, "Database is too large for an MP3 cover");
-        return NULL;
+    if (output_db) {
+        rc = carrier_extract_dpdb_jpeg(cover_path, output_db, err_msg, err_msg_sz);
+        goto done;
     }
-    uint64_t need_slots = (uint64_t)slots_ld;
-    uint64_t need_pixels = need_slots / 3U + (need_slots % 3U != 0);
-    if (need_pixels == 0 || need_pixels > STEGO_MAX_PIXELS) {
-        uint64_t max_bits = ((STEGO_MAX_PIXELS * 3U) / 100U) * percent +
-            (((STEGO_MAX_PIXELS * 3U) % 100U) * percent) / 100U;
-        uint64_t max_bytes = max_bits / 8U;
-        if (max_bytes > STEGO_HEADER_BYTES) max_bytes -= STEGO_HEADER_BYTES;
-        else max_bytes = 0;
-        snprintf(err_msg, err_msg_sz,
-            "Database is too large for an automatically generated MP3 cover; safe limit is about %.2f MiB",
-            (double)max_bytes / (1024.0 * 1024.0));
-        return NULL;
+    fd = open(db_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0 || carrier_copy_fd_exact(db_fd, fd, db_size, err_msg, err_msg_sz) != 0)
+        goto done;
+    if (close(fd) != 0) { fd = -1; goto done; }
+    fd = -1;
+    if (carrier_attach_dpdb_jpeg_impl(cover_path, db_path, result_path, TRUE,
+            err_msg, err_msg_sz) != 0) goto done;
+    uint64_t size = 0;
+    if (carrier_open_regular(result_path, STEGO_MP3_MAX_COVER_BYTES, &fd, &size,
+            err_msg, err_msg_sz) != 0 || size > SIZE_MAX) goto done;
+    *encoded = g_try_malloc((gsize)size);
+    if (!*encoded) { snprintf(err_msg, err_msg_sz, "Out of memory for encoded cover"); goto done; }
+    *encoded_len = (gsize)size;
+    if (stego_pread_all(fd, *encoded, (size_t)size, 0) != 0) {
+        sodium_memzero(*encoded, *encoded_len); g_free(*encoded);
+        *encoded = NULL; *encoded_len = 0;
+        snprintf(err_msg, err_msg_sz, "Cannot read encoded JPEG cover"); goto done;
     }
-    uint64_t width = (uint64_t)ceill(sqrtl((long double)need_pixels));
-    if (width == 0 || width > (uint64_t)G_MAXINT) {
-        snprintf(err_msg, err_msg_sz, "Cannot calculate MP3 cover dimensions");
-        return NULL;
-    }
-    uint64_t height = need_pixels / width + (need_pixels % width != 0);
-    if (height == 0 || height > (uint64_t)G_MAXINT ||
-        width > UINT64_MAX / height || width * height > STEGO_MAX_PIXELS) {
-        snprintf(err_msg, err_msg_sz, "Cannot calculate safe MP3 cover dimensions");
-        return NULL;
-    }
-    GdkPixbuf *pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, (int)width, (int)height);
-    if (!pb) {
-        snprintf(err_msg, err_msg_sz, "Cannot allocate generated MP3 cover");
-        return NULL;
-    }
-    gdk_pixbuf_fill(pb, 0x808080FFU);
-    return pb;
+    rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    unlink(result_path); unlink(db_path); unlink(cover_path); rmdir(dir);
+    g_free(result_path); g_free(db_path); g_free(cover_path); g_free(dir);
+    return rc;
 }
 
 static int stego_pixbuf_embed_db(GdkPixbuf *pb, int dfd, uint64_t db_size,
-    char **out_png, gsize *out_png_len, char *err_msg, size_t err_msg_sz)
+    char **out_png, gsize *out_png_len, gboolean prefer_jpeg,
+    char *err_msg, size_t err_msg_sz)
 {
     uint64_t slots = 0; unsigned char seed[STEGO_SEED_BYTES], ph[STEGO_HASH_BYTES];
     unsigned char header[STEGO_HEADER_BYTES], mask[STEGO_HEADER_BYTES], check[STEGO_CHECK_BYTES];
@@ -962,20 +1056,46 @@ static int stego_pixbuf_embed_db(GdkPixbuf *pb, int dfd, uint64_t db_size,
         if (has_payload) { snprintf(err_msg, err_msg_sz, "Cover already contains a DiskPass payload"); goto done; }
     }
     if (stego_hash_fd(dfd, db_size, ph, err_msg, err_msg_sz) != 0) goto done;
-    memset(header, 0, sizeof(header)); db_store_u64le(header, db_size); memcpy(header+8, ph, STEGO_HASH_BYTES); header[40]=STEGO_IMAGE_VERSION;
-    randombytes_buf(header+41, 15); stego_header_check(seed, header, check); memcpy(header+STEGO_HEADER_BYTES-STEGO_CHECK_BYTES, check, STEGO_CHECK_BYTES);
-    stego_header_mask(seed, mask); for (size_t i=0;i<sizeof(header);i++) header[i]^=mask[i];
+    memset(header, 0, sizeof(header));
+    db_store_u64le(header, db_size);
+    memcpy(header + 8, ph, STEGO_HASH_BYTES);
+    header[40] = STEGO_IMAGE_VERSION;
+    randombytes_buf(header + 41, 15);
+    stego_header_check(seed, header, check);
+    memcpy(header + STEGO_HEADER_BYTES - STEGO_CHECK_BYTES, check, STEGO_CHECK_BYTES);
+    stego_header_mask(seed, mask);
+    for (size_t i = 0; i < sizeof(header); i++) header[i] ^= mask[i];
     stego_iter_t it; stego_iter_init(&it, slots, seed); stego_write_bytes(pb, &it, header, sizeof(header));
     unsigned char buf[128*1024]; uint64_t off=0;
+    crypto_generichash_state written_state;
+    crypto_generichash_init(&written_state, NULL, 0, STEGO_HASH_BYTES);
     while (off<db_size) {
         size_t want=sizeof(buf); if (db_size-off<want) want=(size_t)(db_size-off);
         ssize_t n=pread(dfd,buf,want,(off_t)off); if(n<0&&errno==EINTR)continue;
         if(n<=0){snprintf(err_msg,err_msg_sz,"Cannot read database for cover steganography");sodium_memzero(buf,sizeof(buf));goto done;}
+        crypto_generichash_update(&written_state, buf, (size_t)n);
         stego_write_bytes(pb,&it,buf,(size_t)n); off+=(uint64_t)n;
     }
-    sodium_memzero(buf,sizeof(buf));
-    if (!gdk_pixbuf_save_to_buffer(pb, out_png, out_png_len, "png", &e, "compression", "9", NULL)) {
-        snprintf(err_msg, err_msg_sz, "Cannot encode stego cover PNG: %s", e&&e->message?e->message:"encode error"); g_clear_error(&e); goto done;
+    sodium_memzero(buf, sizeof(buf));
+    unsigned char written_hash[STEGO_HASH_BYTES];
+    crypto_generichash_final(&written_state, written_hash, sizeof(written_hash));
+    gboolean unchanged = sodium_memcmp(written_hash, ph, sizeof(written_hash)) == 0;
+    sodium_memzero(written_hash, sizeof(written_hash));
+    sodium_memzero(&written_state, sizeof(written_state));
+    if (!unchanged) {
+        snprintf(err_msg, err_msg_sz, "Database changed during cover export"); goto done;
+    }
+     
+
+    if (prefer_jpeg) {
+        snprintf(err_msg, err_msg_sz, "Pixel steganography cannot be encoded as lossy JPEG");
+        goto done;
+    }
+    if (!gdk_pixbuf_save_to_buffer(pb, out_png, out_png_len, "png", &e,
+            "compression", "9", NULL)) {
+        snprintf(err_msg, err_msg_sz, "Cannot encode stego cover: %s",
+            e && e->message ? e->message : "encode error");
+        g_clear_error(&e); goto done;
     }
     if (!*out_png || *out_png_len == 0 || (uint64_t)*out_png_len > STEGO_MP3_MAX_COVER_BYTES) {
         if (*out_png) { sodium_memzero(*out_png, *out_png_len); g_free(*out_png); *out_png = NULL; }
@@ -993,7 +1113,7 @@ static int stego_pixbuf_extract_db(GdkPixbuf *pb, const char *output_db_path,
     char *err_msg, size_t err_msg_sz)
 {
     uint64_t slots=0,payload_len=0; unsigned char seed[STEGO_SEED_BYTES], expected[STEGO_HASH_BYTES], actual[STEGO_HASH_BYTES];
-    stego_iter_t it; char *tmp=NULL; int ofd=-1,vfd=-1,rc=-1; crypto_generichash_state hs;
+    stego_iter_t it; char *tmp=NULL; int ofd=-1,rc=-1; crypto_generichash_state hs;
     sodium_memzero(&hs, sizeof(hs));
     if (!stego_pixbuf_layout(pb,&slots,err_msg,err_msg_sz)||!stego_seed_from_pixbuf(pb,seed,err_msg,err_msg_sz)) goto done;
     gboolean found = stego_decode_header(pb,slots,seed,STEGO_IMAGE_VERSION,&payload_len,expected,&it);
@@ -1012,12 +1132,11 @@ static int stego_pixbuf_extract_db(GdkPixbuf *pb, const char *output_db_path,
     while(left){size_t take=sizeof(buf);if(left<take)take=(size_t)left;stego_read_bytes(pb,&it,buf,take);crypto_generichash_update(&hs,buf,take);if(write_all_fd(ofd,buf,take)!=0){snprintf(err_msg,err_msg_sz,"Cannot write extracted database");sodium_memzero(buf,sizeof(buf));goto done;}left-=take;}
     sodium_memzero(buf,sizeof(buf)); crypto_generichash_final(&hs,actual,STEGO_HASH_BYTES);
     if(sodium_memcmp(expected,actual,STEGO_HASH_BYTES)!=0){snprintf(err_msg,err_msg_sz,"Cover payload integrity check failed");goto done;}
+    if(!carrier_dpdb_layout_at_fd(ofd,0,payload_len)){snprintf(err_msg,err_msg_sz,"Extracted payload is not a supported encrypted DiskPass database");goto done;}
     if(fsync(ofd)!=0){snprintf(err_msg,err_msg_sz,"Cannot sync extracted database");goto done;}
     if(close(ofd)!=0){ofd=-1;snprintf(err_msg,err_msg_sz,"Cannot close extracted database: %s",strerror(errno));goto done;}ofd=-1;
-    vfd=open(tmp,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);if(vfd<0||!carrier_dpdb_layout_at_fd(vfd,0,payload_len)){snprintf(err_msg,err_msg_sz,"Extracted cover payload is not a recognized DiskPass .dpdb");goto done;}close(vfd);vfd=-1;
     if(rename(tmp,output_db_path)!=0){snprintf(err_msg,err_msg_sz,"Cannot install extracted database: %s",strerror(errno));goto done;}carrier_fsync_parent(output_db_path);rc=0;
 done:
-    if (vfd >= 0) close(vfd);
     if (ofd >= 0) close(ofd);
     if (rc != 0 && tmp) unlink(tmp);
     free(tmp);
@@ -1043,8 +1162,7 @@ static int carrier_attach_dpdb_mp3(const char *mp3_path, const char *db_path,
     int rc = -1;
     size_t tag_total = 0;
     uint32_t tag_size = 0;
-    unsigned version = 4;
-    gboolean has_id3 = FALSE, apic_found = FALSE, apic_absent = FALSE;
+    gboolean apic_found = FALSE, apic_absent = FALSE;
     stego_mp3_apic_t apic;
     memset(&apic, 0, sizeof(apic));
 
@@ -1054,19 +1172,22 @@ static int carrier_attach_dpdb_mp3(const char *mp3_path, const char *db_path,
         snprintf(err_msg, err_msg_sz, "Output MP3 must be different from source and database");
         return -1;
     }
-    if (!(g_str_has_suffix(output_path, ".mp3") || g_str_has_suffix(output_path, ".MP3"))) {
+    if (!stego_output_is_ci(output_path, ".mp3")) {
         snprintf(err_msg, err_msg_sz, "MP3 steganography output must use .mp3");
         return -1;
     }
     if (carrier_open_regular(db_path, DB_MAX_FILE_BYTES, &dfd, &db_size, err_msg, err_msg_sz) != 0) goto done;
-    if (!db_path_has_dpdb_extension(db_path) || !carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+    if (!carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+        snprintf(err_msg, err_msg_sz, "Input is not a supported encrypted DiskPass database");
+        goto done;
+    }
+    if (!db_path_has_dpdb_extension(db_path) || db_size < 64) {
         snprintf(err_msg, err_msg_sz, "Only valid DiskPass .dpdb databases can be hidden");
         goto done;
     }
     if (carrier_open_regular(mp3_path, DB_CARRIER_MAX_BYTES, &mfd, &msize, err_msg, err_msg_sz) != 0) goto done;
 
     if (msize >= sizeof(hdr) && stego_pread_all(mfd, hdr, sizeof(hdr), 0) == 0 && memcmp(hdr, "ID3", 3) == 0) {
-        has_id3 = TRUE;
         if (!id3_synchsafe_decode4(hdr + 6, &tag_size) ||
             tag_size > STEGO_MP3_MAX_TAG_BYTES || 10ULL + tag_size > msize) {
             snprintf(err_msg, err_msg_sz, "MP3 ID3 tag is malformed or too large");
@@ -1090,7 +1211,6 @@ static int carrier_attach_dpdb_mp3(const char *mp3_path, const char *db_path,
         apic_found = stego_mp3_find_apic(tag, tag_total, &apic, &apic_absent, err_msg, err_msg_sz);
         if (!apic_found && !apic_absent) goto done;
         if (!apic_found && apic_absent && err_msg && err_msg_sz) err_msg[0] = '\0';
-        version = tag[3];
     } else {
         if (!stego_mp3_audio_at_fd(mfd, 0, msize)) {
             snprintf(err_msg, err_msg_sz, "MP3 has neither a supported ID3 tag nor a valid MPEG Layer III frame at file start");
@@ -1098,32 +1218,39 @@ static int carrier_attach_dpdb_mp3(const char *mp3_path, const char *db_path,
         }
         audio_off = 0;
         apic_absent = TRUE;
-        version = 4;
     }
 
+    gboolean prefer_jpeg = apic_found && apic.image_is_jpeg;
     if (apic_found) {
         if (apic.image_len > STEGO_MP3_MAX_COVER_BYTES) {
             snprintf(err_msg, err_msg_sz, "MP3 cover art is too large");
             goto done;
         }
-        cover = stego_pixbuf_from_memory(tag + apic.image_off, (size_t)apic.image_len, err_msg, err_msg_sz);
-        if (!cover) goto done;
-        work = stego_pixbuf_scale_for_payload(cover, db_size, err_msg, err_msg_sz);
-        if (!work) goto done;
+        if (prefer_jpeg) {
+            if (stego_jpeg_cover_codec(tag + apic.image_off, (size_t)apic.image_len,
+                    dfd, db_size, &png, &png_len, NULL, err_msg, err_msg_sz) != 0) goto done;
+        } else {
+            cover = stego_pixbuf_from_memory(tag + apic.image_off, (size_t)apic.image_len, err_msg, err_msg_sz);
+            if (!cover) goto done;
+            work = stego_pixbuf_scale_for_payload(cover, db_size, err_msg, err_msg_sz);
+            if (!work) goto done;
+            if (stego_pixbuf_embed_db(work, dfd, db_size, &png, &png_len, FALSE, err_msg, err_msg_sz) != 0) goto done;
+        }
     } else {
-        work = stego_pixbuf_new_for_payload(db_size, err_msg, err_msg_sz);
-        if (!work) goto done;
+        snprintf(err_msg, err_msg_sz, "MP3 has no cover art; attach a real cover instead of generating one");
+        goto done;
     }
 
-    if (stego_pixbuf_embed_db(work, dfd, db_size, &png, &png_len, err_msg, err_msg_sz) != 0) goto done;
+    const char *cover_mime = prefer_jpeg ? "image/jpeg" : "image/png";
+    size_t cover_mime_len = strlen(cover_mime) + 1U;  
 
     if (apic_found) {
         size_t prefix_desc = (size_t)apic.image_off - (size_t)(apic.mime_end + 1);
-        if (png_len > SIZE_MAX - prefix_desc - 1U - sizeof("image/png")) {
+        if (png_len > SIZE_MAX - prefix_desc - 1U - cover_mime_len) {
             snprintf(err_msg, err_msg_sz, "Stego cover is too large for ID3");
             goto done;
         }
-        size_t new_frame_len = 1U + sizeof("image/png") + prefix_desc + png_len;
+        size_t new_frame_len = 1U + cover_mime_len + prefix_desc + png_len;
         if (new_frame_len > 0x0FFFFFFFU) {
             snprintf(err_msg, err_msg_sz, "Stego cover is too large for ID3");
             goto done;
@@ -1155,58 +1282,14 @@ static int carrier_attach_dpdb_mp3(const char *mp3_path, const char *db_path,
         if (write_all_fd(ofd, framehdr, sizeof(framehdr)) != 0) goto write_fail;
 
         unsigned char enc = tag[apic.frame_data_off];
-        static const char mime[] = "image/png";
         if (write_all_fd(ofd, &enc, 1) != 0 ||
-            write_all_fd(ofd, (const unsigned char *)mime, sizeof(mime)) != 0) goto write_fail;
+            write_all_fd(ofd, (const unsigned char *)cover_mime, cover_mime_len) != 0) goto write_fail;
         size_t desc_start = (size_t)apic.mime_end + 1;
         if (write_all_fd(ofd, tag + desc_start, prefix_desc) != 0 ||
             write_all_fd(ofd, (unsigned char *)png, png_len) != 0) goto write_fail;
         size_t old_frame_end = (size_t)apic.frame_data_off + (size_t)apic.frame_data_len;
         if (old_frame_end > tag_total ||
             write_all_fd(ofd, tag + old_frame_end, tag_total - old_frame_end) != 0) goto write_fail;
-    } else {
-        static const char mime[] = "image/png";
-        if (png_len > SIZE_MAX - 13U) {
-            snprintf(err_msg, err_msg_sz, "Generated MP3 cover is too large for ID3");
-            goto done;
-        }
-        size_t frame_data_len = 1U + sizeof(mime) + 1U + 1U + png_len;
-        if (frame_data_len > 0x0FFFFFFFU || frame_data_len > UINT32_MAX) {
-            snprintf(err_msg, err_msg_sz, "Generated MP3 cover is too large for ID3");
-            goto done;
-        }
-        uint64_t frame_total = 10ULL + (uint64_t)frame_data_len;
-        uint64_t old_tag_size = has_id3 ? (uint64_t)tag_size : 0;
-        uint64_t new_tag_size = old_tag_size + frame_total;
-        if (new_tag_size > 0x0FFFFFFFULL || new_tag_size > STEGO_MP3_MAX_TAG_BYTES) {
-            snprintf(err_msg, err_msg_sz, "Generated ID3 tag would exceed DiskPass safety limits");
-            goto done;
-        }
-        uint64_t added = frame_total + (has_id3 ? 0ULL : 10ULL);
-        if (added > DB_CARRIER_MAX_BYTES - msize) {
-            snprintf(err_msg, err_msg_sz, "Stego MP3 would exceed the carrier size limit");
-            goto done;
-        }
-        if (carrier_create_temp(output_path, &tmp, &ofd, err_msg, err_msg_sz) != 0) goto done;
-
-        unsigned char newhdr[10] = {'I','D','3',4,0,0,0,0,0,0};
-        if (has_id3) memcpy(newhdr, hdr, sizeof(newhdr));
-        newhdr[3] = (unsigned char)version;
-        id3_synchsafe_encode4(newhdr + 6, (uint32_t)new_tag_size);
-        if (write_all_fd(ofd, newhdr, sizeof(newhdr)) != 0) goto write_fail;
-
-        unsigned char framehdr[10] = {'A','P','I','C',0,0,0,0,0,0};
-        if (version == 4) id3_synchsafe_encode4(framehdr + 4, (uint32_t)frame_data_len);
-        else store_u32be_local(framehdr + 4, (uint32_t)frame_data_len);
-        if (write_all_fd(ofd, framehdr, sizeof(framehdr)) != 0) goto write_fail;
-
-        unsigned char enc = 0, picture_type = 3, desc_zero = 0;
-        if (write_all_fd(ofd, &enc, 1) != 0 ||
-            write_all_fd(ofd, (const unsigned char *)mime, sizeof(mime)) != 0 ||
-            write_all_fd(ofd, &picture_type, 1) != 0 ||
-            write_all_fd(ofd, &desc_zero, 1) != 0 ||
-            write_all_fd(ofd, (unsigned char *)png, png_len) != 0) goto write_fail;
-        if (has_id3 && write_all_fd(ofd, tag + 10, tag_total - 10) != 0) goto write_fail;
     }
 
     {
@@ -1258,7 +1341,7 @@ static int carrier_extract_dpdb_mp3(const char *mp3_path, const char *output_db_
     int fd=-1;uint64_t size=0;unsigned char hdr[10];unsigned char *tag=NULL;GdkPixbuf *cover=NULL;int rc=-1;size_t tag_total=0;
     if(!mp3_path||!output_db_path||!carrier_paths_distinct(mp3_path,output_db_path)||!db_path_has_dpdb_extension(output_db_path)){snprintf(err_msg,err_msg_sz,"Extracted database must be a separate .dpdb file");return -1;}
     if(carrier_open_regular(mp3_path,DB_CARRIER_MAX_BYTES,&fd,&size,err_msg,err_msg_sz)!=0)goto done;
-    if(stego_pread_all(fd,hdr,10,0)!=0||memcmp(hdr,"ID3",3)!=0){snprintf(err_msg,err_msg_sz,"MP3 has no supported ID3 cover tag");goto done;}uint32_t ts=0;if(!id3_synchsafe_decode4(hdr+6,&ts)||ts>STEGO_MP3_MAX_TAG_BYTES||10ULL+ts>size){snprintf(err_msg,err_msg_sz,"Malformed MP3 ID3 tag");goto done;}tag_total=10U+(size_t)ts;tag=malloc(tag_total);if(!tag){snprintf(err_msg,err_msg_sz,"Out of memory for MP3 tag");goto done;}if(stego_pread_all(fd,tag,tag_total,0)!=0){snprintf(err_msg,err_msg_sz,"Cannot read complete MP3 tag");goto done;}if(!stego_mp3_audio_at_fd(fd,tag_total,size)){snprintf(err_msg,err_msg_sz,"MP3 has no valid MPEG Layer III audio frame after ID3");goto done;}stego_mp3_apic_t apic;if(!stego_mp3_find_apic(tag,tag_total,&apic,NULL,err_msg,err_msg_sz))goto done;if(apic.image_len>STEGO_MP3_MAX_COVER_BYTES){snprintf(err_msg,err_msg_sz,"MP3 cover art exceeds the safety limit");goto done;}cover=stego_pixbuf_from_memory(tag+apic.image_off,(size_t)apic.image_len,err_msg,err_msg_sz);if(!cover)goto done;rc=stego_pixbuf_extract_db(cover,output_db_path,err_msg,err_msg_sz);
+    if(stego_pread_all(fd,hdr,10,0)!=0||memcmp(hdr,"ID3",3)!=0){snprintf(err_msg,err_msg_sz,"MP3 has no supported ID3 cover tag");goto done;}uint32_t ts=0;if(!id3_synchsafe_decode4(hdr+6,&ts)||ts>STEGO_MP3_MAX_TAG_BYTES||10ULL+ts>size){snprintf(err_msg,err_msg_sz,"Malformed MP3 ID3 tag");goto done;}tag_total=10U+(size_t)ts;tag=malloc(tag_total);if(!tag){snprintf(err_msg,err_msg_sz,"Out of memory for MP3 tag");goto done;}if(stego_pread_all(fd,tag,tag_total,0)!=0){snprintf(err_msg,err_msg_sz,"Cannot read complete MP3 tag");goto done;}if(!stego_mp3_audio_at_fd(fd,tag_total,size)){snprintf(err_msg,err_msg_sz,"MP3 has no valid MPEG Layer III audio frame after ID3");goto done;}stego_mp3_apic_t apic;if(!stego_mp3_find_apic(tag,tag_total,&apic,NULL,err_msg,err_msg_sz))goto done;if(apic.image_len>STEGO_MP3_MAX_COVER_BYTES){snprintf(err_msg,err_msg_sz,"MP3 cover art exceeds the safety limit");goto done;}if(apic.image_is_jpeg){rc=stego_jpeg_cover_codec(tag+apic.image_off,(size_t)apic.image_len,-1,0,NULL,NULL,output_db_path,err_msg,err_msg_sz);goto done;}cover=stego_pixbuf_from_memory(tag+apic.image_off,(size_t)apic.image_len,err_msg,err_msg_sz);if(!cover)goto done;rc=stego_pixbuf_extract_db(cover,output_db_path,err_msg,err_msg_sz);
 done: if(cover)g_object_unref(cover);if(tag){sodium_memzero(tag,tag_total);free(tag);}if(fd>=0)close(fd);return rc;
 }
 
@@ -1334,34 +1417,44 @@ static gboolean stego_flac_find_picture(int fd, uint64_t file_size,
     if (stego_pread_all(fd, magic, 4, 0) != 0 || memcmp(magic, "fLaC", 4) != 0) {
         snprintf(err_msg, err_msg_sz, "Carrier is not a FLAC file"); return FALSE;
     }
+    *out_block = NULL;
+    unsigned char *selected = NULL;
+    stego_flac_picture_t picture = {0};
     uint64_t pos = 4;
-    for (unsigned blocks = 0; blocks < 256 && pos + 4 <= file_size; blocks++) {
+    gboolean complete = FALSE;
+    for (unsigned blocks = 0; blocks < 65536U && pos + 4 <= file_size; blocks++) {
         unsigned char h[4];
-        if (stego_pread_all(fd, h, 4, pos) != 0) break;
+        if (stego_pread_all(fd, h, 4, pos) != 0) goto malformed;
         gboolean last = (h[0] & 0x80U) != 0;
         unsigned type = h[0] & 0x7FU;
         uint32_t len = stego_load_u24be(h + 1);
         uint64_t data_off = pos + 4;
-        if ((uint64_t)len > file_size - data_off) {
-            snprintf(err_msg, err_msg_sz, "Malformed FLAC metadata length"); return FALSE;
-        }
-        if (type == 6U && len > 0) {
-            unsigned char *block = malloc(len);
-            if (!block) { snprintf(err_msg, err_msg_sz, "Out of memory for FLAC cover metadata"); return FALSE; }
-            if (stego_pread_all(fd, block, len, data_off) != 0) {
-                free(block); snprintf(err_msg, err_msg_sz, "Cannot read FLAC PICTURE block"); return FALSE;
+        if ((uint64_t)len > file_size - data_off || type == 127U ||
+            (blocks == 0 && (type != 0 || len != 34)) ||
+            (blocks != 0 && type == 0)) goto malformed;
+        if (type == 6U && !selected) {
+            unsigned char *block = malloc(len ? len : 1);
+            if (!block) { snprintf(err_msg, err_msg_sz, "Out of memory for FLAC metadata"); goto fail; }
+            if (stego_pread_all(fd, block, len, data_off) != 0 ||
+                !stego_flac_parse_picture_block(block, len, &picture, err_msg, err_msg_sz)) {
+                sodium_memzero(block, len); free(block); goto malformed;
             }
-            stego_flac_picture_t pic = {0};
-            if (!stego_flac_parse_picture_block(block, len, &pic, err_msg, err_msg_sz)) {
-                sodium_memzero(block, len); free(block); return FALSE;
-            }
-            pic.header_off = pos; pic.data_off = data_off; pic.block_len = len; pic.is_last = last;
-            *out = pic; *out_block = block; return TRUE;
+            picture.header_off = pos; picture.data_off = data_off;
+            picture.block_len = len; picture.is_last = last;
+            selected = block;
         }
         pos = data_off + len;
-        if (last) break;
+        if (last) { complete = TRUE; break; }
     }
-    snprintf(err_msg, err_msg_sz, "FLAC has no usable PICTURE cover image");
+    if (!complete || pos >= file_size) goto malformed;
+    if (!selected) {
+        snprintf(err_msg, err_msg_sz, "FLAC has no usable PICTURE cover image"); goto fail;
+    }
+    *out = picture; *out_block = selected; return TRUE;
+malformed:
+    snprintf(err_msg, err_msg_sz, "Malformed or truncated FLAC metadata chain");
+fail:
+    if (selected) { sodium_memzero(selected, picture.block_len); free(selected); }
     return FALSE;
 }
 
@@ -1388,13 +1481,26 @@ static int carrier_attach_dpdb_flac(const char *flac_path, const char *db_path,
     if(!stego_output_is_ci(output_path,".flac")){snprintf(err_msg,err_msg_sz,"FLAC steganography output must use .flac");return -1;}
     if(carrier_open_regular(flac_path,STEGO_FLAC_MAX_FILE_BYTES,&ffd,&fsize,err_msg,err_msg_sz)!=0)goto done;
     if(carrier_open_regular(db_path,DB_MAX_FILE_BYTES,&dfd,&db_size,err_msg,err_msg_sz)!=0)goto done;
-    if(!db_path_has_dpdb_extension(db_path)||!carrier_dpdb_layout_at_fd(dfd,0,db_size)){snprintf(err_msg,err_msg_sz,"Only valid DiskPass .dpdb databases can be hidden");goto done;}
+    if(!carrier_dpdb_layout_at_fd(dfd,0,db_size)){snprintf(err_msg,err_msg_sz,"Input is not a supported encrypted DiskPass database");goto done;}
+    if(!db_path_has_dpdb_extension(db_path)||db_size<64){snprintf(err_msg,err_msg_sz,"Only valid DiskPass .dpdb databases can be hidden");goto done;}
     if(!stego_flac_find_picture(ffd,fsize,&pic,&block,err_msg,err_msg_sz))goto done;
     if(pic.image_len>STEGO_MP3_MAX_COVER_BYTES){snprintf(err_msg,err_msg_sz,"FLAC cover image exceeds the safety limit");goto done;}
     cover=stego_pixbuf_from_memory(block+pic.image_off,pic.image_len,err_msg,err_msg_sz);if(!cover)goto done;
-    work=stego_pixbuf_scale_for_payload(cover,db_size,err_msg,err_msg_sz);if(!work)goto done;
-    if(stego_pixbuf_embed_db(work,dfd,db_size,&png,&png_len,err_msg,err_msg_sz)!=0)goto done;
-    const char mime[]="image/png"; uint64_t new_len=4ULL+4ULL+(sizeof(mime)-1)+4ULL+pic.desc_len+20ULL+png_len;
+    gboolean flac_prefer_jpeg = (pic.image_len >= 3 &&
+        block[pic.image_off] == 0xFF && block[pic.image_off+1] == 0xD8 && block[pic.image_off+2] == 0xFF);
+    if (flac_prefer_jpeg) {
+        if (stego_jpeg_cover_codec(block + pic.image_off, pic.image_len, dfd, db_size,
+                &png, &png_len, NULL, err_msg, err_msg_sz) != 0) goto done;
+         
+        work = stego_pixbuf_from_memory((unsigned char *)png, png_len, err_msg, err_msg_sz);
+        if (!work) goto done;
+    } else {
+        work=stego_pixbuf_scale_for_payload(cover,db_size,err_msg,err_msg_sz);if(!work)goto done;
+        if(stego_pixbuf_embed_db(work,dfd,db_size,&png,&png_len,FALSE,err_msg,err_msg_sz)!=0)goto done;
+    }
+    const char *flac_mime = flac_prefer_jpeg ? "image/jpeg" : "image/png";
+    size_t flac_mime_len = strlen(flac_mime);
+    uint64_t new_len=4ULL+4ULL+(uint64_t)flac_mime_len+4ULL+pic.desc_len+20ULL+png_len;
     if(new_len>STEGO_FLAC_MAX_PICTURE_BLOCK){snprintf(err_msg,err_msg_sz,"Stego FLAC cover exceeds the 16 MiB metadata-block limit");goto done;}
     if(carrier_create_temp(output_path,&tmp,&ofd,err_msg,err_msg_sz)!=0)goto done;
     if(stego_copy_range_fd(ffd,ofd,0,pic.header_off)!=0)goto write_fail;
@@ -1402,7 +1508,7 @@ static int carrier_attach_dpdb_flac(const char *flac_path, const char *db_path,
     if(write_all_fd(ofd,bh,4)!=0)goto write_fail;
     unsigned char u32[4];
     store_u32be_local(u32,pic.picture_type);if(write_all_fd(ofd,u32,4)!=0)goto write_fail;
-    store_u32be_local(u32,(uint32_t)(sizeof(mime)-1));if(write_all_fd(ofd,u32,4)!=0||write_all_fd(ofd,(const unsigned char*)mime,sizeof(mime)-1)!=0)goto write_fail;
+    store_u32be_local(u32,(uint32_t)flac_mime_len);if(write_all_fd(ofd,u32,4)!=0||write_all_fd(ofd,(const unsigned char*)flac_mime,flac_mime_len)!=0)goto write_fail;
     store_u32be_local(u32,pic.desc_len);if(write_all_fd(ofd,u32,4)!=0)goto write_fail;
     if(pic.desc_len&&write_all_fd(ofd,block+pic.desc_off,pic.desc_len)!=0)goto write_fail;
     store_u32be_local(u32,(uint32_t)gdk_pixbuf_get_width(work));if(write_all_fd(ofd,u32,4)!=0)goto write_fail;
@@ -1443,6 +1549,11 @@ static int carrier_extract_dpdb_flac(const char *flac_path,const char *output_db
         snprintf(err_msg,err_msg_sz,"Extracted database must be a separate .dpdb file");return -1;}
     if(carrier_open_regular(flac_path,STEGO_FLAC_MAX_FILE_BYTES,&fd,&size,err_msg,err_msg_sz)!=0)goto done;
     if(!stego_flac_find_picture(fd,size,&pic,&block,err_msg,err_msg_sz))goto done;
+    if (pic.image_len >= 3 && block[pic.image_off] == 0xFF && block[pic.image_off+1] == 0xD8) {
+        rc = stego_jpeg_cover_codec(block + pic.image_off, pic.image_len, -1, 0,
+            NULL, NULL, output_db_path, err_msg, err_msg_sz);
+        goto done;
+    }
     cover=stego_pixbuf_from_memory(block+pic.image_off,pic.image_len,err_msg,err_msg_sz);if(!cover)goto done;
     rc=stego_pixbuf_extract_db(cover,output_db_path,err_msg,err_msg_sz);
 done: if(cover)g_object_unref(cover);if(block){sodium_memzero(block,pic.block_len);free(block);}if(fd>=0)close(fd);return rc;

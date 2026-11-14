@@ -389,8 +389,8 @@ static char *db_make_selected_key_gpg_wrapper(gpgme_ctx_t base_ctx, const char *
         "#!/bin/sh\nexec %s --default-key %s --try-secret-key %s \"$@\"\n",
         qgpg, qkey, qkey) : NULL;
     g_free(qgpg); g_free(qkey);
-    /* Keep generated helper non-executable and private while its contents are
-     * written; grant execute permission only after the complete write. */
+     
+
     gboolean ok = script && fchmod(fd, 0600) == 0;
     if (ok) ok = write_all_fd(fd, script, strlen(script)) == 0;
     if (ok) ok = fchmod(fd, 0700) == 0;
@@ -631,6 +631,35 @@ static gboolean db_clear_selected_key_passphrase_cache(db_manager_t *m,
     return TRUE;
 }
 
+typedef struct {
+    char subkey[129];
+    char primary[129];
+    gboolean seen;
+    gboolean invalid;
+} db_decryption_identity_t;
+
+static gpgme_error_t db_decryption_identity_status(void *opaque, const char *keyword,
+    const char *args)
+{
+    db_decryption_identity_t *identity = opaque;
+    if (strcmp(keyword, "DECRYPTION_KEY") != 0) return GPG_ERR_NO_ERROR;
+    char subkey[129] = {0}, primary[129] = {0};
+    if (!args || sscanf(args, "%128s %128s", subkey, primary) != 2 ||
+        (strlen(subkey) != 40 && strlen(subkey) != 64) ||
+        (strlen(primary) != 40 && strlen(primary) != 64) ||
+        !db_hex_string_valid(subkey, strlen(subkey)) ||
+        !db_hex_string_valid(primary, strlen(primary)) ||
+        (identity->seen && (g_ascii_strcasecmp(identity->subkey, subkey) != 0 ||
+                           g_ascii_strcasecmp(identity->primary, primary) != 0))) {
+        identity->invalid = TRUE;
+        return GPG_ERR_NO_ERROR;
+    }
+    g_strlcpy(identity->subkey, subkey, sizeof(identity->subkey));
+    g_strlcpy(identity->primary, primary, sizeof(identity->primary));
+    identity->seen = TRUE;
+    return GPG_ERR_NO_ERROR;
+}
+
 static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_len,
     char *err_msg, size_t err_msg_sz)
 {
@@ -643,8 +672,10 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
     bounded_gpg_output_t bounded = {0};
     struct gpgme_data_cbs cbs = {0};
     gpgme_key_t recipient_pub = NULL;
+    db_decryption_identity_t identity = {0};
 
-    if (!m || !enc_data || enc_len == 0 || enc_len > DB_MAX_FILE_BYTES) {
+    if (m) { m->is_signed = FALSE; m->is_pqc_encrypted = FALSE; }
+    if (!m || !m->gpg_ctx || !enc_data || enc_len == 0 || enc_len > DB_MAX_FILE_BYTES) {
         snprintf(err_msg, err_msg_sz, "Invalid encrypted database size");
         return NULL;
     }
@@ -654,6 +685,8 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
         !db_clear_selected_key_passphrase_cache(m, err_msg, err_msg_sz))
         return NULL;
 
+    m->is_signed = FALSE;
+    m->is_pqc_encrypted = FALSE;
     bounded.chunks = g_ptr_array_new_with_free_func(secure_gpg_chunk_free);
     bounded.limit = DB_MAX_JSON_BYTES;
     if (!bounded.chunks) {
@@ -691,6 +724,10 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
             goto cleanup;
         }
     }
+
+    gerr = gpgme_set_ctx_flag(op_ctx, "full-status", "1");
+    GPG_CHECK(gerr, "Cannot enable decryption identity status");
+    gpgme_set_status_cb(op_ctx, db_decryption_identity_status, &identity);
 
     gerr = gpgme_data_new_from_mem(&in, enc_data, enc_len, 0);
     GPG_CHECK(gerr, "gpgme_data_new_from_mem");
@@ -742,41 +779,62 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
         goto cleanup;
     }
 
-    gboolean recipient_matches = FALSE;
-    gboolean recipient_pqc = FALSE;
     gpgme_decrypt_result_t dres = gpgme_op_decrypt_result(op_ctx);
-    for (gpgme_recipient_t rec = dres ? dres->recipients : NULL; rec; rec = rec->next) {
-        if (rec->status != GPG_ERR_NO_ERROR) continue;
-
-        gboolean hidden = !rec->keyid || !rec->keyid[0];
-        if (!hidden && rec->keyid) {
-            hidden = TRUE;
-            for (const char *p = rec->keyid; *p; p++) {
-                if (*p != '0') { hidden = FALSE; break; }
-            }
-        }
-        if (hidden) {
-            recipient_matches = TRUE;
-            recipient_pqc = rec->pubkey_algo == GPGME_PK_KYBER;
-            break;
-        }
-
+    if (!dres || dres->wrong_key_usage || dres->legacy_cipher_nomdc ||
+        dres->unsupported_algorithm) {
+        snprintf(err_msg, err_msg_sz, "Unsupported or unauthenticated OpenPGP encryption");
+        goto cleanup;
+    }
+    gpgme_subkey_t actual_subkey = NULL;
+    if (identity.seen && !identity.invalid && recipient_pub->subkeys &&
+        recipient_pub->subkeys->fpr &&
+        g_ascii_strcasecmp(identity.primary, recipient_pub->subkeys->fpr) == 0) {
         for (gpgme_subkey_t sub = recipient_pub->subkeys; sub; sub = sub->next) {
-            if (!sub->keyid) continue;
-            if (g_ascii_strcasecmp(sub->keyid, rec->keyid) == 0) {
-                recipient_matches = TRUE;
-                recipient_pqc =
-                    rec->pubkey_algo == GPGME_PK_KYBER ||
-                    sub->pubkey_algo == GPGME_PK_KYBER;
+            if (sub->fpr && g_ascii_strcasecmp(sub->fpr, identity.subkey) == 0 &&
+                sub->can_encrypt && !sub->revoked && !sub->expired &&
+                !sub->disabled && !sub->invalid) {
+                actual_subkey = sub;
                 break;
             }
         }
-        if (recipient_matches) break;
     }
-    if (!recipient_matches) {
+    if (!actual_subkey) {
         snprintf(err_msg, err_msg_sz,
-            "Encrypted database recipient does not match the pinned OpenPGP key");
+            "Actual decryption key does not match the pinned OpenPGP certificate");
         goto cleanup;
+    }
+    gboolean recipient_pqc = actual_subkey->pubkey_algo == GPGME_PK_KYBER;
+    gboolean hidden_recipient = FALSE;
+    gboolean visible_match = FALSE;
+    for (gpgme_recipient_t rec = dres->recipients; rec; rec = rec->next) {
+        gboolean hidden = !rec->keyid || !rec->keyid[0];
+        if (!hidden) {
+            hidden = TRUE;
+            for (const char *p = rec->keyid; *p; p++)
+                if (*p != '0') { hidden = FALSE; break; }
+        }
+        if (hidden) {
+            hidden_recipient = TRUE;
+            continue;
+        }
+         
+
+        if (!actual_subkey->keyid || g_ascii_strcasecmp(rec->keyid, actual_subkey->keyid) != 0 ||
+            rec->pubkey_algo != actual_subkey->pubkey_algo) {
+            snprintf(err_msg, err_msg_sz, "Encrypted database has an unselected recipient");
+            goto cleanup;
+        }
+        visible_match = TRUE;
+    }
+    if (!visible_match && !hidden_recipient) {
+        snprintf(err_msg, err_msg_sz, "Cannot verify encrypted database recipient");
+        goto cleanup;
+    }
+    if (hidden_recipient) {
+         
+
+        m->needs_resave = TRUE;
+        m->legacy_read_only = TRUE;
     }
 
     m->is_pqc_encrypted = recipient_pqc;
@@ -804,6 +862,7 @@ static char *db_gpg_decrypt(db_manager_t *m, const char *enc_data, size_t enc_le
     }
 
 cleanup:
+    if (!result) { m->is_signed = FALSE; m->is_pqc_encrypted = FALSE; }
     if (recipient_pub) gpgme_key_release(recipient_pub);
     if (in) gpgme_data_release(in);
     if (out) gpgme_data_release(out);
@@ -965,6 +1024,7 @@ static unsigned char *db_gpg_encrypt_binary_pqc(db_manager_t *m, const void *pla
     unsigned char *result = NULL;
     char *raw = NULL;
     size_t rlen = 0;
+    int previous_armor = m && m->gpg_ctx ? gpgme_get_armor(m->gpg_ctx) : 0;
 
     if (out_len) *out_len = 0;
     if (!m || !m->recipient || !plaintext || pt_len == 0 || pt_len > DB_MAX_JSON_BYTES || !out_len) {
@@ -1018,11 +1078,28 @@ static unsigned char *db_gpg_encrypt_binary_pqc(db_manager_t *m, const void *pla
     }
 
     {
-        gpgme_key_t recips[] = { recipient_key, NULL };
+         
+
+
+        gpgme_subkey_t selected = NULL;
+        for (gpgme_subkey_t sub = recipient_key->subkeys; sub; sub = sub->next) {
+            if (sub->revoked || sub->expired || sub->disabled || sub->invalid ||
+                !sub->can_encrypt || sub->pubkey_algo != GPGME_PK_KYBER || !sub->fpr)
+                continue;
+            if (!selected || sub->timestamp > selected->timestamp) selected = sub;
+        }
+        if (!selected || !db_hex_string_valid(selected->fpr, strlen(selected->fpr))) {
+            snprintf(err_msg, err_msg_sz, "No usable explicit Kyber recipient fingerprint");
+            goto cleanup;
+        }
+        char *exact_recipient = g_strdup_printf("%s!", selected->fpr);
+        if (!exact_recipient) goto cleanup;
         gpgme_encrypt_flags_t enc_flags = GPGME_ENCRYPT_ALWAYS_TRUST |
-            GPGME_ENCRYPT_NO_COMPRESS;
+            GPGME_ENCRYPT_NO_COMPRESS | GPGME_ENCRYPT_NO_ENCRYPT_TO;
         if (hide_recipient) enc_flags |= GPGME_ENCRYPT_THROW_KEYIDS;
-        gerr = gpgme_op_encrypt_sign(m->gpg_ctx, recips, enc_flags, in, out);
+        gpgme_set_armor(m->gpg_ctx, 0);
+        gerr = gpgme_op_encrypt_sign_ext(m->gpg_ctx, NULL, exact_recipient, enc_flags, in, out);
+        g_free(exact_recipient);
         if (gerr != GPG_ERR_NO_ERROR) {
             snprintf(err_msg, err_msg_sz, "PQC encryption failed: %s", gpgme_strerror(gerr));
             goto cleanup;
@@ -1055,6 +1132,7 @@ static unsigned char *db_gpg_encrypt_binary_pqc(db_manager_t *m, const void *pla
     gpgme_free(raw);
 
 cleanup:
+    if (m && m->gpg_ctx) gpgme_set_armor(m->gpg_ctx, previous_armor);
     if (signer) gpgme_key_release(signer);
     if (recipient_key) gpgme_key_release(recipient_key);
     if (in) gpgme_data_release(in);
@@ -1109,7 +1187,7 @@ static char *db_gpg_encrypt_legacy(db_manager_t *m, const char *plaintext, size_
 
     gpgme_key_t recips[] = { recipient_key, NULL };
     gpgme_encrypt_flags_t enc_flags = GPGME_ENCRYPT_ALWAYS_TRUST |
-        GPGME_ENCRYPT_THROW_KEYIDS | GPGME_ENCRYPT_NO_COMPRESS;
+        GPGME_ENCRYPT_NO_COMPRESS | GPGME_ENCRYPT_NO_ENCRYPT_TO;
     gerr = gpgme_op_encrypt_sign(m->gpg_ctx, recips, enc_flags, in, out);
     if (gerr != GPG_ERR_NO_ERROR) {
         snprintf(err_msg, err_msg_sz, "%s%s", i18n("gpg_err"), gpgme_strerror(gerr));

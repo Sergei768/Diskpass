@@ -1,3 +1,6 @@
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include "diskpass.h"
 #include <inttypes.h>
 #include <sys/file.h>
@@ -47,8 +50,11 @@
 #define DB_OPAQUE_OFFSET_MASK 0x7FFFU
 #define DB_OPAQUE_HEADER_BYTES 4U
 #define DB_OPAQUE_MIN_ENVELOPE 64U
-#define DB_OPAQUE_ENV_TAG "DPENV4"
+#define DB_OPAQUE_ENV_TAG "DPENV5"
+#define DB_OPAQUE_LEGACY_ENV_TAG "DPENV4"
 #define DB_OPAQUE_AAD "DiskPass opaque payload v4"
+_Static_assert(sizeof(DB_OPAQUE_AAD) - 1 + DB_OPAQUE_HEADER_BYTES <= 64,
+    "DB_OPAQUE_AAD + DB_OPAQUE_HEADER_BYTES must fit in aad_buf[64]");
 #define DB_SECURITY_CLASSIC "classic-v1"
 #define DB_CARRIER_MAX_BYTES (16ULL * 1024ULL * 1024ULL * 1024ULL)
 
@@ -452,7 +458,8 @@ static size_t db_opaque_bucket_size(size_t need, gboolean compact) {
 
 static gboolean db_opaque_payload_size_valid(size_t n, gboolean compact) {
     if (compact)
-        return n >= 1024U && n <= (size_t)DB_MAX_JSON_BYTES + 8U && (n % 1024U) == 0;
+        return n >= 1024U && n <= ((size_t)DB_MAX_JSON_BYTES + 8U + 1023U) / 1024U * 1024U &&
+            (n % 1024U) == 0;
     for (size_t i = 0; i < ARRAY_SIZE(DB_OPAQUE_BUCKETS); i++)
         if ((uint64_t)n == DB_OPAQUE_BUCKETS[i]) return TRUE;
     return FALSE;
@@ -556,6 +563,7 @@ static gboolean db_generation_valid(const char *s) {
 
 static gboolean db_hex_string_valid(const char *s, size_t expected_len);
 static char *db_rollback_state_dir(void);
+static gboolean db_rollback_state_dir_prepare(char **out_dir, gboolean create);
 
 static char *db_backup_pointer_path(const char *db_id) {
     if (!db_hex_string_valid(db_id, DB_ID_HEX_LEN)) return NULL;
@@ -578,7 +586,7 @@ static char *db_read_backup_pointer(const char *db_id) {
     char buf[PATH_MAX + 1];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     gboolean ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
-        (st.st_mode & 077) == 0 && n > 0 && n < (ssize_t)sizeof(buf) - 1;
+        (st.st_mode & 077) == 0 && st.st_nlink == 1 && n > 0 && n < (ssize_t)sizeof(buf) - 1;
     close(fd);
     if (!ok) return NULL;
     buf[n] = '\0';
@@ -588,13 +596,12 @@ static char *db_read_backup_pointer(const char *db_id) {
 }
 
 static gboolean db_write_backup_pointer(const char *db_id, const char *backup_path) {
-    char *dir = db_rollback_state_dir();
+    char *dir = NULL;
     char *path = db_backup_pointer_path(db_id);
-    if (!dir || !path || !backup_path || !db_path_has_dpdb_extension(backup_path)) {
+    if (!path || !backup_path || !db_path_has_dpdb_extension(backup_path) ||
+        !db_rollback_state_dir_prepare(&dir, TRUE)) {
         g_free(dir); g_free(path); return FALSE;
     }
-    if (g_mkdir_with_parents(dir, 0700) != 0) { g_free(dir); g_free(path); return FALSE; }
-    (void)chmod(dir, 0700);
     size_t tlen = strlen(path) + sizeof(".tmp.XXXXXX");
     char *tmp = malloc(tlen);
     if (!tmp) { g_free(dir); g_free(path); return FALSE; }
@@ -740,7 +747,7 @@ static unsigned char g_stego_secret_key[32];
 static gboolean g_stego_secret_key_set = FALSE;
 
 
-static const void *g_stego_secret_owner = NULL;
+static GSList *g_stego_secret_owners = NULL;
 
 
 static GMutex g_stego_secret_mutex;
@@ -753,50 +760,51 @@ static void stego_secret_init_mutex(void) {
 
 static void stego_secret_clear_owner(const void *owner);
 
-static void stego_secret_set(const void *owner, const unsigned char *noise_key, size_t key_len) {
+static gboolean stego_secret_set(const void *owner, const unsigned char *noise_key, size_t key_len) {
     unsigned char derived[32];
-    sodium_memzero(derived, sizeof(derived));
-    if (!owner || !noise_key || key_len != 32) return;
-
-
+    if (!owner || !noise_key || key_len != 32) return FALSE;
     static const unsigned char domain[] = "DiskPass stego secret v3";
     crypto_generichash_state st;
     if (crypto_generichash_init(&st, noise_key, key_len, sizeof(derived)) != 0) {
         sodium_memzero(&st, sizeof(st));
-        return;
+        return FALSE;
     }
     crypto_generichash_update(&st, domain, sizeof(domain) - 1);
     crypto_generichash_final(&st, derived, sizeof(derived));
     sodium_memzero(&st, sizeof(st));
-
     g_mutex_lock(&g_stego_secret_mutex);
-    if (!g_stego_secret_key_set || g_stego_secret_owner == owner) {
+    gboolean existing = g_slist_find(g_stego_secret_owners, owner) != NULL;
+    gboolean sole_owner = existing && !g_stego_secret_owners->next;
+    gboolean ok = !g_stego_secret_key_set || sole_owner ||
+        sodium_memcmp(g_stego_secret_key, derived, sizeof(derived)) == 0;
+    if (ok) {
         memcpy(g_stego_secret_key, derived, sizeof(g_stego_secret_key));
         g_stego_secret_key_set = TRUE;
-        g_stego_secret_owner = owner;
-    } else if (sodium_memcmp(g_stego_secret_key, derived, sizeof(derived)) == 0) {
-
-
-    } else {
-
-
+        if (!existing) g_stego_secret_owners = g_slist_prepend(g_stego_secret_owners, (gpointer)owner);
     }
     g_mutex_unlock(&g_stego_secret_mutex);
     sodium_memzero(derived, sizeof(derived));
+    return ok;
 }
-
 
 static void stego_secret_clear_owner(const void *owner) {
     if (!owner) return;
     g_mutex_lock(&g_stego_secret_mutex);
-    if (g_stego_secret_key_set && g_stego_secret_owner == owner) {
+    g_stego_secret_owners = g_slist_remove(g_stego_secret_owners, owner);
+    if (!g_stego_secret_owners) {
         sodium_memzero(g_stego_secret_key, sizeof(g_stego_secret_key));
         g_stego_secret_key_set = FALSE;
-        g_stego_secret_owner = NULL;
     }
     g_mutex_unlock(&g_stego_secret_mutex);
 }
 
+static void stego_secret_shutdown(void) {
+    g_mutex_lock(&g_stego_secret_mutex);
+    g_clear_pointer(&g_stego_secret_owners, g_slist_free);
+    sodium_memzero(g_stego_secret_key, sizeof(g_stego_secret_key));
+    g_stego_secret_key_set = FALSE;
+    g_mutex_unlock(&g_stego_secret_mutex);
+}
 
 static gboolean stego_secret_snapshot(unsigned char out[32]) {
     g_mutex_lock(&g_stego_secret_mutex);
@@ -830,9 +838,25 @@ static gboolean carrier_opaque_layout_at_fd(int fd, uint64_t start, uint64_t len
     unsigned char packet = 0;
     uint64_t packet_pos = start + DB_OPAQUE_HEADER_BYTES + env_off;
     if (packet_pos > (uint64_t)LLONG_MAX ||
-        pread(fd, &packet, 1, (off_t)packet_pos) != 1 || !(packet & 0x80U))
+        pread(fd, &packet, 1, (off_t)packet_pos) != 1)
         return FALSE;
-    return TRUE;
+    if (packet & 0x80U) return TRUE;
+
+     
+
+
+    static const char armor_begin[] = "-----BEGIN PGP MESSAGE-----";
+    static const char armor_end[] = "-----END PGP MESSAGE-----";
+    unsigned char begin[sizeof(armor_begin) - 1U];
+    unsigned char tail[160];
+    size_t tail_len = env_len < sizeof(tail) - 1U ? env_len : sizeof(tail) - 1U;
+    if (env_len < sizeof(begin) + sizeof(armor_end) - 1U ||
+        pread(fd, begin, sizeof(begin), (off_t)packet_pos) != (ssize_t)sizeof(begin) ||
+        memcmp(begin, armor_begin, sizeof(begin)) != 0 ||
+        pread(fd, tail, tail_len, (off_t)(packet_pos + env_len - tail_len)) != (ssize_t)tail_len)
+        return FALSE;
+    tail[tail_len] = '\0';
+    return strstr((const char *)tail, armor_end) != NULL;
 }
 
 static gboolean carrier_legacy_layout_at_fd(int fd, uint64_t start, uint64_t len) {
@@ -905,11 +929,17 @@ static int carrier_open_regular(const char *path, uint64_t max_size, int *out_fd
 }
 
 static gboolean carrier_paths_distinct(const char *a, const char *b) {
-    if (!a || !b) return FALSE;
-    gchar *ca = g_canonicalize_filename(a, NULL);
-    gchar *cb = g_canonicalize_filename(b, NULL);
-    gboolean distinct = ca && cb && strcmp(ca, cb) != 0;
-    g_free(ca); g_free(cb);
+    if (!a || !b || !*a || !*b) return FALSE;
+     
+
+    struct stat sa, sb, da, db;
+    if (stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+        sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) return FALSE;
+    char *pa = g_path_get_dirname(a), *pb = g_path_get_dirname(b);
+    char *ba = g_path_get_basename(a), *bb = g_path_get_basename(b);
+    gboolean distinct = stat(pa, &da) == 0 && stat(pb, &db) == 0 &&
+        !(da.st_dev == db.st_dev && da.st_ino == db.st_ino && strcmp(ba, bb) == 0);
+    g_free(pa); g_free(pb); g_free(ba); g_free(bb);
     return distinct;
 }
 
@@ -923,7 +953,7 @@ static int carrier_create_temp(const char *output_path, char **out_tmp, int *out
     char *tmp = malloc(n);
     if (!tmp) { snprintf(err_msg, err_msg_sz, "Out of memory for temporary path"); return -1; }
     snprintf(tmp, n, "%s.tmp.XXXXXX", output_path);
-    int fd = g_mkstemp_full(tmp, O_WRONLY | O_CLOEXEC, 0600);
+    int fd = g_mkstemp_full(tmp, O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0 || fchmod(fd, 0600) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot create safe output file: %s", strerror(errno));
         if (fd >= 0) close(fd);
@@ -957,6 +987,7 @@ static gboolean stego_iter_init(stego_iter_t *it, uint64_t slots,
     const unsigned char seed[STEGO_SEED_BYTES])
 {
     if (!it || !seed || slots == 0) return FALSE;
+    if (slots == 1) { it->slots = 1; it->pos = it->step = 0; return TRUE; }
     uint64_t start = db_load_u64le(seed) % slots;
     uint64_t step = db_load_u64le(seed + 8) % slots;
     if (step == 0) step = 1;
@@ -1043,6 +1074,13 @@ static GdkPixbuf *stego_load_image_safe_limit(const char *path, uint64_t max_pix
         return NULL;
     }
     g_clear_error(&gerr);
+    int decoded_w = gdk_pixbuf_get_width(pb), decoded_h = gdk_pixbuf_get_height(pb);
+    if (decoded_w <= 0 || decoded_h <= 0 ||
+        (uint64_t)(unsigned)decoded_w * (uint64_t)(unsigned)decoded_h > max_pixels) {
+        g_object_unref(pb);
+        snprintf(err_msg, err_msg_sz, "Decoded image dimensions exceed the safety limit");
+        return NULL;
+    }
     return pb;
 }
 
@@ -1389,14 +1427,36 @@ static int stego_write_pixbuf_webp(int fd, GdkPixbuf *pb) {
     int channels = gdk_pixbuf_get_n_channels(pb), stride = gdk_pixbuf_get_rowstride(pb);
     const uint8_t *pixels = gdk_pixbuf_get_pixels(pb);
     if (w <= 0 || h <= 0 || channels < 3 || !pixels) return -1;
-    uint8_t *encoded = NULL;
-    size_t n = (gdk_pixbuf_get_has_alpha(pb) && channels >= 4)
-        ? WebPEncodeLosslessRGBA(pixels, w, h, stride, &encoded)
-        : WebPEncodeLosslessRGB(pixels, w, h, stride, &encoded);
-    if (n == 0 || !encoded) return -1;
-    int rc = write_all_fd(fd, encoded, n);
-    WebPFree(encoded);
+    WebPConfig config;
+    WebPPicture picture;
+    WebPMemoryWriter writer;
+    if (!WebPConfigInit(&config) || !WebPPictureInit(&picture)) return -1;
+    config.lossless = 1;
+    config.exact = 1;  
+    config.quality = 75;
+    if (!WebPValidateConfig(&config)) return -1;
+    picture.use_argb = 1; picture.width = w; picture.height = h;
+    WebPMemoryWriterInit(&writer);
+    picture.writer = WebPMemoryWrite; picture.custom_ptr = &writer;
+    int imported = (gdk_pixbuf_get_has_alpha(pb) && channels >= 4)
+        ? WebPPictureImportRGBA(&picture, pixels, stride)
+        : WebPPictureImportRGB(&picture, pixels, stride);
+    int rc = -1;
+    if (imported && WebPEncode(&config, &picture))
+        rc = write_all_fd(fd, writer.mem, writer.size);
+    WebPPictureFree(&picture);
+    WebPMemoryWriterClear(&writer);
     return rc;
+}
+
+static gboolean stego_image_write_cb(const gchar *buf, gsize size,
+    GError **error, gpointer data)
+{
+    int fd = GPOINTER_TO_INT(data);
+    if (write_all_fd(fd, buf, size) == 0) return TRUE;
+    g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+        "Cannot write image: %s", strerror(errno));
+    return FALSE;
 }
 
 static int stego_save_image_atomic(GdkPixbuf *pb, const char *output_path,
@@ -1433,29 +1493,17 @@ static int stego_save_image_atomic(GdkPixbuf *pb, const char *output_path,
             unlink(tmp); free(tmp); return -1;
         }
     } else {
-        if (close(fd) != 0) {
-            snprintf(err_msg, err_msg_sz, "Cannot close temporary %s: %s", label, strerror(errno));
-            unlink(tmp); free(tmp); return -1;
-        }
-        fd = -1;
         GError *gerr = NULL;
-        gboolean ok = FALSE;
-        if (fmt == FMT_BMP) ok = gdk_pixbuf_save(pb, tmp, "bmp", &gerr, NULL);
-        else if (fmt == FMT_TIFF) ok = gdk_pixbuf_save(pb, tmp, "tiff", &gerr, NULL);
-        else ok = gdk_pixbuf_save(pb, tmp, "png", &gerr, "compression", "9", NULL);
+        const char *format = fmt == FMT_BMP ? "bmp" : fmt == FMT_TIFF ? "tiff" : "png";
+        gboolean ok = fmt == FMT_PNG
+            ? gdk_pixbuf_save_to_callback(pb, stego_image_write_cb, GINT_TO_POINTER(fd),
+                format, &gerr, "compression", "9", NULL)
+            : gdk_pixbuf_save_to_callback(pb, stego_image_write_cb, GINT_TO_POINTER(fd),
+                format, &gerr, NULL);
         if (!ok) {
             snprintf(err_msg, err_msg_sz, "Cannot encode stego %s: %s", label,
                 gerr && gerr->message ? gerr->message : "image encoder unavailable");
-            g_clear_error(&gerr); unlink(tmp); free(tmp); return -1;
-        }
-        if (chmod(tmp, 0600) != 0) {
-            snprintf(err_msg, err_msg_sz, "Cannot set private permissions on stego %s: %s", label, strerror(errno));
-            unlink(tmp); free(tmp); return -1;
-        }
-        fd = open(tmp, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-        if (fd < 0) {
-            snprintf(err_msg, err_msg_sz, "Cannot open stego %s for sync: %s", label, strerror(errno));
-            unlink(tmp); free(tmp); return -1;
+            g_clear_error(&gerr); close(fd); unlink(tmp); free(tmp); return -1;
         }
         if (fsync(fd) != 0) {
             int saved_errno = errno;
@@ -1489,7 +1537,7 @@ static gboolean stego_embedding_percent(unsigned *out_percent,
 {
     if (!out_percent) return FALSE;
     const char *setting = g_getenv("DISKPASS_STEGO_MAX_PERCENT");
-    unsigned percent = 100;
+    unsigned percent = 20;
     if (setting) {
         size_t n = strlen(setting);
         if (!n || n > 3) goto invalid;
@@ -1498,12 +1546,12 @@ static gboolean stego_embedding_percent(unsigned *out_percent,
             if (setting[i] < '0' || setting[i] > '9') goto invalid;
             percent = percent * 10 + (unsigned)(setting[i] - '0');
         }
-        if (!percent || percent > 100) goto invalid;
+        if (!percent || percent > 40) goto invalid;
     }
     *out_percent = percent;
     return TRUE;
 invalid:
-    snprintf(err_msg, err_msg_sz, "DISKPASS_STEGO_MAX_PERCENT must be an integer from 1 to 100");
+    snprintf(err_msg, err_msg_sz, "DISKPASS_STEGO_MAX_PERCENT must be an integer from 1 to 40 (default 20)");
     return FALSE;
 }
 
@@ -1553,9 +1601,15 @@ static int carrier_attach_dpdb_image(const char *carrier_path, const char *db_pa
     }
     if (carrier_open_regular(db_path, DB_MAX_FILE_BYTES, &dfd, &db_size, err_msg, err_msg_sz) != 0)
         goto cleanup;
-    if (!db_path_has_dpdb_extension(db_path) || !carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
-        snprintf(err_msg, err_msg_sz,
-            "Only valid DiskPass .dpdb databases can be hidden");
+    if (!carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+        snprintf(err_msg, err_msg_sz, "Input is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
+    if (!db_path_has_dpdb_extension(db_path) || db_size < 64) {
+        if (!db_path_has_dpdb_extension(db_path))
+            snprintf(err_msg, err_msg_sz, "Database file must have the .dpdb extension");
+        else
+            snprintf(err_msg, err_msg_sz, "Database file is too small; minimum is 64 bytes");
         goto cleanup;
     }
 
@@ -1606,6 +1660,8 @@ static int carrier_attach_dpdb_image(const char *carrier_path, const char *db_pa
     stego_write_bytes(pb, &it, header, sizeof(header));
 
     unsigned char buf[128 * 1024];
+    crypto_generichash_state written_state;
+    crypto_generichash_init(&written_state, NULL, 0, STEGO_HASH_BYTES);
     uint64_t off = 0;
     while (off < db_size) {
         size_t want = sizeof(buf);
@@ -1617,10 +1673,20 @@ static int carrier_attach_dpdb_image(const char *carrier_path, const char *db_pa
                 n < 0 ? strerror(errno) : "unexpected end of file");
             sodium_memzero(buf, sizeof(buf)); goto cleanup;
         }
+        crypto_generichash_update(&written_state, buf, (size_t)n);
         stego_write_bytes(pb, &it, buf, (size_t)n);
         off += (uint64_t)n;
     }
     sodium_memzero(buf, sizeof(buf));
+    unsigned char written_hash[STEGO_HASH_BYTES];
+    crypto_generichash_final(&written_state, written_hash, sizeof(written_hash));
+    gboolean unchanged = sodium_memcmp(written_hash, payload_hash, sizeof(written_hash)) == 0;
+    sodium_memzero(written_hash, sizeof(written_hash));
+    sodium_memzero(&written_state, sizeof(written_state));
+    if (!unchanged) {
+        snprintf(err_msg, err_msg_sz, "Database changed during steganographic export; retry with a stable copy");
+        goto cleanup;
+    }
 
     if (stego_save_image_atomic(pb, output_path, err_msg, err_msg_sz) != 0) goto cleanup;
     rc = 0;
@@ -1694,16 +1760,13 @@ static int carrier_extract_dpdb_image(const char *image_path, const char *output
         snprintf(err_msg, err_msg_sz, "Steganographic payload integrity check failed; image may have been modified or recompressed");
         goto cleanup;
     }
+    if (!carrier_dpdb_layout_at_fd(ofd, 0, payload_len)) {
+        snprintf(err_msg, err_msg_sz, "Extracted payload is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
     if (fsync(ofd) != 0) { snprintf(err_msg, err_msg_sz, "Cannot sync extracted database: %s", strerror(errno)); goto cleanup; }
     if (close(ofd) != 0) { ofd = -1; snprintf(err_msg, err_msg_sz, "Cannot close extracted database: %s", strerror(errno)); goto cleanup; }
     ofd = -1;
-    int verify_fd = open(tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (verify_fd < 0 || !carrier_dpdb_layout_at_fd(verify_fd, 0, payload_len)) {
-        if (verify_fd >= 0) close(verify_fd);
-        snprintf(err_msg, err_msg_sz, "Hidden payload is intact but is not a recognized DiskPass .dpdb container");
-        goto cleanup;
-    }
-    close(verify_fd);
     if (rename(tmp, output_db_path) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot atomically install extracted database: %s", strerror(errno));
         goto cleanup;
@@ -1759,12 +1822,19 @@ static int stego_wav_parse_fd(int fd, uint64_t file_size, stego_wav_info_t *info
         return -1;
     }
 
+    uint64_t riff_end = 8ULL + stego_load_u32le(riff + 4);
+    if (riff_end < 44 || riff_end > file_size) {
+        snprintf(err_msg, err_msg_sz, "WAV RIFF size is inconsistent with the file");
+        return -1;
+    }
+    file_size = riff_end;
     gboolean have_fmt = FALSE, have_data = FALSE;
     uint16_t fmt_tag = 0, channels = 0, block_align = 0, bits = 0;
     uint32_t sample_rate = 0;
     uint64_t data_offset = 0, data_size = 0;
     uint64_t pos = 12;
-    while (pos + 8 <= file_size) {
+    unsigned chunks = 0;
+    while (pos + 8 <= file_size && chunks++ < 65536U) {
         unsigned char ch[8];
         if (pos > (uint64_t)LLONG_MAX || pread(fd, ch, sizeof(ch), (off_t)pos) != (ssize_t)sizeof(ch)) {
             snprintf(err_msg, err_msg_sz, "Cannot read WAV chunk header");
@@ -1772,7 +1842,7 @@ static int stego_wav_parse_fd(int fd, uint64_t file_size, stego_wav_info_t *info
         }
         uint32_t chunk_size = stego_load_u32le(ch + 4);
         uint64_t body = pos + 8;
-        if (body > file_size || (uint64_t)chunk_size > file_size - body) {
+        if (body > file_size || (uint64_t)chunk_size + (chunk_size & 1U) > file_size - body) {
             snprintf(err_msg, err_msg_sz, "Malformed WAV chunk length");
             return -1;
         }
@@ -1798,12 +1868,20 @@ static int stego_wav_parse_fd(int fd, uint64_t file_size, stego_wav_info_t *info
                     0x01,0x00,0x00,0x00,0x00,0x00,0x10,0x00,
                     0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71
                 };
-                if (chunk_size < 40 || memcmp(fmt + 24, pcm_guid, sizeof(pcm_guid)) != 0) {
+                if (chunk_size < 40 || db_load_u16le(fmt + 16) < 22 ||
+                    db_load_u16le(fmt + 16) > chunk_size - 18 ||
+                    db_load_u16le(fmt + 18) == 0 || db_load_u16le(fmt + 18) > bits ||
+                    memcmp(fmt + 24, pcm_guid, sizeof(pcm_guid)) != 0) {
                     snprintf(err_msg, err_msg_sz, "Only integer PCM WAV is supported for steganography");
                     return -1;
                 }
             } else if (fmt_tag != 1U) {
                 snprintf(err_msg, err_msg_sz, "Only uncompressed integer PCM WAV is supported for steganography");
+                return -1;
+            }
+            uint64_t expected_rate = (uint64_t)sample_rate * block_align;
+            if (expected_rate > UINT32_MAX || stego_load_u32le(fmt + 8) != expected_rate) {
+                snprintf(err_msg, err_msg_sz, "WAV byte rate is inconsistent with its format");
                 return -1;
             }
             have_fmt = TRUE;
@@ -1812,6 +1890,7 @@ static int stego_wav_parse_fd(int fd, uint64_t file_size, stego_wav_info_t *info
             data_size = chunk_size;
             have_data = TRUE;
         }
+        if (have_fmt && have_data) break;    
         uint64_t advance = 8ULL + (uint64_t)chunk_size + (uint64_t)(chunk_size & 1U);
         if (advance > file_size - pos) break;
         pos += advance;
@@ -2008,6 +2087,46 @@ static int carrier_copy_fd_exact(int src, int dst, uint64_t len,
     return 0;
 }
 
+static unsigned char *carrier_snapshot_map_fd(int fd, uint64_t len,
+    char *err_msg, size_t err_msg_sz)
+{
+    struct stat before, after;
+    if (len > SIZE_MAX || fstat(fd, &before) != 0 || before.st_size < 0 ||
+        (uint64_t)before.st_size != len) {
+        snprintf(err_msg, err_msg_sz, "Carrier changed while opening"); return MAP_FAILED;
+    }
+    GError *error = NULL;
+    char *path = NULL;
+    int snapshot = -1;
+#if defined(__linux__) && defined(SYS_memfd_create)
+    snapshot = (int)syscall(SYS_memfd_create, "carrier-snapshot", 1U);
+#endif
+    if (snapshot < 0) snapshot = g_file_open_tmp("diskpass-wav-XXXXXX", &path, &error);
+    if (snapshot < 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot create private WAV snapshot: %s",
+            error ? error->message : "temporary file error");
+        g_clear_error(&error); g_free(path); return MAP_FAILED;
+    }
+    if (path && unlink(path) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot unlink private WAV snapshot: %s", strerror(errno));
+        close(snapshot); g_free(path); return MAP_FAILED;
+    }
+    g_free(path);
+    unsigned char *map = MAP_FAILED;
+    if (carrier_copy_fd_exact(fd, snapshot, len, err_msg, err_msg_sz) != 0) goto done;
+    if (fstat(fd, &after) != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec || before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
+        snprintf(err_msg, err_msg_sz, "Carrier changed while taking a WAV snapshot"); goto done;
+    }
+    map = mmap(NULL, (size_t)len, PROT_READ, MAP_PRIVATE, snapshot, 0);
+    if (map == MAP_FAILED) snprintf(err_msg, err_msg_sz, "Cannot map private WAV snapshot: %s", strerror(errno));
+done:
+    close(snapshot);
+    return map;
+}
+
 static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path,
     const char *output_path, char *err_msg, size_t err_msg_sz)
 {
@@ -2032,9 +2151,15 @@ static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path
     }
     if (carrier_open_regular(db_path, DB_MAX_FILE_BYTES, &dfd, &db_size, err_msg, err_msg_sz) != 0)
         goto cleanup;
-    if (!db_path_has_dpdb_extension(db_path) || !carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
-        snprintf(err_msg, err_msg_sz,
-            "Only valid DiskPass .dpdb databases can be hidden");
+    if (!carrier_dpdb_layout_at_fd(dfd, 0, db_size)) {
+        snprintf(err_msg, err_msg_sz, "Input is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
+    if (!db_path_has_dpdb_extension(db_path) || db_size < 64) {
+        if (!db_path_has_dpdb_extension(db_path))
+            snprintf(err_msg, err_msg_sz, "Database file must have the .dpdb extension");
+        else
+            snprintf(err_msg, err_msg_sz, "Database file is too small; minimum is 64 bytes");
         goto cleanup;
     }
     if (carrier_open_regular(carrier_path, DB_CARRIER_MAX_BYTES, &cfd, &carrier_size, err_msg, err_msg_sz) != 0)
@@ -2044,16 +2169,16 @@ static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path
         snprintf(err_msg, err_msg_sz, "WAV is too large for this build");
         goto cleanup;
     }
-    /* Verify the opened carrier has not changed since its size was checked.
-     * Mapping an fd avoids pathname substitution, while this also catches
-     * truncation races that could otherwise SIGBUS during access. */
+     
+
+
     struct stat carrier_st;
     if (fstat(cfd, &carrier_st) != 0 || !S_ISREG(carrier_st.st_mode) ||
         carrier_st.st_size < 0 || (uint64_t)carrier_st.st_size != carrier_size) {
         snprintf(err_msg, err_msg_sz, "WAV carrier changed while opening");
         goto cleanup;
     }
-    src_map = mmap(NULL, (size_t)carrier_size, PROT_READ, MAP_PRIVATE, cfd, 0);
+    src_map = carrier_snapshot_map_fd(cfd, carrier_size, err_msg, err_msg_sz);
     if (src_map == MAP_FAILED) {
         snprintf(err_msg, err_msg_sz, "Cannot map WAV carrier: %s", strerror(errno));
         goto cleanup;
@@ -2097,20 +2222,12 @@ static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path
     for (size_t i = 0; i < sizeof(header); i++) header[i] ^= mask[i];
 
     if (carrier_create_temp(output_path, &tmp, &tfd, err_msg, err_msg_sz) != 0) goto cleanup;
-    if (carrier_copy_fd_exact(cfd, tfd, carrier_size, err_msg, err_msg_sz) != 0) goto cleanup;
+    if (write_all_fd(tfd, src_map, (size_t)carrier_size) != 0) {
+        snprintf(err_msg, err_msg_sz, "Cannot copy private WAV snapshot: %s", strerror(errno));
+        goto cleanup;
+    }
     if (fsync(tfd) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot sync temporary WAV: %s", strerror(errno));
-        goto cleanup;
-    }
-    if (close(tfd) != 0) {
-        tfd = -1;
-        snprintf(err_msg, err_msg_sz, "Cannot close temporary WAV: %s", strerror(errno));
-        goto cleanup;
-    }
-    tfd = -1;
-    tfd = open(tmp, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-    if (tfd < 0) {
-        snprintf(err_msg, err_msg_sz, "Cannot reopen temporary WAV: %s", strerror(errno));
         goto cleanup;
     }
     dst_map = mmap(NULL, (size_t)carrier_size, PROT_READ | PROT_WRITE, MAP_SHARED, tfd, 0);
@@ -2123,6 +2240,8 @@ static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path
     stego_iter_init(&it, slots, seed);
     stego_wav_write_bytes(dst_map, &info, &it, header, sizeof(header));
     unsigned char buf[128 * 1024];
+    crypto_generichash_state written_state;
+    crypto_generichash_init(&written_state, NULL, 0, STEGO_HASH_BYTES);
     uint64_t off = 0;
     while (off < db_size) {
         size_t want = sizeof(buf);
@@ -2135,10 +2254,20 @@ static int carrier_attach_dpdb_wav(const char *carrier_path, const char *db_path
             sodium_memzero(buf, sizeof(buf));
             goto cleanup;
         }
+        crypto_generichash_update(&written_state, buf, (size_t)n);
         stego_wav_write_bytes(dst_map, &info, &it, buf, (size_t)n);
         off += (uint64_t)n;
     }
     sodium_memzero(buf, sizeof(buf));
+    unsigned char written_hash[STEGO_HASH_BYTES];
+    crypto_generichash_final(&written_state, written_hash, sizeof(written_hash));
+    gboolean unchanged = sodium_memcmp(written_hash, payload_hash, sizeof(written_hash)) == 0;
+    sodium_memzero(written_hash, sizeof(written_hash));
+    sodium_memzero(&written_state, sizeof(written_state));
+    if (!unchanged) {
+        snprintf(err_msg, err_msg_sz, "Database changed during steganographic export; retry with a stable copy");
+        goto cleanup;
+    }
     if (msync(dst_map, (size_t)carrier_size, MS_SYNC) != 0 || fsync(tfd) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot sync stego WAV: %s", strerror(errno));
         goto cleanup;
@@ -2196,7 +2325,7 @@ static int carrier_extract_dpdb_wav(const char *wav_path, const char *output_db_
         snprintf(err_msg, err_msg_sz, "WAV is too large for this build");
         goto cleanup;
     }
-    map = mmap(NULL, (size_t)wav_size, PROT_READ, MAP_PRIVATE, wfd, 0);
+    map = carrier_snapshot_map_fd(wfd, wav_size, err_msg, err_msg_sz);
     if (map == MAP_FAILED) {
         snprintf(err_msg, err_msg_sz, "Cannot map WAV carrier: %s", strerror(errno));
         goto cleanup;
@@ -2241,6 +2370,10 @@ static int carrier_extract_dpdb_wav(const char *wav_path, const char *output_db_
         snprintf(err_msg, err_msg_sz, "Steganographic payload integrity check failed; WAV may have been modified or re-encoded");
         goto cleanup;
     }
+    if (!carrier_dpdb_layout_at_fd(ofd, 0, payload_len)) {
+        snprintf(err_msg, err_msg_sz, "Extracted payload is not a supported encrypted DiskPass database");
+        goto cleanup;
+    }
     if (fsync(ofd) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot sync extracted database: %s", strerror(errno));
         goto cleanup;
@@ -2251,13 +2384,6 @@ static int carrier_extract_dpdb_wav(const char *wav_path, const char *output_db_
         goto cleanup;
     }
     ofd = -1;
-    int verify_fd = open(tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (verify_fd < 0 || !carrier_dpdb_layout_at_fd(verify_fd, 0, payload_len)) {
-        if (verify_fd >= 0) close(verify_fd);
-        snprintf(err_msg, err_msg_sz, "Hidden payload is intact but is not a recognized DiskPass .dpdb container");
-        goto cleanup;
-    }
-    close(verify_fd);
     if (rename(tmp, output_db_path) != 0) {
         snprintf(err_msg, err_msg_sz, "Cannot atomically install extracted database: %s", strerror(errno));
         goto cleanup;
@@ -2476,6 +2602,18 @@ static int db_snapshot_check(const char *path, const db_file_snapshot_t *expecte
 static int db_save_lock(const char *path, char *err_msg, size_t err_msg_sz) {
     char *name = g_strconcat(path, ".lock", NULL);
     if (!name) { snprintf(err_msg, err_msg_sz, "Cannot allocate database lock path"); return -1; }
+    char *parent = g_path_get_dirname(name);
+    if (parent) {
+        struct stat pst;
+        gboolean parent_safe = lstat(parent, &pst) == 0 && S_ISDIR(pst.st_mode) &&
+            !S_ISLNK(pst.st_mode) && pst.st_uid == geteuid() && (pst.st_mode & 022) == 0;
+        g_free(parent);
+        if (!parent_safe) {
+            g_free(name);
+            snprintf(err_msg, err_msg_sz, "Database lock parent directory is unsafe (symlink or world-writable)");
+            return -1;
+        }
+    }
     int fd = open(name, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
     struct stat st, named;
     if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
@@ -2521,6 +2659,9 @@ typedef struct {
 
     gboolean require_pqc;
 
+    gboolean allow_hidden_recipients;
+
+    gboolean needs_resave;
 
     gboolean force_fresh_pinentry;
 } db_manager_t;
@@ -2759,10 +2900,34 @@ static gboolean db_rollback_state_dir_prepare(char **out_dir, gboolean create) {
         return FALSE;
     }
     struct stat st;
+     
+
+
+    if (g_getenv("DISKPASS_PRIVATE_DIR") == NULL && lstat(dir, &st) == 0 &&
+        S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode) && st.st_uid == geteuid() &&
+        (st.st_mode & 077) != 0)
+        (void)chmod(dir, 0700);
     if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) ||
         st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
         g_free(dir);
         return FALSE;
+    }
+    if (g_getenv("DISKPASS_PRIVATE_DIR") != NULL) {
+        char *resolved = realpath(dir, NULL);
+        if (!resolved) {
+             
+            g_free(dir);
+            return FALSE;
+        }
+        struct stat rst;
+        gboolean resolved_safe = lstat(resolved, &rst) == 0 &&
+            S_ISDIR(rst.st_mode) && !S_ISLNK(rst.st_mode) &&
+            rst.st_uid == geteuid() && (rst.st_mode & 077) == 0;
+        free(resolved);
+        if (!resolved_safe) {
+            g_free(dir);
+            return FALSE;
+        }
     }
     if (chmod(dir, 0700) != 0) {
         g_free(dir);
@@ -2825,7 +2990,7 @@ static gboolean db_state_key_load_or_create(unsigned char key[DB_STATE_KEY_BYTES
         unsigned char extra;
         ssize_t more = read(fd, &extra, 1);
         gboolean ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-            st.st_uid == geteuid() && (st.st_mode & 077) == 0 &&
+            st.st_uid == geteuid() && (st.st_mode & 077) == 0 && st.st_nlink == 1 &&
             got == DB_STATE_KEY_BYTES && more == 0;
         close(fd);
         g_free(path);
@@ -3005,7 +3170,7 @@ static int db_check_rollback_state(db_manager_t *m, char *err_msg, size_t err_ms
     unsigned char extra = 0;
     ssize_t extra_n = (n > 0 && (size_t)n < sizeof(buf) - 1) ? read(fd, &extra, 1) : -1;
     gboolean regular = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-        st.st_uid == geteuid() && (st.st_mode & 077) == 0 &&
+        st.st_uid == geteuid() && (st.st_mode & 077) == 0 && st.st_nlink == 1 &&
         st.st_size > 0 && st.st_size < (off_t)sizeof(buf) - 1 && extra_n == 0;
     close(fd);
     g_free(path);
@@ -3084,7 +3249,14 @@ static int db_check_rollback_state(db_manager_t *m, char *err_msg, size_t err_ms
     } else if ((uint64_t)stored_gen < m->generation || !state_v2 ||
                (m->require_pqc && !stored_require_pqc)) {
         if (stored_require_pqc) m->require_pqc = TRUE;
-        if (!db_write_rollback_state(m)) {
+         
+
+
+        if (!m->is_signed) {
+            m->legacy_read_only = TRUE;
+            m->needs_resave = TRUE;
+            rc = 1;
+        } else if (!db_write_rollback_state(m)) {
             snprintf(err_msg, err_msg_sz, "Cannot update rollback state");
             rc = -1;
         } else {
@@ -3304,7 +3476,10 @@ static int db_load_json(db_manager_t *m, const char *json_str, char *err_msg, si
     m->salt_len = slen;
     m->noise_key = secure_noise; m->noise_key_len = nlen;
 
-    stego_secret_set(m, m->noise_key, m->noise_key_len);
+    if (!stego_secret_set(m, m->noise_key, m->noise_key_len)) {
+        snprintf(err_msg, err_msg_sz, "Another database owns the active steganography key; close it before opening this database");
+        goto cleanup;
+    }
 
     cJSON *j_schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
     if (!db_valid_schema_array(j_schema, m->schema_order)) {
@@ -3540,7 +3715,7 @@ static int db_load_json(db_manager_t *m, const char *json_str, char *err_msg, si
     }
     int rollback_rc = db_check_rollback_state(m, err_msg, err_msg_sz);
     if (rollback_rc < 0) goto cleanup;
-    m->rollback_state_verified = m->has_commit_chain && rollback_rc > 0;
+    m->rollback_state_verified = m->is_signed && m->has_commit_chain && rollback_rc >= 0;    
 
     rc = 0;
 cleanup:
@@ -3691,14 +3866,38 @@ static int db_build_opaque_container(db_manager_t *m, const char *json, size_t j
     sodium_bin2hex(key_hex, sizeof(key_hex), key, sizeof(key));
     sodium_bin2hex(nonce_hex, sizeof(nonce_hex), nonce, sizeof(nonce));
 
-    char envelope[256];
+    plain = sodium_malloc(bucket);
+    if (!plain) { snprintf(err_msg, err_msg_sz, "Cannot allocate protected opaque payload"); goto cleanup; }
+    db_store_u64le(plain, (uint64_t)json_len);
+    memcpy(plain + 8, json, json_len);
+
+    if (bucket > json_len + 8) memset(plain + 8 + json_len, 0, bucket - json_len - 8);
+
+     
+
+    unsigned char commitment[32];
+    char commitment_hex[65];
+    crypto_generichash(commitment, sizeof(commitment), plain, bucket, NULL, 0);
+    sodium_bin2hex(commitment_hex, sizeof(commitment_hex), commitment, sizeof(commitment));
+    sodium_memzero(commitment, sizeof(commitment));
+    char envelope[384];
     int en = snprintf(envelope, sizeof(envelope),
-        DB_OPAQUE_ENV_TAG "\nK=%s\nN=%s\nP=%s\n", key_hex, nonce_hex, DB_SECURITY_PQC);
+        DB_OPAQUE_ENV_TAG "\nK=%s\nN=%s\nP=%s\nH=%s\n",
+        key_hex, nonce_hex, DB_SECURITY_PQC, commitment_hex);
     if (en <= 0 || (size_t)en >= sizeof(envelope)) {
         snprintf(err_msg, err_msg_sz, "Cannot construct opaque key envelope");
         goto cleanup;
     }
-    env_cipher = db_gpg_encrypt_binary_pqc(m, envelope, (size_t)en, TRUE, &env_len,
+     
+
+
+
+
+
+
+
+
+    env_cipher = db_gpg_encrypt_binary_pqc(m, envelope, (size_t)en, FALSE, &env_len,
         err_msg, err_msg_sz);
     sodium_memzero(envelope, sizeof(envelope));
     if (!env_cipher) goto cleanup;
@@ -3708,13 +3907,6 @@ static int db_build_opaque_container(db_manager_t *m, const char *json, size_t j
             : "Encrypted key envelope does not fit the fixed privacy slot");
         goto cleanup;
     }
-
-    plain = sodium_malloc(bucket);
-    if (!plain) { snprintf(err_msg, err_msg_sz, "Cannot allocate protected opaque payload"); goto cleanup; }
-    db_store_u64le(plain, (uint64_t)json_len);
-    memcpy(plain + 8, json, json_len);
-
-    if (bucket > json_len + 8) memset(plain + 8 + json_len, 0, bucket - json_len - 8);
 
     if (bucket > SIZE_MAX - crypto_aead_xchacha20poly1305_ietf_ABYTES) {
         snprintf(err_msg, err_msg_sz, "Opaque payload length overflow"); goto cleanup;
@@ -3803,16 +3995,38 @@ static int db_open_opaque_container(db_manager_t *m, const unsigned char *raw, s
     char key_hex[crypto_aead_xchacha20poly1305_ietf_KEYBYTES * 2 + 1] = {0};
     char nonce_hex[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES * 2 + 1] = {0};
     char policy[32] = {0};
-    int fields = sscanf(envelope,
-        DB_OPAQUE_ENV_TAG "\nK=%64[0-9A-Fa-f]\nN=%48[0-9A-Fa-f]\nP=%31[^\n]\n",
-        key_hex, nonce_hex, policy);
+    char legacy_aad_v1[8] = {0};
+    char commitment_hex[65] = {0};
+    unsigned char expected_commitment[32] = {0};
+    gboolean payload_signed = g_str_has_prefix(envelope, DB_OPAQUE_ENV_TAG "\n");
+    int consumed = -1;
+    int fields;
+    if (payload_signed) {
+        fields = sscanf(envelope,
+            DB_OPAQUE_ENV_TAG "\nK=%64[0-9A-Fa-f]\nN=%48[0-9A-Fa-f]\nP=%31[^\n]\nH=%64[0-9A-Fa-f]\n%n",
+            key_hex, nonce_hex, policy, commitment_hex, &consumed);
+    } else {
+        fields = sscanf(envelope,
+            DB_OPAQUE_LEGACY_ENV_TAG "\nK=%64[0-9A-Fa-f]\nN=%48[0-9A-Fa-f]\nP=%31[^\n]\nV=%7[^\n]",
+            key_hex, nonce_hex, policy, legacy_aad_v1);
+    }
+    gboolean envelope_valid = fields >= 3 && strcmp(policy, DB_SECURITY_PQC) == 0;
+    if (payload_signed) {
+        size_t digest_len = 0;
+        envelope_valid = envelope_valid && fields == 4 && consumed >= 0 &&
+            (size_t)consumed == strlen(envelope) && strlen(commitment_hex) == 64 &&
+            sodium_hex2bin(expected_commitment, sizeof(expected_commitment), commitment_hex,
+                strlen(commitment_hex), NULL, &digest_len, NULL) == 0 &&
+            digest_len == sizeof(expected_commitment);
+    }
     sec_strfree(envelope);
-    if (fields != 3 || strcmp(policy, DB_SECURITY_PQC) != 0) {
+    if (!envelope_valid) {
         sodium_memzero(key_hex, sizeof(key_hex)); sodium_memzero(nonce_hex, sizeof(nonce_hex));
         sodium_memzero(policy, sizeof(policy));
         snprintf(err_msg, err_msg_sz, "Invalid signed opaque key envelope");
         return -1;
     }
+    gboolean env_aad_v1 = !payload_signed && fields >= 4 && strcmp(legacy_aad_v1, "1") == 0;
 
     unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
@@ -3852,15 +4066,14 @@ static int db_open_opaque_container(db_manager_t *m, const unsigned char *raw, s
             aad_buf, aad_len,
             nonce, key) == 0 && plain_len == padded_len) {
         decrypt_ok = TRUE;
-    } else {
-
-
+    } else if (env_aad_v1) {
         plain_len = 0;
         if (crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &plain_len, NULL,
                 payload, (unsigned long long)payload_cipher_len,
                 (const unsigned char *)DB_OPAQUE_AAD, strlen(DB_OPAQUE_AAD),
                 nonce, key) == 0 && plain_len == padded_len) {
             decrypt_ok = TRUE;
+            m->needs_resave = TRUE;
         }
     }
     sodium_memzero(aad_buf, sizeof(aad_buf));
@@ -3871,6 +4084,27 @@ static int db_open_opaque_container(db_manager_t *m, const unsigned char *raw, s
         return -1;
     }
     sodium_memzero(key, sizeof(key)); sodium_memzero(nonce, sizeof(nonce));
+
+    if (payload_signed) {
+        unsigned char actual_commitment[32];
+        crypto_generichash(actual_commitment, sizeof(actual_commitment), plain, padded_len, NULL, 0);
+        gboolean matches = sodium_memcmp(actual_commitment, expected_commitment,
+            sizeof(actual_commitment)) == 0;
+        sodium_memzero(actual_commitment, sizeof(actual_commitment));
+        sodium_memzero(expected_commitment, sizeof(expected_commitment));
+        if (!matches) {
+            sec_free(plain, padded_len);
+            m->is_signed = FALSE;
+            snprintf(err_msg, err_msg_sz, "Database payload does not match its OpenPGP signature");
+            return -1;
+        }
+    } else {
+         
+
+        m->is_signed = FALSE;
+        m->needs_resave = TRUE;
+        m->legacy_read_only = TRUE;
+    }
 
     if (padded_len < 8) { sec_free(plain, padded_len); return -1; }
     uint64_t json_len64 = db_load_u64le(plain);
@@ -3909,7 +4143,7 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
     gboolean save_with_pqc = FALSE;
     gboolean original_require_pqc = m ? m->require_pqc : FALSE;
     gboolean external_commit = g_db_external_commit_hook != NULL;
-    gboolean backup_enabled = g_strcmp0(g_getenv("DISKPASS_BACKUP"), "0") != 0 && !external_commit;
+    gboolean backup_enabled = !external_commit;
 
     char candidate_db_id[DB_ID_HEX_LEN + 1] = {0};
     char candidate_previous[DB_COMMIT_HEX_LEN + 1] = {0};
@@ -4168,7 +4402,7 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
         snprintf(err_msg, err_msg_sz, "Database JSON exceeds size limit");
         goto cleanup;
     }
-    if (!save_with_pqc && g_strcmp0(g_getenv("DISKPASS_DISABLE_PADDING"), "1") != 0) {
+    if (!save_with_pqc) {
         size_t quantum = json_len <= 16 * 1024 ? 4 * 1024 :
                          json_len <= 1024 * 1024 ? 64 * 1024 :
                          json_len <= 16 * 1024 * 1024 ? 1024 * 1024 :
@@ -4260,8 +4494,21 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
             snprintf(err_msg, err_msg_sz, "Mounted database has no rollback source");
             goto cleanup;
         }
-        rollback_path = g_strconcat(m->file_path, ".rollback.XXXXXX", NULL);
-        int rfd = rollback_path ? g_mkstemp_full(rollback_path, O_RDWR | O_CLOEXEC, 0600) : -1;
+         
+
+
+        unsigned char rollback_random[16];
+        char rollback_hex[33], rollback_name[40];
+        randombytes_buf(rollback_random, sizeof(rollback_random));
+        sodium_bin2hex(rollback_hex, sizeof(rollback_hex), rollback_random, sizeof(rollback_random));
+        snprintf(rollback_name, sizeof(rollback_name), ".%s.dpdb", rollback_hex);
+        gchar *rollback_dir = g_path_get_dirname(m->file_path);
+        rollback_path = g_build_filename(rollback_dir, rollback_name, NULL);
+        g_free(rollback_dir);
+        sodium_memzero(rollback_random, sizeof(rollback_random));
+        sodium_memzero(rollback_hex, sizeof(rollback_hex));
+        int rfd = rollback_path ? open(rollback_path,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600) : -1;
         if (rfd < 0) {
             snprintf(err_msg, err_msg_sz, "Cannot reserve mounted database rollback path");
             goto cleanup;
@@ -4269,14 +4516,14 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
         close(rfd);
 
 
-        if (!db_write_backup_pointer(m->db_id, rollback_path)) {
+        if (!db_write_backup_pointer(candidate_db_id, rollback_path)) {
             snprintf(err_msg, err_msg_sz, "Cannot record rollback pointer for crash recovery");
             unlink(rollback_path);
             goto cleanup;
         }
         if (rename(m->file_path, rollback_path) != 0) {
             snprintf(err_msg, err_msg_sz, "Cannot preserve mounted database for rollback: %s", strerror(errno));
-            db_remove_recorded_backup(m->db_id, m->file_path);
+            db_remove_recorded_backup(candidate_db_id, m->file_path);
             goto cleanup;
         }
         keep_rollback = TRUE;
@@ -4318,13 +4565,16 @@ static int db_save(db_manager_t *m, char *err_msg, size_t err_msg_sz) {
 
     keep_rollback = FALSE;
 
+     
 
-    db_remove_recorded_backup(candidate_db_id, m->file_path);
+    if (external_commit) db_remove_recorded_backup(candidate_db_id, m->file_path);
 
     char snapshot_err[256];
     if (db_file_snapshot(m->file_path, &m->file_snapshot, snapshot_err, sizeof(snapshot_err)) != 0)
         fprintf(stderr, "DiskPass: warning: saved snapshot unavailable; reopen before saving again\n");
     m->is_pqc_encrypted = save_with_pqc;
+    m->is_signed = TRUE;
+    m->needs_resave = FALSE;
     g_strlcpy(m->db_id, candidate_db_id, sizeof(m->db_id));
     m->generation = candidate_generation;
     g_strlcpy(m->previous_commit, candidate_previous, sizeof(m->previous_commit));
@@ -4345,7 +4595,7 @@ cleanup:
         if (rename(rollback_path, m->file_path) == 0) {
             keep_rollback = FALSE;
 
-            db_remove_recorded_backup(m->db_id, m->file_path);
+            db_remove_recorded_backup(candidate_db_id, m->file_path);
             carrier_fsync_parent(m->file_path);
             char snapshot_err[256];
             (void)db_file_snapshot(m->file_path, &m->file_snapshot, snapshot_err, sizeof(snapshot_err));
@@ -4354,11 +4604,13 @@ cleanup:
 
 
             snprintf(err_msg, err_msg_sz,
-                "Mounted save and rollback failed; stop and recover encrypted database from %s", rollback_path);
+                "Mounted save and rollback failed; stop and recover the encrypted database using the recorded backup pointer");
         }
     }
     if (rollback_path && !keep_rollback) unlink(rollback_path);
     g_free(rollback_path);
+     
+
     if (lock_fd >= 0) close(lock_fd);
     if (fd >= 0) close(fd);
     if (!write_ok && tmp_path) unlink(tmp_path);
@@ -4463,6 +4715,10 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
     if (db_file_snapshot(path, &m->file_snapshot, err_msg, err_msg_sz) != 0) {
         db_manager_clear(m); free(m); return NULL;
     }
+    if (m->file_snapshot.exists) {       
+        snprintf(err_msg, err_msg_sz, "File already exists; refusing to overwrite an existing database");
+        db_manager_clear(m); free(m); return NULL;
+    }
     if (!recipient) { snprintf(err_msg, err_msg_sz, "%s", i18n("no_recipient")); db_manager_clear(m); free(m); return NULL; }
     if (db_init_gpg(m, err_msg, err_msg_sz) != 0) { db_manager_clear(m); free(m); return NULL; }
     m->file_path = xstrdup(path);
@@ -4474,7 +4730,10 @@ static db_manager_t *db_manager_create(const char *path, const char *recipient,
     randombytes_buf(m->salt, 32);
     randombytes_buf(m->noise_key, 32);
 
-    stego_secret_set(m, m->noise_key, m->noise_key_len);
+    if (!stego_secret_set(m, m->noise_key, m->noise_key_len)) {
+        snprintf(err_msg, err_msg_sz, "Another database owns the active steganography key; close it before creating a database");
+        db_manager_clear(m); free(m); return NULL;
+    }
     char *tmp[SCHEMA_COUNT];
     for (int i = 0; i < SCHEMA_COUNT; i++) tmp[i] = xstrdup(SCHEMA_PARTS[i]);
     secure_shuffle((const char **)tmp, SCHEMA_COUNT);
@@ -4678,6 +4937,17 @@ static fs_node_t *fs_build_tree(const char *files) {
     return root;
 }
 
+ 
+static unsigned scan_rel_depth(const char *rel) {
+    unsigned depth = 0;
+    gboolean in_component = FALSE;
+    for (const char *q = rel; *q; q++) {
+        if (*q == '/') { in_component = FALSE; continue; }
+        if (!in_component) { in_component = TRUE; depth++; }
+    }
+    return depth;
+}
+
 static char *scan_directory_recursive(const char *root) {
     if (!root || !root[0]) return NULL;
 
@@ -4704,11 +4974,13 @@ static char *scan_directory_recursive(const char *root) {
 
     static const char *skip_names[] = {
         "node_modules", ".cache", ".git", ".svn", ".hg",
-        "proc", "sys", "dev", "run",
         "__pycache__", ".npm", ".cargo", ".rustup", ".gradle",
         ".thumbnails", "lost+found",
         NULL
     };
+     
+
+    static const char *skip_root_names[] = { "proc", "sys", "dev", "run", NULL };
 
     while (!g_queue_is_empty(queue) && !exceeded) {
         char *dir = g_queue_pop_head(queue);
@@ -4730,6 +5002,7 @@ static char *scan_directory_recursive(const char *root) {
             continue;
         }
 
+        const gboolean at_root = strcmp(dir, root) == 0;
         struct dirent *de;
         while ((de = readdir(d)) != NULL) {
             const char *name = de->d_name;
@@ -4737,6 +5010,9 @@ static char *scan_directory_recursive(const char *root) {
             gboolean skip = FALSE;
             for (int i = 0; skip_names[i]; i++) {
                 if (strcmp(name, skip_names[i]) == 0) { skip = TRUE; break; }
+            }
+            for (int i = 0; at_root && !skip && skip_root_names[i]; i++) {
+                if (strcmp(name, skip_root_names[i]) == 0) { skip = TRUE; break; }
             }
             if (skip) continue;
 
@@ -4747,6 +5023,12 @@ static char *scan_directory_recursive(const char *root) {
             if (!full) continue;
 
             if (S_ISDIR(st.st_mode)) {
+                const char *drel = full + root_len;
+                while (*drel == '/' || *drel == '\\') drel++;
+                if (scan_rel_depth(drel) >= DB_MAX_INDEX_DEPTH) {    
+                    secure_g_free_string(&full);
+                    continue;
+                }
                 if (g_queue_get_length(queue) >= DB_MAX_INDEX_QUEUED_DIRS) {
                     secure_g_free_string(&full);
                     exceeded = TRUE;
@@ -4756,7 +5038,8 @@ static char *scan_directory_recursive(const char *root) {
             } else if (S_ISREG(st.st_mode)) {
                 const char *rel = full + root_len;
                 while (*rel == '/' || *rel == '\\') rel++;
-                if (strchr(rel, '\n') || strchr(rel, '\r') || strchr(rel, '\t')) {
+                if (scan_rel_depth(rel) > DB_MAX_INDEX_DEPTH ||
+                    strchr(rel, '\n') || strchr(rel, '\r') || strchr(rel, '\t')) {
                     secure_g_free_string(&full);
                     continue;
                 }
@@ -5368,6 +5651,10 @@ static int db_add_entry(db_manager_t *m, const char *type, const char *size,
         snprintf(err_msg, err_msg_sz, "Invalid tag fields: use a known type, size and cipher, a two-character alphanumeric tag, and a valid salt");
         return -1;
     }
+     
+
+    char tag_up[3] = { (char)g_ascii_toupper(content_tag[0]), (char)g_ascii_toupper(content_tag[1]), '\0' };
+    content_tag = tag_up;
     if ((tag_full && strlen(tag_full) > 4096) ||
         (dpass && strlen(dpass) > 16384) ||
         (notes && strlen(notes) > 1024 * 1024) ||

@@ -10,6 +10,7 @@
 
 typedef struct {
     GModule *module;
+    int fd;  
     char *path;
     char *id;
     char *name;
@@ -25,6 +26,10 @@ typedef struct {
     gpointer user_data;
     GDestroyNotify destroy_notify;
 } DiskPassPluginAction;
+
+static gboolean app_has_open_database(void);
+static gboolean g_plugin_load_authorized = FALSE;
+static GtkWidget *diskpass_plugins_build_menu(GtkWidget *button);
 
 static GPtrArray *g_loaded_plugins = NULL;
 static GPtrArray *g_plugin_actions = NULL;
@@ -132,6 +137,7 @@ static void plugin_action_free(DiskPassPluginAction *a) {
 static void loaded_plugin_free(DiskPassLoadedPlugin *p) {
     if (!p) return;
     if (p->module) g_module_close(p->module);
+    if (p->fd >= 0) close(p->fd);
     g_free(p->path);
     g_free(p->id);
     g_free(p->name);
@@ -160,7 +166,7 @@ static char *diskpass_plugin_directory(void) {
     g_free(base);
     if (!dir) return NULL;
     if (g_mkdir_with_parents(dir, 0700) != 0 || g_lstat(dir, &st) != 0 ||
-        !S_ISDIR(st.st_mode) || st.st_uid != getuid() || chmod(dir, 0700) != 0) {
+        !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077) != 0) {
         g_free(dir);
         return NULL;
     }
@@ -170,7 +176,7 @@ static char *diskpass_plugin_directory(void) {
 
 static int plugin_open_locked_fd(const char *path) {
     if (!path) return -1;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
@@ -204,6 +210,10 @@ static void rollback_plugin_actions(guint start_index) {
 }
 
 static void diskpass_plugin_load_one(const char *path) {
+    for (guint i = 0; i < g_loaded_plugins->len; i++) {
+        DiskPassLoadedPlugin *loaded = g_ptr_array_index(g_loaded_plugins, i);
+        if (g_strcmp0(loaded->path, path) == 0) return;
+    }
 
 
     int locked_fd = plugin_open_locked_fd(path);
@@ -224,10 +234,10 @@ static void diskpass_plugin_load_one(const char *path) {
         module = g_module_open(fd_path, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
     }
 #endif
-    /* Never reopen by pathname: that would discard the inode validation above
-     * and reintroduce a replacement race. */
-    close(locked_fd);
+     
+
     if (!module) {
+        close(locked_fd);
         fprintf(stderr, "DiskPass: cannot load plugin %s: %s\n", path, g_module_error());
         return;
     }
@@ -239,6 +249,7 @@ static void diskpass_plugin_load_one(const char *path) {
             (after_st.st_dev != locked_st.st_dev || after_st.st_ino != locked_st.st_ino)) {
             fprintf(stderr, "DiskPass: plugin %s was replaced during load; refusing to use it\n", path);
             g_module_close(module);
+        close(locked_fd);
             return;
         }
     }
@@ -248,11 +259,13 @@ static void diskpass_plugin_load_one(const char *path) {
     if (!g_module_symbol(module, DISKPASS_PLUGIN_INIT_SYMBOL, &init_symbol) || !init_symbol) {
         fprintf(stderr, "DiskPass: plugin %s has no %s symbol\n", path, DISKPASS_PLUGIN_INIT_SYMBOL);
         g_module_close(module);
+        close(locked_fd);
         return;
     }
     if (sizeof(init_fn) != sizeof(init_symbol)) {
         fprintf(stderr, "DiskPass: unsupported function-pointer ABI for plugin %s\n", path);
         g_module_close(module);
+        close(locked_fd);
         return;
     }
     memcpy(&init_fn, &init_symbol, sizeof(init_fn));
@@ -260,9 +273,11 @@ static void diskpass_plugin_load_one(const char *path) {
     DiskPassLoadedPlugin *p = g_new0(DiskPassLoadedPlugin, 1);
     if (!p) {
         g_module_close(module);
+        close(locked_fd);
         return;
     }
     p->module = module;
+    p->fd = locked_fd;
     p->path = g_strdup(path);
     p->id = plugin_id_from_path(path);
     p->name = g_strdup(p->id ? p->id : "plugin");
@@ -327,11 +342,8 @@ void diskpass_plugins_load_all(void) {
         return;
     }
 
-    /* Environment flags are inherited by child processes and are not a safe
-     * trust boundary for enabling native code. Keep plugins opt-in disabled
-     * until an explicit authenticated UI flow is implemented. */
-    fprintf(stderr, "DiskPass: native plugins are disabled; no authenticated enable flow is available\n");
-    return;
+     
+    if (!g_plugin_load_authorized || !app_has_open_database()) return;
 
     char *dir = diskpass_plugin_directory();
     if (!dir) return;
@@ -372,7 +384,33 @@ static void on_open_plugin_directory(GtkMenuItem *item, gpointer user_data) {
 static void on_plugin_action_activate(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     DiskPassPluginAction *a = user_data;
-    if (a && a->callback) a->callback(a->user_data);
+    if (app_has_open_database() && a && a->callback) a->callback(a->user_data);
+}
+
+static void on_enable_plugins(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
+    GtkWidget *button = user_data;
+    if (!app_has_open_database()) {
+        plugin_host_show_message("DiskPass", "Сначала откройте и разблокируйте базу данных.");
+        return;
+    }
+    GtkWidget *dialog = gtk_message_dialog_new(g_plugin_parent_window,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE, "%s",
+        "Загрузить нативные плагины из каталога плагинов?\n"
+        "Они работают без песочницы с правами приложения и доступом к открытой базе. "
+        "Продолжайте только если доверяете всем установленным .so.\n"
+        "Разрешение действует на эту загрузку; загруженный код остаётся до выхода.");
+    gtk_dialog_add_buttons(GTK_DIALOG(dialog), "Отмена", GTK_RESPONSE_CANCEL,
+                           "Доверяю, загрузить", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    if (response != GTK_RESPONSE_ACCEPT || !app_has_open_database()) return;
+    g_plugin_load_authorized = TRUE;
+    diskpass_plugins_load_all();
+    g_plugin_load_authorized = FALSE;
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(button), diskpass_plugins_build_menu(button));
 }
 
 GtkWidget *diskpass_plugins_create_button(void) {
@@ -381,7 +419,15 @@ GtkWidget *diskpass_plugins_create_button(void) {
     gtk_button_set_image(GTK_BUTTON(button), img);
     gtk_widget_set_tooltip_text(button, i18n("plugins"));
 
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(button), diskpass_plugins_build_menu(button));
+    return button;
+}
+
+static GtkWidget *diskpass_plugins_build_menu(GtkWidget *button) {
     GtkWidget *menu = gtk_menu_new();
+    GtkWidget *enable = gtk_menu_item_new_with_label("Загрузить доверенные плагины…");
+    g_signal_connect(enable, "activate", G_CALLBACK(on_enable_plugins), button);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), enable);
     GtkWidget *folder_item = gtk_menu_item_new_with_label(i18n("plugins_open_folder"));
     g_signal_connect(folder_item, "activate", G_CALLBACK(on_open_plugin_directory), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), folder_item);
@@ -403,8 +449,7 @@ GtkWidget *diskpass_plugins_create_button(void) {
         }
     }
     gtk_widget_show_all(menu);
-    gtk_menu_button_set_popup(GTK_MENU_BUTTON(button), menu);
-    return button;
+    return menu;
 }
 
 void diskpass_plugins_shutdown(void) {
@@ -509,7 +554,9 @@ int main(int argc, char **argv) {
         }
     } else {
         fprintf(stderr,
-            "DiskPass: memory locking disabled by DISKPASS_DISABLE_MLOCK=1.\n");
+            "DiskPass: WARNING — memory locking disabled by DISKPASS_DISABLE_MLOCK=1.\n"
+            "DiskPass: WARNING — secrets (PIN, derived keys, plaintext entries) WILL be written to swap.\n"
+            "DiskPass: WARNING — only use this for debugging on a trusted machine with encrypted swap.\n");
     }
 #endif
     db_install_secure_cjson_hooks();
@@ -520,6 +567,7 @@ int main(int argc, char **argv) {
     gpgme_set_locale(NULL, LC_CTYPE, setlocale(LC_CTYPE, NULL));
     g_unix_signal_add(SIGINT, graceful_shutdown, NULL);
     g_unix_signal_add(SIGTERM, graceful_shutdown, NULL);
+    g_set_prgname("diskpass");
     gtk_init(&argc, &argv);
     i18n_select_system_language();
     i18n_init();
@@ -532,12 +580,13 @@ int main(int argc, char **argv) {
     if (!load_config()) {
         fprintf(stderr, "DiskPass: cannot read or validate configuration.\n");
         diskpass_plugins_shutdown();
+    stego_secret_shutdown();
         i18n_shutdown();
         return 1;
     }
     if (g_app.camouflage_enabled) {
-        g_set_prgname("gnome-calculator");
-        g_set_application_name("GNOME Calculator");
+        camouflage_update_presentation(TRUE);
+
         if (!g_app.camouflage_hash[0]) {
             fprintf(stderr, "DiskPass: camouflage enabled but access-code hash is missing.\n");
             diskpass_plugins_shutdown();
@@ -555,7 +604,7 @@ int main(int argc, char **argv) {
         }
         g_app.camouflage_key_valid = TRUE;
         if (g_app.camouflage_legacy_config) {
-            /* Upgrade old plaintext v5 preferences only after authentication. */
+             
             if (!save_config()) {
                 fprintf(stderr, "DiskPass: could not upgrade protected configuration.\n");
                 sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
@@ -564,17 +613,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             g_app.camouflage_legacy_config = FALSE;
-        } else if (!load_config()) {
+        } else if (!load_config() || !g_app.camouflage_enabled) {
             fprintf(stderr, "DiskPass: protected configuration authentication failed.\n");
             sodium_memzero(g_app.camouflage_config_key, sizeof(g_app.camouflage_config_key));
             diskpass_plugins_shutdown();
             i18n_shutdown();
             return 1;
         }
-        /* Keep the camouflage process identity for the entire session. */
+
     }
-    if (!g_app.camouflage_enabled && !diskpass_sync_launcher_icon(FALSE))
-        g_warning("DiskPass: could not update user launcher icon");
+    camouflage_update_presentation(FALSE);
     load_css();
     char *icon_path = find_icon_path();
     if (icon_path) {
@@ -582,29 +630,21 @@ int main(int argc, char **argv) {
         g_free(icon_path);
     }
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), g_app.camouflage_enabled ? "Calculator" : "DiskPass");
-    if (g_app.camouflage_enabled) {
-        g_set_prgname("calculator");
-        g_set_application_name("Calculator");
-    } else {
-        g_set_prgname("diskpass");
-        g_set_application_name("DiskPass");
-    }
+    gtk_window_set_title(GTK_WINDOW(win), "DiskPass");
+    diskpass_bind_window_launcher(GTK_WINDOW(win));
     gtk_window_set_default_size(GTK_WINDOW(win), 1000, 660);
     gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
-    gtk_window_set_default_icon_name(g_app.camouflage_enabled ?
-        diskpass_calculator_icon_name() : "diskpass");
-    gtk_window_set_icon_name(GTK_WINDOW(win), g_app.camouflage_enabled ?
-        diskpass_calculator_icon_name() : "diskpass");
-    if (!gtk_icon_theme_has_icon(gtk_icon_theme_get_default(),
-            g_app.camouflage_enabled ? diskpass_calculator_icon_name() : "diskpass") && icon_pb)
+    diskpass_set_default_icon(FALSE);
+    diskpass_set_window_icon(GTK_WINDOW(win), FALSE);
+    if (!gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "diskpass") && icon_pb)
         gtk_window_set_icon(GTK_WINDOW(win), icon_pb);
 
     GtkWidget *hb = gtk_header_bar_new();
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(hb), FALSE);
     gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(hb), FALSE);
 
-    GtkWidget *title_lbl = gtk_label_new(g_app.camouflage_enabled ? "Calculator" : "DiskPass");
+    GtkWidget *title_lbl = gtk_label_new("DiskPass");
+    g_app.window_title_label = title_lbl;
     gtk_widget_set_size_request(title_lbl, 160, -1);
     gtk_style_context_add_class(gtk_widget_get_style_context(title_lbl), "title");
     gtk_header_bar_set_custom_title(GTK_HEADER_BAR(hb), title_lbl);
@@ -709,6 +749,8 @@ int main(int argc, char **argv) {
     gtk_clipboard_set_text(cb, "", 0);
     GtkClipboard *primary = gtk_clipboard_get(GDK_SELECTION_PRIMARY);
     gtk_clipboard_set_text(primary, "", 0);
+    if (g_app.camouflage_enabled && !diskpass_sync_launcher_icon(TRUE))
+        g_warning("DiskPass: could not restore calculator launcher icon on exit");
     diskpass_plugins_shutdown();
     sodium_memzero(g_app.camouflage_hash, sizeof(g_app.camouflage_hash));
     sodium_memzero(g_app.camouflage_salt, sizeof(g_app.camouflage_salt));
